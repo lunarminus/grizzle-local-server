@@ -44,6 +44,14 @@ point the two volumes at a dataset, e.g. `/mnt/tank/apps/grizzle-local/data` and
 `/mnt/tank/apps/grizzle-local/certs`. For the DNS-override setup put a certificate in the
 `certs` folder first (see section 2). Save, and the app pulls the image and starts.
 
+> **Port 443 is taken by the TrueNAS web UI**, so the app fails to start with
+> "address already in use" until you free it. Either move the UI: *System → General
+> Settings → GUI → Settings*, set **Web Interface HTTPS Port** to e.g. 9443 (the UI is then
+> at `https://<nas-ip>:9443`); or give the container its own address: add an IP alias to
+> the NIC under *Network → Interfaces*, set the GUI's **Web Interface IPv4 Address** to the
+> NAS's primary IP, bind the port as `"<alias-ip>:443:8443"` in the compose file, and point
+> the DNS override at the alias IP.
+
 **Any Docker host:**
 
 ```bash
