@@ -42,14 +42,14 @@ push to `main`: `ghcr.io/lunarminus/grizzle-local:latest`.
 [`docker-compose.yml`](docker-compose.yml), change `GRIZZLE_API_PASSWORD` and `TZ`, and
 point the two volumes at a dataset, e.g. `/mnt/tank/apps/grizzle-local/data` and
 `/mnt/tank/apps/grizzle-local/certs`. For the DNS-override setup put a certificate in the
-`certs` folder first (see Option B below). Save, and the app pulls the image and starts.
+`certs` folder first (see section 2). Save, and the app pulls the image and starts.
 
 **Any Docker host:**
 
 ```bash
 git clone https://github.com/lunarminus/grizzle-local-server.git && cd grizzle-local-server
 # edit docker-compose.yml: password, timezone
-scripts/make-cert.sh ./certs        # only for the DNS-override setup
+scripts/make-cert.sh ./certs
 docker compose up -d
 curl http://localhost:9000/health
 ```
@@ -72,46 +72,17 @@ Environment variables (all optional):
 | `GRIZZLE_TLS_PORT`, `GRIZZLE_TLS_CERT`, `GRIZZLE_TLS_KEY` | `8443`, `/certs/fullchain.pem`, `/certs/privkey.pem` | `wss://` listener; enabled automatically when both files exist |
 | `LOG_LEVEL` | `info` | `debug` logs every OCPP frame |
 
-## 2. Point the charger at it
+## 2. Point the charger at it: DNS override
 
-The charger does **not** use `connect-api.unitedchargers.com`; that is the phone
-app's REST API. The charger is an OCPP client connecting to
-`wss://ocpp.unitedchargers.com/ocpp1.6`. You have two options.
-
-### Option A: change the OCPP server URL on the charger (preferred)
-
-Set the server URL to `ws://<nas-ip>:9000/ocpp1.6/` (keep the trailing slash; the
-charger appends its station ID). Leave the station ID and auth key as they are.
-
-- **Grizzl-E Connect app**: the app has an OCPP configuration screen for chargers
-  with OCPP access enabled (United Chargers sells "Unlock OCPP Access" in some
-  regions; US accounts appear not to be charged). If you don't see it, ask their
-  support to enable OCPP on your serial.
-- **Local web interface**: on firmware that exposes the Smart-style page
-  (`http://<charger-ip>/`, *Advanced OCPP Settings*), or with the helper script:
-
-  ```bash
-  export GRIZZLE_WEB_PASSWORD='<the web page login>'     # or add -p; the script prompts otherwise
-  python scripts/configure-charger.py --host <charger-ip> status   # live readings, no login needed
-  python scripts/configure-charger.py --host <charger-ip> show     # OCPP settings
-  python scripts/configure-charger.py --host <charger-ip> set ws://<nas-ip>:9000/ocpp1.6/
-  python scripts/configure-charger.py --host <charger-ip> reset    # back to the cloud
-  ```
-
-  The web page uses HTTP Basic auth (user `admin` unless you changed it). The script
-  talks to `GET /info` and `POST /ocpp`; if `show` reports 404, this firmware doesn't
-  expose the OCPP settings page (a Duo reports `thirdPartyBackends: 0` in its status
-  payload, which looks like the vendor's "OCPP unlock" flag) and you need Option B.
-
-Once the URL is changed the vendor app stops seeing the charger. That's the point.
-
-### Option B: DNS override (if you can't change the URL)
-
-Make `ocpp.unitedchargers.com` resolve to the server on your LAN. The charger then
-opens `wss://` to port 443 on the server, so it needs a TLS certificate for that name.
-`scripts/make-cert.sh` writes a self-signed one and the server turns TLS on
-automatically when the files exist (the compose file already maps `443:8443` and
-mounts `./certs`):
+The charger does **not** use `connect-api.unitedchargers.com`; that is the phone app's
+REST API. The charger is an OCPP client connecting to `wss://ocpp.unitedchargers.com/ocpp1.6`,
+and the Connect/Duo firmware gives you no way to change that address (the app has no OCPP
+settings screen and the web interface has no OCPP page unless the vendor unlocks it). So we
+answer to that name instead: make `ocpp.unitedchargers.com` resolve to the server on your
+LAN. The charger opens `wss://` to port 443 on the server, which needs a certificate for
+that name. `scripts/make-cert.sh` writes a self-signed one and the server turns TLS on
+automatically when the files exist (the compose file maps `443:8443` and mounts `./certs`).
+A Duo on firmware `UDGRW070L-04.03.2` does not verify the certificate, so this works.
 
 ```bash
 scripts/make-cert.sh ./certs
@@ -132,25 +103,26 @@ docker compose logs -f        # look for "and wss:// on 8443"
 3. Verify from any LAN machine: `dig ocpp.unitedchargers.com @<opnsense-ip>` returns the
    server IP. Then power-cycle the charger so it drops its cached address.
 4. Watch `docker compose logs -f`:
-   - `GRD-… booted` means it works.
-   - `TLS: <charger-ip> REJECTED OUR CERTIFICATE` means the firmware verifies
-     certificates: the connection reached us but the charger refused our certificate.
-     This approach can't work on that firmware; you need Option A or a United Chargers
-     support ticket to enable OCPP configuration.
-   - `TLS: connection from <charger-ip>` followed by `handshake … OK` but no `booted`
-     means TLS is fine and the problem is at the OCPP level; set `LOG_LEVEL=debug`.
-   - Nothing at all means the charger isn't resolving the name to us; recheck step 2,
-     or run `tcpdump -ni <lan> host <charger-ip> and port 53` on OPNsense.
+   - `TLS: connection from <charger-ip>`, `handshake … OK`, then `GRD-… booted`: it works.
+   - `TLS: <charger-ip> REJECTED OUR CERTIFICATE`: that firmware verifies certificates and
+     this approach can't work on it. Open a United Chargers support ticket asking for OCPP
+     configuration to be enabled on your serial.
+   - `handshake … OK` but no `booted`: TLS is fine and the problem is at the OCPP level;
+     set `LOG_LEVEL=debug`.
+   - Nothing at all: the charger isn't resolving the name to us. Recheck step 2, or run
+     `tcpdump -ni <lan> host <charger-ip> and port 53` on OPNsense.
 
-**This only works if the charger does not verify the server certificate.** A Duo on
-firmware `UDGRW070L-04.03.2` does not, so this is the confirmed working route for the Duo.
+Other DNS servers (Pi-hole, AdGuard Home, a router's local DNS) work the same way: add a
+local A record for `ocpp.unitedchargers.com` pointing at the server.
+
 Overriding `connect-api.unitedchargers.com` is not needed: Home Assistant is pointed at
 the server directly, and the phone app can't be made to work this way anyway (it uses
 HTTPS with normal certificate checks). Block that host at the firewall if you want the
-app silenced.
+app silenced. Once the charger is on the local server the vendor app stops seeing it.
 
 You can test the whole chain without the real charger: `tools/fake_charger.py` accepts
-`wss://…` URLs with `--insecure`.
+`wss://…` URLs with `--insecure`. The plain `ws://` listener on port 9000 also accepts
+chargers, for firmware that does let you set a server URL.
 
 ## 3. Connect Home Assistant
 
@@ -210,10 +182,10 @@ grizzle_local/
 ├── api.py         # REST facade + station JSON in the cloud's shape
 ├── store.py       # state.json + history.sqlite
 ├── config.py      # env vars
-├── tls.py         # wss:// front door with handshake logging (DNS-override setup)
+├── tls.py         # wss:// front door with handshake logging
 └── main.py        # aiohttp app: WebSocket upgrade on any path, REST
 tools/fake_charger.py   # simulated Grizzl-E, also used by the tests
-scripts/                # make-cert.sh, configure-charger.py
+scripts/make-cert.sh    # self-signed certificate for ocpp.unitedchargers.com
 ```
 
 ## Status
@@ -222,7 +194,7 @@ Verified against a real Grizzl-E Duo 40A (`GRD 40A 2025`, firmware `UDGRW070L-04
 on 2026-11-08, connected through the DNS override:
 
 - The charger **does not verify the server certificate**: it completed a TLS 1.2
-  handshake against the self-signed cert and connected. Option B works on this firmware.
+  handshake against the self-signed cert and connected, so the DNS override works.
 - It connects to path `/ocpp1.6` with no station id in the URL and identifies itself with
   HTTP Basic auth (user = serial), which the server uses as the charge point id.
 - BootNotification, StatusNotification (connectors 0, 1, 2), RemoteStartTransaction

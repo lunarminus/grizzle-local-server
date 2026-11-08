@@ -21,7 +21,8 @@ _LOGGER = logging.getLogger("grizzle_local")
 
 INDEX = """<!doctype html><title>Grizzl-E local server</title>
 <h1>Grizzl-E local server</h1>
-<p>OCPP 1.6-J endpoint: <code>ws://&lt;this host&gt;:{port}/ocpp1.6/&lt;serial&gt;</code> (any path works).</p>
+<p>OCPP 1.6-J endpoint: <code>wss://ocpp.unitedchargers.com/ocpp1.6</code>, reached through a DNS override
+of that name to this host. Any path works; plain <code>ws://</code> on port {port} is accepted too.</p>
 <p>REST API for the Home Assistant integration: <code>http://&lt;this host&gt;:{port}</code></p>
 <p>Connected chargers: {stations}</p>
 <p><a href="/health">health</a></p>
