@@ -1,0 +1,24 @@
+# Grizzl-E local server: OCPP central system for the charger + REST API for Home Assistant.
+# TrueNAS SCALE: Apps -> Discover Apps -> Custom App -> "Install via YAML", paste this file,
+# then change the password, the timezone and the two host paths.
+services:
+  grizzle-local:
+    image: ghcr.io/lunarminus/grizzle-local:latest
+    # To build from source instead: comment out `image:` and uncomment `build: .`
+    # build: .
+    container_name: grizzle-local
+    restart: unless-stopped
+    ports:
+      - "9000:9000"      # ws:// for the charger and http:// for Home Assistant
+      - "443:8443"       # wss:// for the DNS-override approach (charger thinks it's ocpp.unitedchargers.com)
+    environment:
+      TZ: America/Denver                # schedules are evaluated in this timezone
+      GRIZZLE_API_EMAIL: admin@local    # what Home Assistant logs in with
+      GRIZZLE_API_PASSWORD: change-me
+      # GRIZZLE_OCPP_PASSWORD: ""       # set to require the charger's OCPP "Auth key"
+      GRIZZLE_HEARTBEAT_INTERVAL: "300"
+      GRIZZLE_METER_INTERVAL: "30"
+      LOG_LEVEL: info                   # debug logs every OCPP frame
+    volumes:
+      - ./data:/data                    # state.json + history.sqlite
+      - ./certs:/certs:ro               # run scripts/make-cert.sh ./certs first; TLS turns on when the files exist
