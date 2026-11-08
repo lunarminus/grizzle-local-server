@@ -91,13 +91,17 @@ charger appends its station ID). Leave the station ID and auth key as they are.
   (`http://<charger-ip>/`, *Advanced OCPP Settings*), or with the helper script:
 
   ```bash
-  python scripts/configure-charger.py --host <charger-ip> show
+  export GRIZZLE_WEB_PASSWORD='<the web page login>'     # or add -p; the script prompts otherwise
+  python scripts/configure-charger.py --host <charger-ip> status   # live readings, no login needed
+  python scripts/configure-charger.py --host <charger-ip> show     # OCPP settings
   python scripts/configure-charger.py --host <charger-ip> set ws://<nas-ip>:9000/ocpp1.6/
-  python scripts/configure-charger.py --host <charger-ip> reset   # back to the cloud
+  python scripts/configure-charger.py --host <charger-ip> reset    # back to the cloud
   ```
 
-  The script talks to `GET /info` and `POST /ocpp`. If `/info` doesn't answer, your
-  firmware doesn't have that page.
+  The web page uses HTTP Basic auth (user `admin` unless you changed it). The script
+  talks to `GET /info` and `POST /ocpp`; if `show` reports 404, this firmware doesn't
+  expose the OCPP settings page (a Duo reports `thirdPartyBackends: 0` in its status
+  payload, which looks like the vendor's "OCPP unlock" flag) and you need Option B.
 
 Once the URL is changed the vendor app stops seeing the charger. That's the point.
 
