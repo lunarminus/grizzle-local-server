@@ -57,6 +57,11 @@ def _parse_iso(value: str | None) -> datetime | None:
         return None
 
 
+def _recent(last: float | None, now: float) -> bool:
+    """Was the last attempt less than REMOTE_RETRY_SECONDS ago? (None = never attempted)"""
+    return last is not None and now - last < REMOTE_RETRY_SECONDS
+
+
 def _to_float(value: Any) -> float | None:
     try:
         return float(value)
@@ -126,8 +131,8 @@ class Controller:
                 "totalEnergyWh": None,
                 "isActiveBySchedule": None,
                 "nextScheduleTime": None,
-                "lastRemoteStart": 0,
-                "lastRemoteStop": 0,
+                "lastRemoteStart": None,  # monotonic time of the last attempt; None = never
+                "lastRemoteStop": None,
             }
             if cid > int(station.get("connectorCount") or 1):
                 station["connectorCount"] = cid
@@ -201,7 +206,7 @@ class Controller:
             station["model"] = {"name": model or "Grizzl-E", "code": model}
         for cid in range(1, int(station["connectorCount"]) + 1):
             connector = self._ensure_connector(station, cid)
-            connector["lastRemoteStart"] = 0
+            connector["lastRemoteStart"] = None
         station["appliedLimit"] = None  # profiles may not survive a reboot
         _LOGGER.info("%s booted: %s fw %s", station["id"], model, payload.get("firmwareVersion"))
         self._spawn(self._after_boot(station["id"]))
@@ -537,7 +542,7 @@ class Controller:
         tx = connector.get("transaction")
         now = _time.monotonic()
         if allowed and tx is None and status in WANTS_START:
-            if now - connector.get("lastRemoteStart", 0) < REMOTE_RETRY_SECONDS:
+            if _recent(connector.get("lastRemoteStart"), now):
                 return
             connector["lastRemoteStart"] = now
             try:
@@ -550,7 +555,7 @@ class Controller:
             except OcppError as err:
                 _LOGGER.warning("%s connector %s: RemoteStartTransaction failed: %s", station_id, cid, err)
         elif not allowed and tx is not None:
-            if now - connector.get("lastRemoteStop", 0) < REMOTE_RETRY_SECONDS:
+            if _recent(connector.get("lastRemoteStop"), now):
                 return
             connector["lastRemoteStop"] = now
             try:
@@ -575,8 +580,8 @@ class Controller:
         for cid in targets:
             connector = self._ensure_connector(station, int(cid))
             connector["mode"] = mode
-            connector["lastRemoteStart"] = 0
-            connector["lastRemoteStop"] = 0
+            connector["lastRemoteStart"] = None
+            connector["lastRemoteStop"] = None
         self._dirty = True
         for cid in targets:
             await self._enforce(station_id, int(cid))

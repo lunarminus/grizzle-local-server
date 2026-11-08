@@ -68,7 +68,7 @@ class FakeCharger:
             protocols=("ocpp1.6",),
             heartbeat=30,
             headers={"Authorization": aiohttp.BasicAuth(self.serial, self.auth_key).encode()},
-            ssl=False if self.insecure else None,
+            ssl=False if self.insecure else True,
         )
         _LOGGER.info("connected to %s (subprotocol %s)", self.url, self.ws.protocol)
 
