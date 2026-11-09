@@ -24,6 +24,8 @@ Nothing leaves your LAN: the charger talks to this container, and the
 - **Tolerant framing.** Grizzl-E firmware replies to `GetConfiguration` with invalid
   JSON (`"configurationKey":]`). The server repairs or drops bad frames instead of
   letting the socket die.
+- **Built-in web page** at `http://<server>:9000/` for live status, charging modes,
+  schedules, electricity rates, charger settings and session history with cost.
 - **REST API shaped like `connect-api.unitedchargers.com`**, so the Home Assistant
   integration only needs a different server URL. Plus a few `/local/...` extras:
   raw OCPP calls, the frame log, meter history.
@@ -132,7 +134,32 @@ You can test the whole chain without the real charger: `tools/fake_charger.py` a
 `wss://…` URLs with `--insecure`. The plain `ws://` listener on port 9000 also accepts
 chargers, for firmware that does let you set a server URL.
 
-## 3. Connect Home Assistant
+## 3. Open the web page
+
+Browse to `http://<server-ip>:9000/` and sign in with `GRIZZLE_API_EMAIL` /
+`GRIZZLE_API_PASSWORD`.
+
+![The web page: connectors, schedules, rates, sessions and settings](docs/web-ui.png)
+
+- **Connectors**: live power, current, voltage, temperature and the running session, with
+  an On / Off / Scheduled switch per connector.
+- **Charging schedules**: windows in which a connector set to *Scheduled* may charge, with
+  days, an optional connector and an optional current limit for that window.
+- **Electricity rates**: a base price per kWh plus time-of-use zones. Session cost is
+  computed from whichever price applies as energy is delivered, so set the price before
+  you care about cost; earlier sessions keep the cost they were recorded with.
+- **Sessions**: every session with duration, energy and cost, and totals for today, the
+  last 7 and 30 days, and all time.
+- **Charger settings**: name, current limit (bounded by the DIP switch), base price,
+  currency and the timezone schedules are evaluated in.
+
+The page is a single self-contained file (no external scripts or fonts), follows the
+browser's light or dark theme and works on a phone. To show it inside Home Assistant, add
+a *Webpage* card pointing at the same address; that only works when Home Assistant itself
+is opened over plain `http://`, because browsers won't embed an `http://` page in an
+`https://` one.
+
+## 4. Connect Home Assistant
 
 In the integration's *Add → Grizzl-E Connect account* step, set **Server URL** to
 `http://<nas-ip>:9000` and log in with `GRIZZLE_API_EMAIL` / `GRIZZLE_API_PASSWORD`.
@@ -166,6 +193,7 @@ Local extras (same auth):
 | Method & path | Purpose |
 |---|---|
 | `POST /local/stations/{serial}/ocpp` | `{"action": "GetConfiguration", "payload": {}}`: send any OCPP call, get the raw reply |
+| `GET /local/stations/{serial}/sessions?limit=100` | session history incl. sessions in progress, plus totals (what the web page shows) |
 | `GET /local/stations/{serial}/log` | the last 200 OCPP frames in either direction |
 | `GET /local/stations/{serial}/samples?since=ISO&connector=1` | meter history (kept 90 days) |
 | `PUT /local/stations/{serial}/settings` | `{"displayName", "timezone", "connectorCount", "maxCurrent", "minCurrent", "dipSwitchCurrentLimit"}` |
@@ -191,6 +219,7 @@ grizzle_local/
 ├── store.py       # state.json + history.sqlite
 ├── config.py      # env vars
 ├── tls.py         # wss:// front door with handshake logging
+├── web/index.html # the built-in web page (inline CSS and JS, no build step)
 └── main.py        # aiohttp app: WebSocket upgrade on any path, REST
 tools/fake_charger.py   # simulated Grizzl-E, also used by the tests
 scripts/make-cert.sh    # self-signed certificate for ocpp.unitedchargers.com

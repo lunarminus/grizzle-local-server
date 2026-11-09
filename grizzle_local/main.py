@@ -6,6 +6,7 @@ import asyncio
 import base64
 import logging
 import sys
+from pathlib import Path
 
 from aiohttp import web
 
@@ -19,14 +20,13 @@ from .tls import start_tls_frontend
 
 _LOGGER = logging.getLogger("grizzle_local")
 
-INDEX = """<!doctype html><title>Grizzl-E local server</title>
-<h1>Grizzl-E local server</h1>
-<p>OCPP 1.6-J endpoint: <code>wss://ocpp.unitedchargers.com/ocpp1.6</code>, reached through a DNS override
-of that name to this host. Any path works; plain <code>ws://</code> on port {port} is accepted too.</p>
-<p>REST API for the Home Assistant integration: <code>http://&lt;this host&gt;:{port}</code></p>
-<p>Connected chargers: {stations}</p>
-<p><a href="/health">health</a></p>
-"""
+WEB_DIR = Path(__file__).parent / "web"
+# The page is fully self-contained (inline CSS/JS, no external requests).
+PAGE_HEADERS = {
+    "Content-Security-Policy": "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+    "img-src 'self' data:; frame-ancestors *",
+    "Cache-Control": "no-cache",
+}
 
 
 def _charge_point_id(request: web.Request) -> str:
@@ -60,9 +60,9 @@ async def websocket_handler(request: web.Request) -> web.StreamResponse:
     controller: Controller = request.app["controller"]
     settings: Settings = request.app["settings"]
     if request.headers.get("Upgrade", "").lower() != "websocket":
-        if request.path == "/":
-            html = INDEX.format(port=settings.port, stations=", ".join(controller.stations) or "none yet")
-            return web.Response(text=html, content_type="text/html")
+        if request.path in ("/", "/index.html"):
+            html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+            return web.Response(text=html, content_type="text/html", headers=PAGE_HEADERS)
         raise web.HTTPNotFound()
     cp_id = _charge_point_id(request)
     if settings.ocpp_password is not None and _basic_password(request) != settings.ocpp_password:

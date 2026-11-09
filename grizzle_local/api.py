@@ -9,13 +9,13 @@ from __future__ import annotations
 import logging
 import secrets
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from aiohttp import web
 
 from . import __version__
-from .controller import MODES, Controller
+from .controller import MODES, Controller, _parse_iso
 from .ocpp import OcppError
 
 _LOGGER = logging.getLogger(__name__)
@@ -404,6 +404,54 @@ async def local_samples(request: web.Request) -> web.Response:
     return web.json_response({"samples": rows})
 
 
+async def local_sessions(request: web.Request) -> web.Response:
+    """Session history for the web page: finished sessions plus the ones in progress, with totals."""
+    station = _station_or_404(request)
+    controller = _controller(request)
+    limit = max(1, min(int(request.query.get("limit", 100)), 1000))
+    live = {
+        int(c["transaction"]["id"]): c["transaction"] for c in station["connectors"].values() if c.get("transaction")
+    }
+    now = datetime.now(UTC)
+    rows = controller.store.sessions(station["id"], 5000)
+    for row in rows:
+        tx = live.get(row["id"]) if row["stop_at"] is None else None
+        row["active"] = tx is not None
+        row["incomplete"] = row["stop_at"] is None and tx is None  # never closed, e.g. lost in a restart
+        if tx is not None:
+            start = _parse_iso(row["start_at"])
+            row["energy_wh"] = tx.get("energy") or 0
+            row["duration_s"] = int((now - start).total_seconds()) if start else None
+            row["cost"] = round(float(tx.get("priceTotal") or 0), 4)
+            row["price_kwh"] = tx.get("priceKW")
+
+    local_now = datetime.now(controller.tz(station))
+    periods = {
+        "today": local_now.replace(hour=0, minute=0, second=0, microsecond=0),
+        "week": local_now - timedelta(days=7),
+        "month": local_now - timedelta(days=30),
+        "all": None,
+    }
+    summary = {key: {"energy_wh": 0.0, "cost": 0.0, "count": 0} for key in periods}
+    for row in rows:
+        start = _parse_iso(row["start_at"])
+        for key, since in periods.items():
+            if since is None or (start is not None and start >= since):
+                summary[key]["energy_wh"] += float(row["energy_wh"] or 0)
+                summary[key]["cost"] += float(row["cost"] or 0)
+                summary[key]["count"] += 1
+    for totals in summary.values():
+        totals["cost"] = round(totals["cost"], 4)
+    return web.json_response(
+        {
+            "sessions": rows[:limit],
+            "summary": summary,
+            "currency": station.get("currency"),
+            "timezone": station.get("timezone"),
+        }
+    )
+
+
 async def local_log(request: web.Request) -> web.Response:
     station = _station_or_404(request)
     conn = _controller(request).connections.get(station["id"])
@@ -477,6 +525,7 @@ def add_routes(app: web.Application) -> None:
     app.router.add_post("/client/stations/{station_id}/reboot", reboot)
     app.router.add_get("/client/stations/{station_id}/events", events)
     app.router.add_get("/local/stations/{station_id}/samples", local_samples)
+    app.router.add_get("/local/stations/{station_id}/sessions", local_sessions)
     app.router.add_get("/local/stations/{station_id}/log", local_log)
     app.router.add_post("/local/stations/{station_id}/ocpp", local_ocpp_call)
     app.router.add_put("/local/stations/{station_id}/settings", local_settings)

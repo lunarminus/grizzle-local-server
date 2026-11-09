@@ -1,0 +1,685 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Grizzl-E local</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230a7868'/%3E%3Cpath d='M18 4 8 18h7l-1 10 10-14h-7z' fill='%23fff'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #f3f4f6; --card: #ffffff; --ink: #15181e; --muted: #5f6b7a; --line: #e2e5ea;
+    --accent: #0a7868; --accent-ink: #ffffff; --accent-soft: #e3f3f0;
+    --good: #0a7a4b; --good-soft: #e2f5ec; --warn: #a25a00; --warn-soft: #fdf1dc;
+    --bad: #b3261e; --bad-soft: #fbe6e4; --chip: #eceff3; --shadow: 0 1px 2px rgba(16, 24, 40, .06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1013; --card: #181b20; --ink: #eceef2; --muted: #9aa5b4; --line: #2a2f38;
+      --accent: #3cc7b0; --accent-ink: #04211c; --accent-soft: #12332e;
+      --good: #4bd08f; --good-soft: #11301f; --warn: #f5b942; --warn-soft: #3a2a0b;
+      --bad: #ff8278; --bad-soft: #3b1614; --chip: #242931; --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  [hidden] { display: none !important; }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 16px 16px 56px; }
+  header.top { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 6px 0 16px; }
+  header.top h1 { font-size: 20px; margin: 0; letter-spacing: -.01em; }
+  header.top .sub { color: var(--muted); font-size: 13px; }
+  header.top .spacer { flex: 1; }
+  h2 { font-size: 15px; margin: 0; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; box-shadow: var(--shadow); margin-bottom: 14px; }
+  .card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+  .card-head .spacer { flex: 1; }
+  .hint { color: var(--muted); font-size: 13px; margin: 0; }
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+  .grid .card { margin-bottom: 0; }
+  .grid + .card, .grid + .grid { margin-top: 14px; }
+
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; font-size: 12.5px; font-weight: 600; background: var(--chip); color: var(--muted); white-space: nowrap; }
+  .pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .pill.good { background: var(--good-soft); color: var(--good); }
+  .pill.warn { background: var(--warn-soft); color: var(--warn); }
+  .pill.bad { background: var(--bad-soft); color: var(--bad); }
+
+  .power { font-size: 34px; font-weight: 650; letter-spacing: -.02em; line-height: 1.1; font-variant-numeric: tabular-nums; }
+  .power small { font-size: 15px; font-weight: 500; color: var(--muted); margin-left: 4px; }
+  dl.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px 12px; margin: 14px 0; }
+  dl.stats div { min-width: 0; }
+  dl.stats dt { color: var(--muted); font-size: 12px; }
+  dl.stats dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; background: var(--chip); }
+  .seg button { border: 0; background: transparent; color: var(--ink); padding: 7px 14px; font: inherit; font-size: 13.5px; cursor: pointer; }
+  .seg button + button { border-left: 1px solid var(--line); }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); font-weight: 600; }
+  .mode-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .mode-row .hint { flex: 1 1 140px; }
+
+  button, .btn { font: inherit; }
+  .btn { border: 1px solid var(--line); background: var(--card); color: var(--ink); border-radius: 9px; padding: 7px 13px; cursor: pointer; font-size: 13.5px; }
+  .btn:hover { border-color: var(--muted); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+  .btn.danger { color: var(--bad); }
+  .btn.small { padding: 4px 10px; font-size: 13px; }
+  .btn:disabled { opacity: .55; cursor: default; }
+  button:focus-visible, input:focus-visible, select:focus-visible, .seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  label.field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); min-width: 0; }
+  input[type=text], input[type=email], input[type=password], input[type=number], input[type=time], select {
+    font: inherit; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: 9px; padding: 7px 10px; width: 100%; min-width: 0;
+  }
+  .form-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); align-items: end; }
+  .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
+  .actions .spacer { flex: 1; }
+
+  .scroll { overflow-x: auto; margin: 0 -4px; padding: 0 4px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12.5px; padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  td { padding: 9px 10px 9px 0; border-bottom: 1px solid var(--line); vertical-align: middle; white-space: nowrap; }
+  tr:last-child td { border-bottom: 0; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.name { font-weight: 600; white-space: normal; min-width: 110px; }
+  td.row-actions { text-align: right; padding-right: 0; }
+  td.row-actions .btn + .btn { margin-left: 6px; }
+  .empty { color: var(--muted); padding: 6px 0 2px; font-size: 14px; }
+
+  .switch { position: relative; display: inline-block; width: 38px; height: 22px; vertical-align: middle; }
+  .switch input { position: absolute; opacity: 0; inset: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+  .switch span { position: absolute; inset: 0; background: var(--line); border-radius: 999px; transition: background .15s; pointer-events: none; }
+  .switch span::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: var(--card); transition: transform .15s; box-shadow: 0 1px 2px rgba(0,0,0,.25); }
+  .switch input:checked + span { background: var(--accent); }
+  .switch input:checked + span::after { transform: translateX(16px); }
+  .switch input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .tile { background: var(--chip); border-radius: 10px; padding: 10px 12px; }
+  .tile .label { color: var(--muted); font-size: 12.5px; }
+  .tile .value { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+  .tile .sub { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+
+  .days { display: flex; gap: 6px; flex-wrap: wrap; }
+  .days label { position: relative; }
+  .days input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+  .days span { display: inline-block; min-width: 44px; text-align: center; padding: 6px 8px; border: 1px solid var(--line); border-radius: 9px; font-size: 13px; color: var(--ink); background: var(--card); }
+  .days input:checked + span { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+  .days input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .check { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; color: var(--ink); }
+  .quick { display: flex; gap: 6px; margin-top: 6px; }
+
+  dialog { border: 1px solid var(--line); border-radius: 14px; padding: 0; background: var(--card); color: var(--ink); width: min(560px, calc(100vw - 24px)); }
+  dialog::backdrop { background: rgba(8, 10, 14, .5); }
+  dialog form { padding: 18px; display: grid; gap: 14px; }
+  dialog h3 { margin: 0; font-size: 17px; }
+  fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+  legend { font-size: 13px; color: var(--muted); padding: 0; margin-bottom: 6px; }
+
+  #login { max-width: 380px; margin: 9vh auto 0; }
+  #login form { display: grid; gap: 12px; }
+  .error { color: var(--bad); font-size: 13.5px; min-height: 1.2em; margin: 0; }
+  #toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: var(--ink); color: var(--bg); padding: 9px 16px; border-radius: 10px; font-size: 14px; max-width: calc(100vw - 32px); z-index: 10; box-shadow: 0 6px 20px rgba(0,0,0,.25); }
+  #toast.bad { background: var(--bad); color: #fff; }
+  dialog .error:empty { display: none; }
+  @media (max-width: 520px) { dl.stats { grid-template-columns: repeat(2, 1fr); } .power { font-size: 30px; } }
+  @media (max-width: 680px) {
+    table, tbody { display: block; }
+    thead { display: none; }
+    tbody tr { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+    tbody tr:last-child { border-bottom: 0; padding-bottom: 2px; }
+    td, td.num { display: block; border: 0; padding: 0; text-align: left; white-space: normal; min-width: 0; }
+    td[data-label]::before { content: attr(data-label); display: block; color: var(--muted); font-size: 12px; font-weight: 400; }
+    td.name, td.row-actions { grid-column: 1 / -1; }
+    td.name { font-size: 15px; }
+    td.row-actions { text-align: left; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <section id="login" class="card" hidden>
+    <h1 style="font-size:20px;margin:0 0 4px">Grizzl-E local</h1>
+    <p class="hint" style="margin-bottom:14px">Sign in with the email and password set in the server's configuration.</p>
+    <form id="loginForm">
+      <label class="field">Email <input type="email" id="loginEmail" autocomplete="username" required></label>
+      <label class="field">Password <input type="password" id="loginPassword" autocomplete="current-password" required></label>
+      <p class="error" id="loginError" role="alert"></p>
+      <button class="btn primary" type="submit">Sign in</button>
+    </form>
+  </section>
+
+  <div id="app" hidden>
+    <header class="top">
+      <div>
+        <h1 id="stationName">Grizzl-E local</h1>
+        <div class="sub" id="stationSub"></div>
+      </div>
+      <span class="pill" id="onlinePill">…</span>
+      <span class="spacer"></span>
+      <select id="stationSelect" aria-label="Charger" hidden style="width:auto"></select>
+      <button class="btn small" id="logoutBtn" type="button">Sign out</button>
+    </header>
+
+    <p class="card empty" id="noStations" hidden>No charger has connected yet. Point <code>ocpp.unitedchargers.com</code> at this server in your DNS and power-cycle the charger.</p>
+
+    <div id="stationView" hidden>
+      <div class="grid" id="connectors"></div>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>Charging schedules</h2>
+          <span class="spacer"></span>
+          <button class="btn small primary" type="button" id="addSchedule">Add schedule</button>
+        </div>
+        <div class="scroll"><table id="scheduleTable"></table></div>
+        <p class="hint" style="margin-top:10px">A connector set to <b>Scheduled</b> only charges inside the enabled windows below. <b>On</b> and <b>Off</b> ignore them.</p>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>Electricity rates</h2>
+          <span class="spacer"></span>
+          <button class="btn small primary" type="button" id="addRate">Add rate zone</button>
+        </div>
+        <div class="scroll"><table id="rateTable"></table></div>
+        <p class="hint" style="margin-top:10px" id="rateHint"></p>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h2>Sessions</h2></div>
+        <div class="tiles" id="tiles"></div>
+        <div class="scroll"><table id="sessionTable"></table></div>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h2>Charger settings</h2></div>
+        <form id="settingsForm">
+          <div class="form-grid">
+            <label class="field">Name <input type="text" id="setName" maxlength="60"></label>
+            <label class="field"><span id="limitLabel">Current limit (A)</span> <input type="number" id="setLimit" step="1" inputmode="numeric"></label>
+            <label class="field">Base price per kWh <input type="number" id="setPrice" step="0.0001" min="0" inputmode="decimal"></label>
+            <label class="field">Currency <input type="text" id="setCurrency" maxlength="3" placeholder="USD" style="text-transform:uppercase"></label>
+            <label class="field">Timezone <input type="text" id="setTimezone" placeholder="America/Denver" list="tzList"></label>
+          </div>
+          <datalist id="tzList"></datalist>
+          <div class="actions">
+            <button class="btn primary" type="submit">Save settings</button>
+            <span class="hint" id="deviceInfo"></span>
+            <span class="spacer"></span>
+            <button class="btn danger" type="button" id="rebootBtn">Reboot charger</button>
+          </div>
+        </form>
+      </section>
+    </div>
+  </div>
+</div>
+
+<dialog id="zoneDialog">
+  <form id="zoneForm">
+    <h3 id="zoneTitle">Add schedule</h3>
+    <label class="field">Name <input type="text" id="zName" maxlength="60" required></label>
+    <div class="form-grid" id="zRateFields">
+      <label class="field">Price per kWh <input type="number" id="zPrice" step="0.0001" min="0" inputmode="decimal"></label>
+    </div>
+    <label class="check"><input type="checkbox" id="zAllDay"> All day</label>
+    <div class="form-grid" id="zTimes">
+      <label class="field">Start <input type="time" id="zStart"></label>
+      <label class="field">End <input type="time" id="zEnd"></label>
+    </div>
+    <fieldset>
+      <legend>Days</legend>
+      <div class="days" id="zDays"></div>
+      <div class="quick">
+        <button class="btn small" type="button" data-days="0,1,2,3,4,5,6">Every day</button>
+        <button class="btn small" type="button" data-days="1,2,3,4,5">Weekdays</button>
+        <button class="btn small" type="button" data-days="0,6">Weekends</button>
+      </div>
+    </fieldset>
+    <div class="form-grid" id="zScheduleFields">
+      <label class="field">Connector <select id="zConnector"></select></label>
+      <label class="field">Current limit in this window (A) <input type="number" id="zLimit" step="1" inputmode="numeric" placeholder="No change"></label>
+    </div>
+    <label class="check" id="zWindowRow"><input type="checkbox" id="zWindow"> Also use as a charging window</label>
+    <p class="error" id="zoneError" role="alert"></p>
+    <div class="actions" style="margin-top:0">
+      <span class="spacer"></span>
+      <button class="btn" type="button" id="zoneCancel">Cancel</button>
+      <button class="btn primary" type="submit">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toast" hidden role="status"></div>
+
+<script>
+"use strict";
+const $ = (sel, root = document) => root.querySelector(sel);
+const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MODES = [["Active", "On"], ["Inactive", "Off"], ["Schedule", "Scheduled"]];
+const REFRESH_MS = 10000;
+
+const state = { token: null, stations: [], id: null, sessions: null, settingsFor: null, settingsDirty: false, editing: null, timer: null };
+
+/* ---------- small helpers ---------- */
+function h(tag, attrs, ...children) {
+  const el = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    if (value === null || value === undefined || value === false) continue;
+    if (key === "class") el.className = value;
+    else if (key === "text") el.textContent = value;
+    else if (key.startsWith("on")) el.addEventListener(key.slice(2), value);
+    else if (value === true) el.setAttribute(key, "");
+    else el.setAttribute(key, value);
+  }
+  for (const child of children.flat()) {
+    if (child === null || child === undefined || child === false) continue;
+    el.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return el;
+}
+const pad = (n) => String(n).padStart(2, "0");
+const isNum = (v) => typeof v === "number" && isFinite(v);
+function storage(action, value) {
+  try {
+    if (action === "get") return localStorage.getItem("grizzle_token");
+    if (value) localStorage.setItem("grizzle_token", value); else localStorage.removeItem("grizzle_token");
+  } catch (err) { /* private mode: keep the token in memory only */ }
+  return null;
+}
+let toastTimer = null;
+function toast(message, bad) {
+  const el = $("#toast");
+  el.textContent = message; el.className = bad ? "bad" : ""; el.hidden = false;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { el.hidden = true; }, bad ? 6000 : 2500);
+}
+function station() { return state.stations.find((s) => s.id === state.id) || null; }
+function money(value, currency) {
+  if (!isNum(value)) return "—";
+  try { return new Intl.NumberFormat(undefined, { style: "currency", currency: currency || "USD", maximumFractionDigits: 2 }).format(value); }
+  catch (err) { return value.toFixed(2) + " " + (currency || ""); }
+}
+function price(value, currency) {
+  if (!isNum(value)) return "—";
+  try { return new Intl.NumberFormat(undefined, { style: "currency", currency: currency || "USD", minimumFractionDigits: 2, maximumFractionDigits: 4 }).format(value); }
+  catch (err) { return value.toFixed(4) + " " + (currency || ""); }
+}
+const kwh = (wh, digits = 2) => (isNum(wh) ? (wh / 1000).toFixed(digits) + " kWh" : "—");
+function duration(seconds) {
+  if (!isNum(seconds)) return "—";
+  if (seconds < 60) return Math.max(0, Math.round(seconds)) + " s";
+  const m = Math.round(seconds / 60);
+  return m < 60 ? m + " min" : Math.floor(m / 60) + " h " + pad(m % 60) + " min";
+}
+function when(iso, tz, withDate = true) {
+  if (!iso) return "—";
+  const date = new Date(iso);
+  if (isNaN(date)) return "—";
+  const opts = withDate ? { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" } : { weekday: "short", hour: "numeric", minute: "2-digit" };
+  try { return date.toLocaleString(undefined, { ...opts, timeZone: tz || undefined }); }
+  catch (err) { return date.toLocaleString(undefined, opts); }
+}
+function describeDays(days) {
+  const set = [...new Set(days || [])].sort();
+  const key = set.join(",");
+  if (set.length === 0 || set.length === 7) return "Every day";
+  if (key === "1,2,3,4,5") return "Weekdays";
+  if (key === "0,6") return "Weekends";
+  return set.map((d) => DAY_NAMES[d]).join(", ");
+}
+function describeTime(zone) {
+  if (zone.allDay) return "All day";
+  const range = (suffix) => {
+    const start = pad(zone["startHours" + suffix] || 0) + ":" + pad(zone["startMinutes" + suffix] || 0);
+    const end = pad(zone["endHours" + suffix] || 0) + ":" + pad(zone["endMinutes" + suffix] || 0);
+    return start + " – " + end;
+  };
+  const second = ["startHours2", "startMinutes2", "endHours2", "endMinutes2"].some((k) => zone[k]);
+  return range("") + (second ? ", " + range("2") : "");
+}
+
+/* ---------- API ---------- */
+async function api(method, path, body) {
+  if (!state.token && path !== "/client/auth/login") throw new Error("Signed out");
+  const headers = {};
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (state.token) headers["Authorization"] = "Bearer " + state.token;
+  const res = await fetch(path, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (err) { data = text; }
+  if (res.status === 401 && path !== "/client/auth/login") { signOut(); throw new Error("Signed out"); }
+  if (!res.ok) throw new Error((data && data.message) || "HTTP " + res.status);
+  return data;
+}
+const stationPath = (suffix) => "/client/stations/" + encodeURIComponent(state.id) + suffix;
+const localPath = (suffix) => "/local/stations/" + encodeURIComponent(state.id) + suffix;
+async function act(promise, done) {
+  try { await promise; if (done) toast(done); await refresh(); }
+  catch (err) { if (err.message !== "Signed out") toast(err.message, true); await refresh().catch(() => {}); }
+}
+
+/* ---------- auth ---------- */
+function showLogin() {
+  clearInterval(state.timer);
+  $("#app").hidden = true; $("#login").hidden = false;
+  $("#loginEmail").focus();
+}
+function signOut() { state.token = null; storage("set", null); showLogin(); }
+$("#loginForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  $("#loginError").textContent = "";
+  try {
+    const data = await api("POST", "/client/auth/login", { emailOrPhone: $("#loginEmail").value.trim(), password: $("#loginPassword").value });
+    state.token = data.token; storage("set", data.token);
+    $("#loginPassword").value = "";
+    start();
+  } catch (err) { $("#loginError").textContent = err.message; }
+});
+$("#logoutBtn").addEventListener("click", signOut);
+
+/* ---------- rendering ---------- */
+function statusClass(status, online) {
+  if (!online) return "bad";
+  if (status === "Charging") return "good";
+  if (status === "Faulted" || status === "Unavailable") return "bad";
+  if (status === "Available") return "";
+  return "warn";
+}
+const STATUS_TEXT = { SuspendedEV: "Plugged in, car idle", SuspendedEVSE: "Paused by charger", Preparing: "Plugged in, waiting", Finishing: "Finishing", Available: "Not plugged in" };
+
+function renderHeader(st) {
+  $("#stationName").textContent = st.displayName || st.id;
+  const boot = st.bootNotification || {};
+  $("#stationSub").textContent = [st.model && st.model.displayName, st.id !== st.displayName ? st.id : null, boot.firmwareVersion && "firmware " + boot.firmwareVersion].filter(Boolean).join(" · ");
+  const pill = $("#onlinePill");
+  pill.textContent = st.online ? "Connected" : "Offline"; pill.className = "pill " + (st.online ? "good" : "bad");
+  const select = $("#stationSelect");
+  select.hidden = state.stations.length < 2;
+  select.replaceChildren(...state.stations.map((s) => h("option", { value: s.id, selected: s.id === state.id, text: s.displayName || s.id })));
+}
+
+function renderConnectors(st) {
+  const tz = (st.locationData || {}).timezone;
+  const cards = st.connectors.map((c, index) => {
+    const id = c.connectorId || index + 1;
+    const charge = c.charge;
+    const mv = (charge && charge.meterValues) || {};
+    const last = c.lastMeter || {};
+    const first = (list, fallback) => (Array.isArray(list) && isNum(list[0]) ? list[0] : fallback);
+    const amps = first(mv.currentImport, last.currentImport);
+    const volts = first(mv.voltage, last.voltage);
+    const temp = first(mv.temperature, last.temperature);
+    const status = st.online ? c.status : "Offline";
+    let hint = "";
+    if (c.mode === "Schedule") {
+      hint = (c.isActiveBySchedule ? "Inside a charging window" : "Outside charging windows") + (c.nextScheduleTime ? " until " + when(c.nextScheduleTime, tz, false) : c.isActiveBySchedule ? "" : " (none enabled)");
+    } else if (c.mode === "Inactive") hint = "Charging is switched off";
+    else hint = "Charges whenever a car is plugged in";
+    return h("section", { class: "card" },
+      h("div", { class: "card-head" },
+        h("h2", { text: st.connectors.length > 1 ? "Connector " + id : "Connector" }),
+        h("span", { class: "spacer" }),
+        h("span", { class: "pill " + statusClass(c.status, st.online), text: STATUS_TEXT[status] || status })),
+      h("div", { class: "power" }, ((c.power || 0) / 1000).toFixed(2), h("small", { text: "kW" })),
+      h("dl", { class: "stats" },
+        stat("Current", isNum(amps) ? amps.toFixed(1) + " A" : "—"),
+        stat("Voltage", isNum(volts) ? Math.round(volts) + " V" : "—"),
+        stat("Temperature", isNum(temp) ? Math.round(temp) + " °C" : "—"),
+        stat("Session energy", charge ? kwh(charge.energy) : "—"),
+        stat("Session time", charge ? duration(charge.duration) : "—"),
+        stat("Session cost", charge ? money(charge.priceTotal, st.currency) : "—")),
+      h("div", { class: "mode-row" },
+        h("div", { class: "seg", role: "group", "aria-label": "Charging mode" },
+          MODES.map(([value, label]) => h("button", {
+            type: "button", "aria-pressed": String(c.mode === value), text: label,
+            onclick: () => c.mode !== value && act(api("POST", stationPath("/mode"), { mode: value, connectorId: id }), "Connector " + id + ": " + label),
+          }))),
+        h("p", { class: "hint", text: hint })),
+      isNum(c.totalEnergyWh) ? h("p", { class: "hint", style: "margin-top:10px", text: "Lifetime " + kwh(c.totalEnergyWh, 1) }) : null);
+  });
+  $("#connectors").replaceChildren(...cards);
+}
+const td = (label, attrs, ...kids) => h("td", { "data-label": label, ...(attrs || {}) }, ...kids);
+const stat = (label, value) => h("div", null, h("dt", { text: label }), h("dd", { text: value, title: value }));
+
+function zoneSwitch(zone, label) {
+  return h("label", { class: "switch", title: label },
+    h("input", { type: "checkbox", checked: !!zone.scheduleEnabled, "aria-label": label,
+      onchange: (event) => act(api("POST", stationPath("/scheduleEnable"), { _id: zone._id, scheduleEnabled: event.target.checked })) }),
+    h("span"));
+}
+function rowActions(zone, kind) {
+  return h("td", { class: "row-actions" },
+    h("button", { class: "btn small", type: "button", text: "Edit", onclick: () => openZone(kind, zone) }),
+    h("button", { class: "btn small danger", type: "button", text: "Delete", onclick: () => {
+      if (!confirm('Delete "' + (zone.name || "this entry") + '"?')) return;
+      act(api("DELETE", stationPath((kind === "schedule" ? "/scheduleDelete/" : "/pricesByZoneDelete/") + encodeURIComponent(zone._id))), "Deleted");
+    } }));
+}
+function renderSchedules(st) {
+  const zones = (st.pricesByZone || []).filter((z) => z.isSchedule);
+  const table = $("#scheduleTable");
+  if (!zones.length) { table.replaceChildren(h("caption", { class: "empty", style: "text-align:left", text: "No schedules yet." })); return; }
+  table.replaceChildren(
+    h("thead", null, h("tr", null, ["Name", "Time", "Days", "Connector", "Limit", "Enabled", ""].map((t) => h("th", { text: t })))),
+    h("tbody", null, zones.map((z) => h("tr", null,
+      h("td", { class: "name", text: z.name || "—" }),
+      td("Time", { text: describeTime(z) }),
+      td("Days", { text: describeDays(z.days) }),
+      td("Connector", { text: z.connectorId ? String(z.connectorId) : st.connectors.length > 1 ? "All" : "—" }),
+      td("Limit", { text: isNum(z.currentLimit) ? z.currentLimit + " A" : "—" }),
+      td("Enabled", null, zoneSwitch(z, "Enable " + (z.name || "schedule"))),
+      rowActions(z, "schedule")))));
+}
+function renderRates(st) {
+  const zones = (st.pricesByZone || []).filter((z) => !z.isSchedule);
+  $("#rateHint").textContent = "Outside these zones the base price applies: " + price(st.priceKW || 0, st.currency) + " per kWh (change it under Charger settings).";
+  const table = $("#rateTable");
+  if (!zones.length) { table.replaceChildren(h("caption", { class: "empty", style: "text-align:left", text: "No rate zones. Every session uses the base price." })); return; }
+  table.replaceChildren(
+    h("thead", null, h("tr", null, ["Name", "Price per kWh", "Time", "Days", "Charging window", ""].map((t) => h("th", { text: t })))),
+    h("tbody", null, zones.map((z) => h("tr", null,
+      h("td", { class: "name", text: z.name || "—" }),
+      td("Price per kWh", { text: price(z.priceKW, st.currency) }),
+      td("Time", { text: describeTime(z) }),
+      td("Days", { text: describeDays(z.days) }),
+      td("Charging window", null, zoneSwitch(z, "Use " + (z.name || "zone") + " as a charging window")),
+      rowActions(z, "rate")))));
+}
+function renderSessions(st) {
+  const data = state.sessions;
+  const tiles = $("#tiles"), table = $("#sessionTable");
+  if (!data) { tiles.replaceChildren(); table.replaceChildren(); return; }
+  const cur = data.currency || st.currency;
+  const labels = [["today", "Today"], ["week", "Last 7 days"], ["month", "Last 30 days"], ["all", "All time"]];
+  tiles.replaceChildren(...labels.map(([key, label]) => {
+    const s = data.summary[key] || { energy_wh: 0, cost: 0, count: 0 };
+    return h("div", { class: "tile" },
+      h("div", { class: "label", text: label }),
+      h("div", { class: "value", text: money(s.cost, cur) }),
+      h("div", { class: "sub", text: kwh(s.energy_wh, s.energy_wh < 10000 ? 2 : 1) + " · " + s.count + (s.count === 1 ? " session" : " sessions") }));
+  }));
+  if (!data.sessions.length) { table.replaceChildren(h("caption", { class: "empty", style: "text-align:left", text: "No sessions recorded yet." })); return; }
+  const multi = st.connectors.length > 1;
+  table.replaceChildren(
+    h("thead", null, h("tr", null,
+      h("th", { text: "Started" }), multi ? h("th", { text: "Connector" }) : null, h("th", { text: "Duration" }),
+      h("th", { class: "num", text: "Energy" }), h("th", { class: "num", text: "Cost" }), h("th", { text: "Ended" }))),
+    h("tbody", null, data.sessions.map((s) => h("tr", null,
+      td("Started", { text: when(s.start_at, data.timezone) }),
+      multi ? td("Connector", { text: String(s.connector) }) : null,
+      td("Duration", { text: duration(s.duration_s) }),
+      td("Energy", { class: "num", text: kwh(s.energy_wh) }),
+      td("Cost", { class: "num", text: money(s.cost, cur) }),
+      td("Ended", null, s.active ? h("span", { class: "pill good", text: "In progress" }) : s.incomplete ? h("span", { class: "pill", text: "Not closed" }) : when(s.stop_at, data.timezone))))));
+}
+function limitBounds(st) {
+  const model = st.model || {};
+  const min = isNum(model.minCurrent) ? model.minCurrent : 6;
+  let max = isNum(model.maxCurrent) ? model.maxCurrent : 80;
+  if (isNum(st.dipSwitchCurrentLimit)) max = Math.min(max, st.dipSwitchCurrentLimit);
+  return [min, max];
+}
+function renderSettings(st, force) {
+  const boot = st.bootNotification || {};
+  $("#deviceInfo").textContent = [st.id, boot.chargePointModel, st.lastSeen && "last message " + when(st.lastSeen, (st.locationData || {}).timezone)].filter(Boolean).join(" · ");
+  if (!force && state.settingsFor === st.id && (state.settingsDirty || $("#settingsForm").contains(document.activeElement))) return;
+  const [min, max] = limitBounds(st);
+  $("#limitLabel").textContent = "Current limit (" + min + "–" + max + " A)";
+  $("#setLimit").min = min; $("#setLimit").max = max;
+  $("#setLimit").placeholder = isNum(st.dipSwitchCurrentLimit) ? "DIP switch: " + st.dipSwitchCurrentLimit : "Not set";
+  $("#setName").value = st.displayName || "";
+  $("#setLimit").value = isNum((st.smartCharging || {}).currentLimit) ? st.smartCharging.currentLimit : "";
+  $("#setPrice").value = isNum(st.priceKW) ? st.priceKW : 0;
+  $("#setCurrency").value = st.currency || "";
+  $("#setTimezone").value = (st.locationData || {}).timezone || "";
+  state.settingsFor = st.id; state.settingsDirty = false;
+}
+function render() {
+  const st = station();
+  $("#noStations").hidden = state.stations.length > 0;
+  $("#stationView").hidden = !st;
+  if (!st) { $("#stationName").textContent = "Grizzl-E local"; $("#stationSub").textContent = ""; $("#onlinePill").hidden = true; return; }
+  $("#onlinePill").hidden = false;
+  renderHeader(st); renderConnectors(st); renderSchedules(st); renderRates(st); renderSessions(st); renderSettings(st, false);
+}
+
+/* ---------- data ---------- */
+async function refresh() {
+  const data = await api("GET", "/client/stations");
+  state.stations = data.stations || [];
+  if (!state.stations.some((s) => s.id === state.id)) state.id = state.stations.length ? state.stations[0].id : null;
+  state.sessions = state.id ? await api("GET", localPath("/sessions?limit=100")) : null;
+  render();
+}
+function start() {
+  $("#login").hidden = true; $("#app").hidden = false;
+  clearInterval(state.timer);
+  refresh().catch((err) => err.message !== "Signed out" && toast(err.message, true));
+  state.timer = setInterval(() => {
+    if (document.hidden || $("#zoneDialog").open) return;
+    refresh().catch(() => {});
+  }, REFRESH_MS);
+}
+$("#stationSelect").addEventListener("change", (event) => { state.id = event.target.value; state.settingsFor = null; refresh().catch((err) => toast(err.message, true)); });
+
+/* ---------- settings ---------- */
+$("#settingsForm").addEventListener("input", () => { state.settingsDirty = true; });
+$("#settingsForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const st = station(); if (!st) return;
+  const jobs = [];
+  const local = {};
+  const name = $("#setName").value.trim(), tz = $("#setTimezone").value.trim(), cur = $("#setCurrency").value.trim().toUpperCase();
+  if (name && name !== st.displayName) local.displayName = name;
+  if (tz && tz !== (st.locationData || {}).timezone) local.timezone = tz;
+  if (cur && cur !== st.currency) local.currency = cur;
+  if (Object.keys(local).length) jobs.push(() => api("PUT", localPath("/settings"), local));
+  const priceValue = parseFloat($("#setPrice").value);
+  if (isNum(priceValue) && priceValue !== (st.priceKW || 0)) jobs.push(() => api("PUT", stationPath("/rate"), { priceKW: priceValue }));
+  const limitValue = parseInt($("#setLimit").value, 10);
+  if (isNum(limitValue) && limitValue !== (st.smartCharging || {}).currentLimit) jobs.push(() => api("PUT", stationPath("/currentLimit"), { value: limitValue }));
+  if (!jobs.length) { toast("Nothing to save"); state.settingsDirty = false; return; }
+  try {
+    for (const job of jobs) await job();
+    toast("Settings saved");
+  } catch (err) { toast(err.message, true); }
+  state.settingsDirty = false; state.settingsFor = null;
+  await refresh().catch(() => {});
+});
+$("#rebootBtn").addEventListener("click", () => {
+  if (confirm("Reboot the charger? Any session in progress will be interrupted.")) act(api("POST", stationPath("/reboot"), {}), "Reboot requested");
+});
+
+/* ---------- schedule / rate dialog ---------- */
+const dayBoxes = DAY_NAMES.map((name, index) => {
+  const input = h("input", { type: "checkbox", value: String(index), "aria-label": name });
+  $("#zDays").append(h("label", null, input, h("span", { text: name })));
+  return input;
+});
+document.querySelectorAll("#zoneForm [data-days]").forEach((button) => button.addEventListener("click", () => {
+  const days = button.dataset.days.split(",").map(Number);
+  dayBoxes.forEach((box, index) => { box.checked = days.includes(index); });
+}));
+$("#zAllDay").addEventListener("change", () => { $("#zTimes").hidden = $("#zAllDay").checked; });
+$("#zoneCancel").addEventListener("click", () => $("#zoneDialog").close());
+
+function openZone(kind, zone) {
+  const st = station(); if (!st) return;
+  state.editing = { kind, zone: zone || null };
+  const isSchedule = kind === "schedule";
+  $("#zoneTitle").textContent = (zone ? "Edit " : "Add ") + (isSchedule ? "schedule" : "rate zone");
+  $("#zRateFields").hidden = isSchedule; $("#zScheduleFields").hidden = !isSchedule; $("#zWindowRow").hidden = isSchedule;
+  $("#zPrice").required = !isSchedule;
+  const z = zone || { allDay: false, startHours: 23, startMinutes: 0, endHours: 7, endMinutes: 0, days: [0, 1, 2, 3, 4, 5, 6], connectorId: 0 };
+  $("#zName").value = z.name || "";
+  $("#zPrice").value = isNum(z.priceKW) ? z.priceKW : "";
+  $("#zAllDay").checked = !!z.allDay; $("#zTimes").hidden = !!z.allDay;
+  $("#zStart").value = pad(z.startHours || 0) + ":" + pad(z.startMinutes || 0);
+  $("#zEnd").value = pad(z.endHours || 0) + ":" + pad(z.endMinutes || 0);
+  const days = z.days && z.days.length ? z.days : [0, 1, 2, 3, 4, 5, 6];
+  dayBoxes.forEach((box, index) => { box.checked = days.includes(index); });
+  const options = [h("option", { value: "0", text: st.connectors.length > 1 ? "All connectors" : "Connector" })];
+  if (st.connectors.length > 1) st.connectors.forEach((c, i) => options.push(h("option", { value: String(c.connectorId || i + 1), text: "Connector " + (c.connectorId || i + 1) })));
+  $("#zConnector").replaceChildren(...options);
+  $("#zConnector").value = String(z.connectorId || 0);
+  const [min, max] = limitBounds(st);
+  $("#zLimit").min = min; $("#zLimit").max = max;
+  $("#zLimit").value = isNum(z.currentLimit) ? z.currentLimit : "";
+  $("#zWindow").checked = !!z.scheduleEnabled;
+  $("#zoneError").textContent = "";
+  $("#zoneDialog").showModal();
+  $("#zName").focus();
+}
+$("#addSchedule").addEventListener("click", () => openZone("schedule", null));
+$("#addRate").addEventListener("click", () => openZone("rate", null));
+
+$("#zoneForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const { kind, zone } = state.editing || {};
+  const isSchedule = kind === "schedule";
+  const error = (message) => { $("#zoneError").textContent = message; };
+  const days = dayBoxes.filter((box) => box.checked).map((box) => Number(box.value));
+  if (!days.length) return error("Pick at least one day.");
+  const allDay = $("#zAllDay").checked;
+  const [sh, sm] = ($("#zStart").value || "00:00").split(":").map(Number);
+  const [eh, em] = ($("#zEnd").value || "00:00").split(":").map(Number);
+  if (!allDay && sh === eh && sm === em) return error("Start and end are the same. Tick All day for a full day.");
+  const body = {
+    name: $("#zName").value.trim(), allDay, days,
+    startHours: allDay ? 0 : sh, startMinutes: allDay ? 0 : sm, endHours: allDay ? 0 : eh, endMinutes: allDay ? 0 : em,
+  };
+  if (!body.name) return error("Give it a name.");
+  if (isSchedule) {
+    const limit = parseInt($("#zLimit").value, 10);
+    body.isSchedule = true;
+    body.connectorId = Number($("#zConnector").value) || 0;
+    body.currentLimit = isNum(limit) ? limit : null;
+  } else {
+    const value = parseFloat($("#zPrice").value);
+    if (!isNum(value) || value < 0) return error("Enter the price per kWh.");
+    body.priceKW = value;
+    body.scheduleEnabled = $("#zWindow").checked;
+    if (!zone) { body.priceKWSummer = 0; body.useSeason = false; body.currentLimit = null; body.connectorId = 0; }
+  }
+  if (zone) body._id = zone._id;
+  try {
+    await api("POST", stationPath(isSchedule ? "/scheduleUpdate" : "/pricesByZoneUpdate"), { price: body });
+    $("#zoneDialog").close();
+    toast(zone ? "Saved" : isSchedule ? "Schedule added" : "Rate zone added");
+    await refresh();
+  } catch (err) { if (err.message !== "Signed out") error(err.message); }
+});
+
+/* ---------- boot ---------- */
+try {
+  const zones = Intl.supportedValuesOf ? Intl.supportedValuesOf("timeZone") : [];
+  $("#tzList").replaceChildren(...zones.map((z) => h("option", { value: z })));
+} catch (err) { /* older browsers: free text only */ }
+state.token = storage("get");
+if (state.token) start(); else showLogin();
+</script>
+</body>
+</html>

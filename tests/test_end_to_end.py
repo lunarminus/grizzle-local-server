@@ -358,3 +358,40 @@ async def test_config_keys_teach_dip_switch_and_connectors(tmp_path):
     assert station["idTag"] == "uc_default_auth"
     with pytest.raises(ValueError):
         await controller.set_current_limit(SERIAL, 36)  # above the DIP switch
+
+
+async def test_web_page_is_served_without_login(server):
+    resp = await server.get("/")
+    assert resp.status == 200 and resp.content_type == "text/html"
+    html = await resp.text()
+    assert "<title>Grizzl-E local</title>" in html
+    assert "http://" not in html.replace("http://www.w3.org", "") and "https://" not in html  # nothing external
+    assert "frame-ancestors" in resp.headers["Content-Security-Policy"]
+    assert (await server.get("/nope")).status == 404
+
+
+async def test_session_history_with_live_and_finished_sessions(server, charger):
+    api = Api(server)
+    await api.login()
+    await api.request("PUT", f"/client/stations/{SERIAL}/rate", {"priceKW": 0.5})
+    await charger.plug_in(1)
+    await wait_for(lambda: charger.status[1] == "Charging")
+    await asyncio.sleep(1.6)
+
+    data = await api.request("GET", f"/local/stations/{SERIAL}/sessions")
+    live = data["sessions"][0]
+    assert live["active"] is True and live["incomplete"] is False and live["stop_at"] is None
+    assert live["energy_wh"] > 0 and live["duration_s"] >= 1
+    assert live["cost"] == pytest.approx(live["energy_wh"] / 1000 * 0.5, rel=0.05)
+    assert data["summary"]["today"]["count"] == 1 and data["summary"]["all"]["energy_wh"] == live["energy_wh"]
+    assert data["timezone"] == "America/Denver" and data["currency"] == "USD"
+
+    await charger.unplug(1)
+    await wait_for(lambda: charger.status[1] == "Available")
+    await asyncio.sleep(0.3)
+    data = await api.request("GET", f"/local/stations/{SERIAL}/sessions?limit=5")
+    done = data["sessions"][0]
+    assert done["active"] is False and done["stop_at"] and done["reason"] == "EVDisconnected"
+    assert done["cost"] == pytest.approx(done["energy_wh"] / 1000 * 0.5, rel=0.05)
+    assert data["summary"]["week"]["cost"] == pytest.approx(done["cost"], abs=1e-4)
+    assert (await server.get(f"/local/stations/{SERIAL}/sessions")).status == 401

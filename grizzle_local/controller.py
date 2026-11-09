@@ -232,6 +232,8 @@ class Controller:
         connector["info"] = payload.get("info")
         if status == "Available":
             connector["power"] = 0
+            if connector.get("lastMeter"):  # no MeterValues arrive while idle, so don't show the last session's draw
+                connector["lastMeter"] = {**connector["lastMeter"], "current_a": 0.0, "power_w": 0.0}
             if connector.get("transaction"):
                 # Missed the StopTransaction; close the session so state doesn't stick.
                 self._finish_transaction(station, connector, None, "Available", now_iso())
