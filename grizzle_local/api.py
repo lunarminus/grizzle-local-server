@@ -14,7 +14,7 @@ from typing import Any
 
 from aiohttp import web
 
-from . import __version__
+from . import __version__, holiday_calendar
 from .controller import MODES, Controller, _parse_iso
 from .ocpp import OcppError
 
@@ -117,6 +117,8 @@ def build_station(controller: Controller, station: dict[str, Any]) -> dict[str, 
     model = station.get("model") or {}
     max_current = int(station.get("maxCurrent") or 40)
     limit = station.get("currentLimit")
+    holiday_settings = {**holiday_calendar.DEFAULTS, **(station.get("holidaysSettings") or {})}
+    today = datetime.now(controller.tz(station)).date()
     return {
         "id": station["id"],
         "_id": station["id"],
@@ -169,7 +171,13 @@ def build_station(controller: Controller, station: dict[str, Any]) -> dict[str, 
             "firmwareVersion": boot.get("firmwareVersion"),
         },
         "pricesByZone": station["pricesByZone"],
-        "holidays": [],
+        "holidaysSettings": holiday_settings,
+        "holidays": [
+            {"date": row["date"], "name": row["name"]}
+            for row in (holiday_calendar.upcoming(holiday_settings, today, 370) if holiday_settings["enabled"] else [])
+            if row["included"]
+        ],
+        "holidayToday": holiday_calendar.holiday_name(holiday_settings, today) if holiday_settings["enabled"] else None,
         "sharedWith": [],
         "isSharedAccess": False,
         "dipSwitchCurrentLimit": station.get("dipSwitchCurrentLimit"),
@@ -340,7 +348,10 @@ async def schedule_update(request: web.Request) -> web.Response:
         return _json_error(400, "price object required")
     if request.path.endswith("scheduleUpdate"):
         price["isSchedule"] = True
-    zone = await _controller(request).upsert_zone(station["id"], price)
+    try:
+        zone = await _controller(request).upsert_zone(station["id"], price)
+    except ValueError as err:
+        return _json_error(400, str(err))
     data = build_station(_controller(request), station)
     data["price"] = zone
     data["_id"] = zone["_id"]  # the HA integration reads the new schedule id from here
@@ -452,6 +463,44 @@ async def local_sessions(request: web.Request) -> web.Response:
     )
 
 
+def _holiday_payload(controller: Controller, station: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+    today = datetime.now(controller.tz(station)).date()
+    return {
+        "settings": settings,
+        "upcoming": holiday_calendar.upcoming(settings, today, 370),
+        "today": holiday_calendar.holiday_name(settings, today) if settings.get("enabled") else None,
+    }
+
+
+async def local_holidays_get(request: web.Request) -> web.Response:
+    station = _station_or_404(request)
+    settings = {**holiday_calendar.DEFAULTS, **(station.get("holidaysSettings") or {})}
+    return web.json_response(_holiday_payload(_controller(request), station, settings))
+
+
+async def local_holidays_put(request: web.Request) -> web.Response:
+    station = _station_or_404(request)
+    try:
+        settings = await _controller(request).set_holidays(station["id"], await _body(request))
+    except (TypeError, ValueError) as err:
+        return _json_error(400, str(err))
+    return web.json_response(_holiday_payload(_controller(request), station, settings))
+
+
+async def local_holidays_preview(request: web.Request) -> web.Response:
+    """What the calendar would look like with these settings, without saving them."""
+    station = _station_or_404(request)
+    try:
+        settings = holiday_calendar.normalize(await _body(request))
+    except (TypeError, ValueError) as err:
+        return _json_error(400, str(err))
+    return web.json_response(_holiday_payload(_controller(request), station, settings))
+
+
+async def local_holiday_countries(request: web.Request) -> web.Response:
+    return web.json_response({"countries": holiday_calendar.countries()})
+
+
 async def local_log(request: web.Request) -> web.Response:
     station = _station_or_404(request)
     conn = _controller(request).connections.get(station["id"])
@@ -526,6 +575,10 @@ def add_routes(app: web.Application) -> None:
     app.router.add_get("/client/stations/{station_id}/events", events)
     app.router.add_get("/local/stations/{station_id}/samples", local_samples)
     app.router.add_get("/local/stations/{station_id}/sessions", local_sessions)
+    app.router.add_get("/local/holidays/countries", local_holiday_countries)
+    app.router.add_get("/local/stations/{station_id}/holidays", local_holidays_get)
+    app.router.add_put("/local/stations/{station_id}/holidays", local_holidays_put)
+    app.router.add_post("/local/stations/{station_id}/holidays/preview", local_holidays_preview)
     app.router.add_get("/local/stations/{station_id}/log", local_log)
     app.router.add_post("/local/stations/{station_id}/ocpp", local_ocpp_call)
     app.router.add_put("/local/stations/{station_id}/settings", local_settings)

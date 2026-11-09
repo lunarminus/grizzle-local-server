@@ -122,6 +122,17 @@
   #toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: var(--ink); color: var(--bg); padding: 9px 16px; border-radius: 10px; font-size: 14px; max-width: calc(100vw - 32px); z-index: 10; box-shadow: 0 6px 20px rgba(0,0,0,.25); }
   #toast.bad { background: var(--bad); color: #fff; }
   dialog .error:empty { display: none; }
+  .holiday-list { max-height: 300px; overflow-y: auto; border: 1px solid var(--line); border-radius: 10px; margin: 14px 0 12px; }
+  .holiday-list:empty { display: none; }
+  .holiday-row { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 14px; }
+  .holiday-row:last-child { border-bottom: 0; }
+  .holiday-row .date { color: var(--muted); font-variant-numeric: tabular-nums; flex: 0 0 132px; }
+  .holiday-row .title { flex: 1; min-width: 0; }
+  .holiday-row.off .title { color: var(--muted); text-decoration: line-through; }
+  .holiday-row input[type=checkbox] { flex: none; width: 16px; height: 16px; accent-color: var(--accent); }
+  .add-row { display: grid; grid-template-columns: minmax(140px, 180px) 1fr auto; gap: 8px; align-items: end; }
+  input[type=date] { font: inherit; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: 9px; padding: 7px 10px; width: 100%; min-width: 0; }
+  @media (max-width: 520px) { .add-row { grid-template-columns: 1fr; } .holiday-row .date { flex-basis: 96px; } }
   @media (max-width: 520px) { dl.stats { grid-template-columns: repeat(2, 1fr); } .power { font-size: 30px; } }
   @media (max-width: 680px) {
     table, tbody { display: block; }
@@ -157,6 +168,7 @@
         <div class="sub" id="stationSub"></div>
       </div>
       <span class="pill" id="onlinePill">…</span>
+      <span class="pill warn" id="holidayPill" hidden></span>
       <span class="spacer"></span>
       <select id="stationSelect" aria-label="Charger" hidden style="width:auto"></select>
       <button class="btn small" id="logoutBtn" type="button">Sign out</button>
@@ -185,6 +197,33 @@
         </div>
         <div class="scroll"><table id="rateTable"></table></div>
         <p class="hint" style="margin-top:10px" id="rateHint"></p>
+      </section>
+
+      <section class="card">
+        <form id="holidayForm">
+          <div class="card-head">
+            <h2>Statutory holidays</h2>
+            <span class="spacer"></span>
+            <label class="check"><span class="switch"><input type="checkbox" id="holEnabled" aria-label="Use statutory holidays"><span></span></span> Use holidays</label>
+          </div>
+          <div class="form-grid">
+            <label class="field">Country <select id="holCountry"><option value="">Choose…</option></select></label>
+            <label class="field">Region <select id="holRegion"><option value="">Whole country</option></select></label>
+            <label class="field">Holiday price per kWh (optional) <input type="number" id="holPrice" step="0.0001" min="0" inputmode="decimal" placeholder="Use the normal rates"></label>
+            <label class="check" style="padding-bottom:8px"><input type="checkbox" id="holObserved"> Include observed days</label>
+          </div>
+          <div class="holiday-list" id="holList"></div>
+          <div class="add-row">
+            <label class="field">Add a date <input type="date" id="holAddDate"></label>
+            <label class="field">Name <input type="text" id="holAddName" maxlength="60" placeholder="e.g. Utility holiday"></label>
+            <button class="btn" type="button" id="holAddBtn">Add</button>
+          </div>
+          <div class="actions">
+            <button class="btn primary" type="submit">Save holidays</button>
+            <span class="hint" id="holHint"></span>
+          </div>
+        </form>
+        <p class="hint" style="margin-top:10px">Each schedule and rate zone chooses how it treats these days: like any other day, not at all, in addition to its days, or only on holidays. A holiday price, if set, replaces every rate zone on a holiday. Untick a holiday your utility doesn't count.</p>
       </section>
 
       <section class="card">
@@ -228,7 +267,7 @@
       <label class="field">Start <input type="time" id="zStart"></label>
       <label class="field">End <input type="time" id="zEnd"></label>
     </div>
-    <fieldset>
+    <fieldset id="zDaysField">
       <legend>Days</legend>
       <div class="days" id="zDays"></div>
       <div class="quick">
@@ -237,6 +276,15 @@
         <button class="btn small" type="button" data-days="0,6">Weekends</button>
       </div>
     </fieldset>
+    <label class="field">On statutory holidays
+      <select id="zHolidays">
+        <option value="same">Treat a holiday like any other day</option>
+        <option value="skip">Not on holidays</option>
+        <option value="also">On its days, and on every holiday too</option>
+        <option value="only">Only on holidays</option>
+      </select>
+    </label>
+    <p class="hint" id="zHolidayHint" hidden style="margin-top:-8px">Holidays are switched off for this charger, so this has no effect until you turn them on.</p>
     <div class="form-grid" id="zScheduleFields">
       <label class="field">Connector <select id="zConnector"></select></label>
       <label class="field">Current limit in this window (A) <input type="number" id="zLimit" step="1" inputmode="numeric" placeholder="No change"></label>
@@ -260,7 +308,8 @@ const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MODES = [["Active", "On"], ["Inactive", "Off"], ["Schedule", "Scheduled"]];
 const REFRESH_MS = 10000;
 
-const state = { token: null, stations: [], id: null, sessions: null, settingsFor: null, settingsDirty: false, editing: null, timer: null };
+const state = { token: null, stations: [], id: null, sessions: null, settingsFor: null, settingsDirty: false, editing: null, timer: null,
+  holidays: null, holidaysFor: null, holidaysDirty: false, countries: null };
 
 /* ---------- small helpers ---------- */
 function h(tag, attrs, ...children) {
@@ -319,6 +368,14 @@ function when(iso, tz, withDate = true) {
   const opts = withDate ? { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" } : { weekday: "short", hour: "numeric", minute: "2-digit" };
   try { return date.toLocaleString(undefined, { ...opts, timeZone: tz || undefined }); }
   catch (err) { return date.toLocaleString(undefined, opts); }
+}
+function describeZoneDays(zone) {
+  const mode = zone.holidays || "same";
+  if (mode === "only") return "Holidays only";
+  const text = describeDays(zone.days);
+  if (mode === "skip") return text + ", not holidays";
+  if (mode === "also") return text + " + holidays";
+  return text;
 }
 function describeDays(days) {
   const set = [...new Set(days || [])].sort();
@@ -395,6 +452,8 @@ function renderHeader(st) {
   $("#stationSub").textContent = [st.model && st.model.displayName, st.id !== st.displayName ? st.id : null, boot.firmwareVersion && "firmware " + boot.firmwareVersion].filter(Boolean).join(" · ");
   const pill = $("#onlinePill");
   pill.textContent = st.online ? "Connected" : "Offline"; pill.className = "pill " + (st.online ? "good" : "bad");
+  const holiday = $("#holidayPill");
+  holiday.hidden = !st.holidayToday; holiday.textContent = st.holidayToday ? "Holiday: " + st.holidayToday : "";
   const select = $("#stationSelect");
   select.hidden = state.stations.length < 2;
   select.replaceChildren(...state.stations.map((s) => h("option", { value: s.id, selected: s.id === state.id, text: s.displayName || s.id })));
@@ -467,7 +526,7 @@ function renderSchedules(st) {
     h("tbody", null, zones.map((z) => h("tr", null,
       h("td", { class: "name", text: z.name || "—" }),
       td("Time", { text: describeTime(z) }),
-      td("Days", { text: describeDays(z.days) }),
+      td("Days", { text: describeZoneDays(z) }),
       td("Connector", { text: z.connectorId ? String(z.connectorId) : st.connectors.length > 1 ? "All" : "—" }),
       td("Limit", { text: isNum(z.currentLimit) ? z.currentLimit + " A" : "—" }),
       td("Enabled", null, zoneSwitch(z, "Enable " + (z.name || "schedule"))),
@@ -484,7 +543,7 @@ function renderRates(st) {
       h("td", { class: "name", text: z.name || "—" }),
       td("Price per kWh", { text: price(z.priceKW, st.currency) }),
       td("Time", { text: describeTime(z) }),
-      td("Days", { text: describeDays(z.days) }),
+      td("Days", { text: describeZoneDays(z) }),
       td("Charging window", null, zoneSwitch(z, "Use " + (z.name || "zone") + " as a charging window")),
       rowActions(z, "rate")))));
 }
@@ -552,6 +611,13 @@ async function refresh() {
   state.stations = data.stations || [];
   if (!state.stations.some((s) => s.id === state.id)) state.id = state.stations.length ? state.stations[0].id : null;
   state.sessions = state.id ? await api("GET", localPath("/sessions?limit=100")) : null;
+  if (state.id && (state.holidaysFor !== state.id || !state.holidaysDirty)) {
+    if (state.holidaysFor !== state.id || !$("#holidayForm").contains(document.activeElement)) {
+      state.holidays = await api("GET", localPath("/holidays"));
+      state.holidaysFor = state.id; state.holidaysDirty = false;
+      renderHolidays();
+    }
+  }
   render();
 }
 function start() {
@@ -563,7 +629,7 @@ function start() {
     refresh().catch(() => {});
   }, REFRESH_MS);
 }
-$("#stationSelect").addEventListener("change", (event) => { state.id = event.target.value; state.settingsFor = null; refresh().catch((err) => toast(err.message, true)); });
+$("#stationSelect").addEventListener("change", (event) => { state.id = event.target.value; state.settingsFor = null; state.holidaysFor = null; refresh().catch((err) => toast(err.message, true)); });
 
 /* ---------- settings ---------- */
 $("#settingsForm").addEventListener("input", () => { state.settingsDirty = true; });
@@ -629,6 +695,9 @@ function openZone(kind, zone) {
   $("#zLimit").min = min; $("#zLimit").max = max;
   $("#zLimit").value = isNum(z.currentLimit) ? z.currentLimit : "";
   $("#zWindow").checked = !!z.scheduleEnabled;
+  $("#zHolidays").value = z.holidays || "same";
+  $("#zDaysField").hidden = $("#zHolidays").value === "only";
+  $("#zHolidayHint").hidden = !!(st.holidaysSettings && st.holidaysSettings.enabled);
   $("#zoneError").textContent = "";
   $("#zoneDialog").showModal();
   $("#zName").focus();
@@ -641,14 +710,15 @@ $("#zoneForm").addEventListener("submit", async (event) => {
   const { kind, zone } = state.editing || {};
   const isSchedule = kind === "schedule";
   const error = (message) => { $("#zoneError").textContent = message; };
-  const days = dayBoxes.filter((box) => box.checked).map((box) => Number(box.value));
-  if (!days.length) return error("Pick at least one day.");
+  const holidayMode = $("#zHolidays").value;
+  const days = holidayMode === "only" ? [] : dayBoxes.filter((box) => box.checked).map((box) => Number(box.value));
+  if (holidayMode !== "only" && !days.length) return error("Pick at least one day.");
   const allDay = $("#zAllDay").checked;
   const [sh, sm] = ($("#zStart").value || "00:00").split(":").map(Number);
   const [eh, em] = ($("#zEnd").value || "00:00").split(":").map(Number);
   if (!allDay && sh === eh && sm === em) return error("Start and end are the same. Tick All day for a full day.");
   const body = {
-    name: $("#zName").value.trim(), allDay, days,
+    name: $("#zName").value.trim(), allDay, days, holidays: holidayMode,
     startHours: allDay ? 0 : sh, startMinutes: allDay ? 0 : sm, endHours: allDay ? 0 : eh, endMinutes: allDay ? 0 : em,
   };
   if (!body.name) return error("Give it a name.");
@@ -671,6 +741,120 @@ $("#zoneForm").addEventListener("submit", async (event) => {
     toast(zone ? "Saved" : isSchedule ? "Schedule added" : "Rate zone added");
     await refresh();
   } catch (err) { if (err.message !== "Signed out") error(err.message); }
+});
+
+/* ---------- statutory holidays ---------- */
+$("#zHolidays").addEventListener("change", () => { $("#zDaysField").hidden = $("#zHolidays").value === "only"; });
+
+function countryName(code) {
+  try { return new Intl.DisplayNames(undefined, { type: "region" }).of(code) || code; } catch (err) { return code; }
+}
+async function loadCountries() {
+  if (state.countries) return state.countries;
+  const data = await api("GET", "/local/holidays/countries");
+  state.countries = data.countries.map((c) => ({ ...c, name: countryName(c.code) })).sort((a, b) => a.name.localeCompare(b.name));
+  return state.countries;
+}
+function fillRegions(countryCode, selected) {
+  const country = (state.countries || []).find((c) => c.code === countryCode);
+  const subs = country ? country.subdivisions : [];
+  const region = $("#holRegion");
+  region.replaceChildren(h("option", { value: "", text: subs.length ? "Whole country" : "No regions" }),
+    ...subs.map((sub) => h("option", { value: sub.code, text: sub.name === sub.code ? sub.code : sub.name + " (" + sub.code + ")" })));
+  region.disabled = !subs.length;
+  region.value = subs.some((sub) => sub.code === selected) ? selected : "";
+}
+function holidayDraft() {
+  const current = (state.holidays && state.holidays.settings) || {};
+  const priceValue = parseFloat($("#holPrice").value);
+  return {
+    enabled: $("#holEnabled").checked,
+    country: $("#holCountry").value || null,
+    subdivision: $("#holRegion").value || null,
+    observed: $("#holObserved").checked,
+    priceKW: isNum(priceValue) ? priceValue : null,
+    excludedNames: [...(current.excludedNames || [])],
+    extraDates: [...(current.extraDates || [])],
+  };
+}
+function renderHolidayList() {
+  const data = state.holidays; if (!data) return;
+  const fmt = (iso) => {
+    const [y, m, d] = iso.split("-").map(Number);
+    return new Date(Date.UTC(y, m - 1, d, 12)).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
+  };
+  $("#holList").replaceChildren(...data.upcoming.map((row) => h("div", { class: "holiday-row" + (row.included ? "" : " off") },
+    row.custom
+      ? h("input", { type: "checkbox", checked: true, disabled: true, "aria-label": row.name })
+      : h("input", { type: "checkbox", checked: row.included, "aria-label": "Count " + row.name + " as a holiday",
+          onchange: (event) => {
+            const draft = holidayDraft();
+            const names = new Set(draft.excludedNames);
+            if (event.target.checked) names.delete(row.key); else names.add(row.key);
+            draft.excludedNames = [...names];
+            previewHolidays(draft);
+          } }),
+    h("span", { class: "date", text: fmt(row.date) }),
+    h("span", { class: "title", text: row.name + (row.custom ? " (added)" : "") }),
+    row.custom ? h("button", { class: "btn small danger", type: "button", text: "Remove", onclick: () => {
+      const draft = holidayDraft();
+      draft.extraDates = draft.extraDates.filter((item) => item.date !== row.date);
+      previewHolidays(draft);
+    } }) : null)));
+  const settings = data.settings;
+  const count = data.upcoming.filter((row) => row.included).length;
+  let hint = "";
+  if (!settings.country && !data.upcoming.length) hint = "Pick a country to load its holidays, or add your own dates.";
+  else hint = count + (count === 1 ? " holiday" : " holidays") + " in the next 12 months" + (state.holidaysDirty ? " (not saved yet)" : settings.enabled ? "" : "; switched off");
+  if (data.today) hint = "Today is " + data.today + ". " + hint;
+  $("#holHint").textContent = hint;
+}
+async function renderHolidays() {
+  const data = state.holidays; if (!data) return;
+  try { await loadCountries(); } catch (err) { return; }
+  const settings = data.settings;
+  const country = $("#holCountry");
+  if (country.options.length <= 1) {
+    country.replaceChildren(h("option", { value: "", text: "Choose…" }), ...state.countries.map((c) => h("option", { value: c.code, text: c.name })));
+  }
+  $("#holEnabled").checked = !!settings.enabled;
+  country.value = settings.country || "";
+  fillRegions(settings.country, settings.subdivision);
+  $("#holObserved").checked = settings.observed !== false;
+  $("#holPrice").value = isNum(settings.priceKW) ? settings.priceKW : "";
+  renderHolidayList();
+}
+async function previewHolidays(draft) {
+  try {
+    state.holidays = await api("POST", localPath("/holidays/preview"), draft);
+    state.holidaysDirty = true;
+    renderHolidayList();
+  } catch (err) { if (err.message !== "Signed out") toast(err.message, true); }
+}
+$("#holCountry").addEventListener("change", () => { fillRegions($("#holCountry").value, null); previewHolidays(holidayDraft()); });
+$("#holRegion").addEventListener("change", () => previewHolidays(holidayDraft()));
+$("#holObserved").addEventListener("change", () => previewHolidays(holidayDraft()));
+$("#holEnabled").addEventListener("change", () => { state.holidaysDirty = true; renderHolidayList(); });
+$("#holPrice").addEventListener("input", () => { state.holidaysDirty = true; });
+$("#holAddBtn").addEventListener("click", () => {
+  const day = $("#holAddDate").value;
+  if (!day) { toast("Pick a date to add", true); return; }
+  const draft = holidayDraft();
+  draft.extraDates = draft.extraDates.filter((item) => item.date !== day).concat([{ date: day, name: $("#holAddName").value.trim() || "Holiday" }]);
+  $("#holAddDate").value = ""; $("#holAddName").value = "";
+  previewHolidays(draft);
+});
+$("#holidayForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const draft = holidayDraft();
+  if (draft.enabled && !draft.country && !draft.extraDates.length) { toast("Pick a country or add a date first", true); return; }
+  try {
+    state.holidays = await api("PUT", localPath("/holidays"), draft);
+    state.holidaysDirty = false;
+    toast("Holidays saved");
+    await renderHolidays();
+    await refresh();
+  } catch (err) { if (err.message !== "Signed out") toast(err.message, true); }
 });
 
 /* ---------- boot ---------- */

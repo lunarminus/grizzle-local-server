@@ -25,11 +25,15 @@ Nothing leaves your LAN: the charger talks to this container, and the
   JSON (`"configurationKey":]`). The server repairs or drops bad frames instead of
   letting the socket die.
 - **Built-in web page** at `http://<server>:9000/` for live status, charging modes,
-  schedules, electricity rates, charger settings and session history with cost.
+  schedules, electricity rates, statutory holidays, charger settings and session history
+  with cost.
+- **Statutory holidays** for 250 countries and their states or provinces, computed
+  offline. Each schedule and rate zone chooses how it treats a holiday, and a flat holiday
+  price can replace the rate zones for the day.
 - **REST API shaped like `connect-api.unitedchargers.com`**, so the Home Assistant
   integration only needs a different server URL. Plus a few `/local/...` extras:
   raw OCPP calls, the frame log, meter history.
-- Single process, single port, one dependency (aiohttp), state survives restarts.
+- Single process, single port, two dependencies (aiohttp, holidays), state survives restarts.
 
 > Reverse engineered from the Grizzl-E Connect app and community OCPP work. Not
 > affiliated with United Chargers. MIT licensed. Confirmed connecting and controlling a real Grizzl-E
@@ -148,6 +152,13 @@ Browse to `http://<server-ip>:9000/` and sign in with `GRIZZLE_API_EMAIL` /
 - **Electricity rates**: a base price per kWh plus time-of-use zones. Session cost is
   computed from whichever price applies as energy is delivered, so set the price before
   you care about cost; earlier sessions keep the cost they were recorded with.
+- **Statutory holidays**: pick a country and region to load its holidays, untick the ones
+  your utility doesn't count, add your own dates, and optionally set a flat holiday price.
+  Every schedule and rate zone then has an *On statutory holidays* choice: treat it like
+  any other day (the default), not on holidays, on its days and every holiday too, or only
+  on holidays. For example "Peak, weekdays, not on holidays" plus a holiday price gives the
+  usual utility rule that holidays are off-peak all day. An overnight window belongs to
+  the day it starts on.
 - **Sessions**: every session with duration, energy and cost, and totals for today, the
   last 7 and 30 days, and all time.
 - **Charger settings**: name, current limit (bounded by the DIP switch), base price,
@@ -194,11 +205,18 @@ Local extras (same auth):
 |---|---|
 | `POST /local/stations/{serial}/ocpp` | `{"action": "GetConfiguration", "payload": {}}`: send any OCPP call, get the raw reply |
 | `GET /local/stations/{serial}/sessions?limit=100` | session history incl. sessions in progress, plus totals (what the web page shows) |
+| `GET` / `PUT /local/stations/{serial}/holidays` | holiday settings: `{"enabled", "country", "subdivision", "observed", "priceKW", "excludedNames", "extraDates"}`; returns them with the next 12 months of holidays |
+| `POST /local/stations/{serial}/holidays/preview` | the same response for settings you haven't saved |
+| `GET /local/holidays/countries` | supported countries and subdivisions |
 | `GET /local/stations/{serial}/log` | the last 200 OCPP frames in either direction |
 | `GET /local/stations/{serial}/samples?since=ISO&connector=1` | meter history (kept 90 days) |
 | `PUT /local/stations/{serial}/settings` | `{"displayName", "timezone", "connectorCount", "maxCurrent", "minCurrent", "dipSwitchCurrentLimit"}` |
 | `DELETE /local/stations/{serial}` | forget a station (only while it's disconnected) |
 | `GET /health` | no auth |
+
+Schedules and rate zones (the `price` object) accept one field the cloud doesn't have:
+`"holidays": "same" | "skip" | "also" | "only"`. Stations also report `holidaysSettings`,
+the upcoming `holidays` and `holidayToday`.
 
 ## Development
 
@@ -215,6 +233,7 @@ grizzle_local/
 ├── ocpp.py        # OCPP-J framing, call/result matching, malformed-frame repair
 ├── controller.py  # station state, message handlers, mode/schedule enforcement, commands
 ├── schedules.py   # pricesByZone window evaluation, next change, price lookup
+├── holiday_calendar.py  # statutory holidays per country/region (the `holidays` package)
 ├── api.py         # REST facade + station JSON in the cloud's shape
 ├── store.py       # state.json + history.sqlite
 ├── config.py      # env vars

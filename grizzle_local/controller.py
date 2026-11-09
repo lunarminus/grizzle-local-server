@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from . import holiday_calendar
 from .config import Settings
 from .ocpp import ChargePointConnection, OcppError, now_iso
 from .schedules import charging_allowed, next_change, price_now
@@ -145,6 +146,28 @@ class Controller:
         except Exception:  # noqa: BLE001 - bad tz name in state
             return ZoneInfo("UTC")
 
+    # --- holidays, windows and prices -------------------------------------------
+
+    def holiday_check(self, station: dict[str, Any]) -> Any:
+        """A ``date -> bool`` for this station's holidays, or None when holidays are switched off."""
+        settings = station.get("holidaysSettings") or {}
+        if not settings.get("enabled"):
+            return None
+        return lambda day: holiday_calendar.holiday_name(settings, day) is not None
+
+    def window_now(self, station: dict[str, Any], now: datetime, cid: int) -> dict[str, Any] | None:
+        return charging_allowed(station["pricesByZone"], now, cid, self.holiday_check(station))
+
+    def price_at(self, station: dict[str, Any], now: datetime) -> float | None:
+        settings = station.get("holidaysSettings") or {}
+        return price_now(
+            station["pricesByZone"],
+            now,
+            _to_float(station.get("priceKW")),
+            self.holiday_check(station),
+            settings.get("priceKW"),
+        )
+
     def is_online(self, station_id: str) -> bool:
         conn = self.connections.get(station_id)
         return conn is not None and not conn.ws.closed
@@ -250,7 +273,7 @@ class Controller:
         started = payload.get("timestamp") or now_iso()
         meter_start = payload.get("meterStart")
         local_now = datetime.now(self.tz(station))
-        price = price_now(station["pricesByZone"], local_now, _to_float(station.get("priceKW")))
+        price = self.price_at(station, local_now)
         connector["transaction"] = {
             "id": tid,
             "idTag": payload.get("idTag"),
@@ -392,7 +415,7 @@ class Controller:
                 if isinstance(previous, (int, float)):
                     delta_kwh = max(0.0, tx["energy"] - previous) / 1000
                     local_now = datetime.now(self.tz(station))
-                    price = price_now(station["pricesByZone"], local_now, _to_float(station.get("priceKW"))) or 0
+                    price = self.price_at(station, local_now) or 0
                     tx["priceKW"] = price
                     tx["priceTotal"] = float(tx.get("priceTotal") or 0) + delta_kwh * price
                 tx["lastSessionEnergy"] = tx["energy"]
@@ -489,7 +512,7 @@ class Controller:
         limit = station.get("currentLimit")
         local_now = datetime.now(self.tz(station))
         for cid in range(1, int(station["connectorCount"]) + 1):
-            zone = charging_allowed(station["pricesByZone"], local_now, cid)
+            zone = self.window_now(station, local_now, cid)
             if zone and isinstance(zone.get("currentLimit"), (int, float)):
                 limit = int(zone["currentLimit"])
         return int(limit) if limit is not None else None
@@ -531,9 +554,9 @@ class Controller:
             return
         connector = self._ensure_connector(station, cid)
         local_now = datetime.now(self.tz(station))
-        window = charging_allowed(station["pricesByZone"], local_now, cid)
+        window = self.window_now(station, local_now, cid)
         connector["isActiveBySchedule"] = window is not None
-        nxt = next_change(station["pricesByZone"], local_now, cid)
+        nxt = next_change(station["pricesByZone"], local_now, cid, self.holiday_check(station))
         connector["nextScheduleTime"] = nxt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z") if nxt else None
         mode = connector.get("mode") or "Active"
         allowed = mode == "Active" or (mode == "Schedule" and window is not None)
@@ -608,6 +631,8 @@ class Controller:
     async def upsert_zone(self, station_id: str, price: dict[str, Any]) -> dict[str, Any]:
         station = self._require(station_id)
         zones = station["pricesByZone"]
+        if price.get("holidays") not in (None, *holiday_calendar.HOLIDAY_MODES):
+            raise ValueError(f"holidays must be one of {holiday_calendar.HOLIDAY_MODES}")
         zone_id = price.get("_id")
         existing = next((z for z in zones if z.get("_id") == zone_id), None) if zone_id else None
         if existing is None:
@@ -647,6 +672,13 @@ class Controller:
         for cid in range(1, int(station["connectorCount"]) + 1):
             await self._enforce(station_id, cid)
         await self._apply_limit(station_id)
+
+    async def set_holidays(self, station_id: str, raw: dict[str, Any]) -> dict[str, Any]:
+        station = self._require(station_id)
+        station["holidaysSettings"] = holiday_calendar.normalize(raw)
+        self._dirty = True
+        await self._refresh_all(station_id)
+        return station["holidaysSettings"]
 
     async def reboot(self, station_id: str) -> dict[str, Any]:
         self._require(station_id)

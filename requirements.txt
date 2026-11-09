@@ -1,1 +1,2 @@
 aiohttp>=3.9,<4
+holidays>=0.60
