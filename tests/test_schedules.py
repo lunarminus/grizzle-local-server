@@ -107,3 +107,35 @@ def test_price_now():
     }
     assert price_now([rate, OFF_PEAK], at(2026, 11, 9, 10), 0.10) == 0.30
     assert price_now([rate, OFF_PEAK], at(2026, 11, 9, 20), 0.10) == 0.10
+
+
+def test_overnight_range_is_judged_per_calendar_day():
+    """Reported on a real setup: weekdays 09-17, weekdays 20-06 and Sunday all day.
+
+    "Weekdays 20:00-06:00" means that on a weekday the hours 00:00-06:00 and 20:00-24:00 are in the
+    zone, not "starts Monday 20:00 and runs into Tuesday". So Sunday (all day) runs straight on into
+    Monday's 00:00-06:00, and Saturday morning is outside every window.
+    """
+
+    def z(start, end, days, all_day=False):
+        return {
+            "startHours": start,
+            "startMinutes": 0,
+            "endHours": end,
+            "endMinutes": 0,
+            "allDay": all_day,
+            "days": days,
+            "scheduleEnabled": True,
+            "priceKW": 0.0923,
+        }
+
+    weekdays = [1, 2, 3, 4, 5]
+    zones = [z(9, 17, weekdays), z(20, 6, weekdays), z(0, 0, [0], all_day=True)]
+    # 2026-11-08 is a Sunday
+    assert next_change(zones, at(2026, 11, 8, 19, 53), 1) == at(2026, 11, 9, 6)
+    assert charging_allowed(zones, at(2026, 11, 9, 3), 1) is zones[1]  # Monday 03:00
+    assert charging_allowed(zones, at(2026, 11, 9, 7), 1) is None  # Monday 07:00, between windows
+    assert charging_allowed(zones, at(2026, 11, 13, 21), 1) is zones[1]  # Friday 21:00
+    assert charging_allowed(zones, at(2026, 11, 14, 3), 1) is None  # Saturday 03:00: Saturday isn't listed
+    assert next_change(zones, at(2026, 11, 13, 21), 1) == at(2026, 11, 14, 0)  # Friday evening ends at midnight
+    assert next_change(zones, at(2026, 11, 14, 12), 1) == at(2026, 11, 15, 0)  # Saturday -> Sunday 00:00

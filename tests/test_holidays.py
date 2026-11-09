@@ -96,12 +96,15 @@ def test_holiday_modes():
     assert not zone_active(only, noon_xmas, None)
 
 
-def test_overnight_window_belongs_to_the_day_it_starts_on():
+def test_overnight_window_skips_the_holiday_as_a_calendar_day():
     night = zone(startHours=22, endHours=6, days=[0, 1, 2, 3, 4, 5, 6], holidays="skip")
-    assert zone_active(night, at(2026, 12, 25, 2), is_holiday)  # started Thursday evening
-    assert not zone_active(night, at(2026, 12, 25, 23), is_holiday)  # would start on the holiday
-    assert not zone_active(night, at(2026, 12, 26, 2), is_holiday)  # spill-over from the holiday
-    assert zone_active(night, at(2026, 12, 26, 23), is_holiday)
+    assert zone_active(night, at(2026, 12, 24, 23), is_holiday)  # Christmas Eve evening
+    assert not zone_active(night, at(2026, 12, 25, 2), is_holiday)  # nothing on the holiday itself…
+    assert not zone_active(night, at(2026, 12, 25, 23), is_holiday)
+    assert zone_active(night, at(2026, 12, 26, 2), is_holiday)  # …and back to normal the next morning
+    only = zone(startHours=22, endHours=6, days=[], holidays="only")
+    assert zone_active(only, at(2026, 12, 25, 2), is_holiday) and zone_active(only, at(2026, 12, 25, 23), is_holiday)
+    assert not zone_active(only, at(2026, 12, 26, 2), is_holiday)
 
 
 def test_next_change_and_window_lookup_with_holidays():

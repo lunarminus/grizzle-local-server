@@ -680,6 +680,76 @@ class Controller:
         await self._refresh_all(station_id)
         return station["holidaysSettings"]
 
+    def _reprice(
+        self,
+        station: dict[str, Any],
+        meter_start: Any,
+        total_wh: float | None,
+        samples: list[dict[str, Any]],
+        start_at: str | None,
+        end_at: str | None,
+    ) -> float:
+        """Cost of a session under today's rates: each slice of energy at the price in force when it was metered.
+
+        Samples hold either the lifetime register or energy since the session started (the Duo's
+        firmware does the latter); both are reduced to "Wh so far". Energy the samples don't
+        account for, such as the tail before StopTransaction or a session whose samples have been
+        pruned, is priced at the end (or, with no samples at all, the start) of the session.
+        """
+        tz = self.tz(station)
+
+        def price_at(stamp: str | None) -> float:
+            moment = _parse_iso(stamp)
+            return (self.price_at(station, moment.astimezone(tz)) or 0.0) if moment else 0.0
+
+        base = float(meter_start) if isinstance(meter_start, (int, float)) else None
+        cost, counted = 0.0, 0.0
+        for row in samples:
+            reading = float(row["energy_wh"])
+            so_far = reading - base if base is not None and reading >= base else reading
+            if total_wh is not None:
+                so_far = min(so_far, float(total_wh))
+            if so_far > counted:
+                cost += (so_far - counted) / 1000 * price_at(row["at"])
+                counted = so_far
+        if total_wh is not None and total_wh > counted:
+            cost += (float(total_wh) - counted) / 1000 * price_at((end_at or start_at) if samples else start_at)
+        return cost
+
+    async def recalculate_costs(self, station_id: str) -> dict[str, Any]:
+        """Reprice every recorded session, and the ones in progress, with the current rates and holidays."""
+        station = self._require(station_id)
+        live = {
+            int(c["transaction"]["id"]): c["transaction"]
+            for c in station["connectors"].values()
+            if c.get("transaction")
+        }
+        before = after = 0.0
+        count = 0
+        for row in self.store.sessions(station_id, 100000):
+            tx = live.get(row["id"]) if row["stop_at"] is None else None
+            if tx is not None:
+                energy = float(tx.get("energy") or 0)
+                old = float(tx.get("priceTotal") or 0)
+            elif row["energy_wh"] is not None:
+                energy = float(row["energy_wh"])
+                old = float(row["cost"] or 0)
+            else:
+                continue  # never closed and not running: nothing to price
+            samples = self.store.energy_samples(station_id, row["id"])
+            cost = self._reprice(station, row["meter_start"], energy, samples, row["start_at"], row["stop_at"])
+            if tx is not None:
+                tx["priceTotal"] = cost
+                tx["lastSessionEnergy"] = energy
+            else:
+                self.store.set_session_cost(row["id"], round(cost, 6), cost / (energy / 1000) if energy > 0 else None)
+            before += old
+            after += cost
+            count += 1
+        self._dirty = True
+        _LOGGER.info("%s: repriced %d sessions, %.2f -> %.2f", station_id, count, before, after)
+        return {"sessions": count, "cost_before": round(before, 4), "cost_after": round(after, 4)}
+
     async def reboot(self, station_id: str) -> dict[str, Any]:
         self._require(station_id)
         return await self.call(station_id, "Reset", {"type": "Soft"})

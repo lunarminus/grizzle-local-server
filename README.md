@@ -148,19 +148,21 @@ Browse to `http://<server-ip>:9000/` and sign in with `GRIZZLE_API_EMAIL` /
 - **Connectors**: live power, current, voltage, temperature and the running session, with
   an On / Off / Scheduled switch per connector.
 - **Charging schedules**: windows in which a connector set to *Scheduled* may charge, with
-  days, an optional connector and an optional current limit for that window.
-- **Electricity rates**: a base price per kWh plus time-of-use zones. Session cost is
-  computed from whichever price applies as energy is delivered, so set the price before
-  you care about cost; earlier sessions keep the cost they were recorded with.
+  days, an optional connector and an optional current limit for that window. Days are
+  calendar days: "weekdays 20:00-06:00" covers 00:00-06:00 and 20:00-24:00 of each weekday,
+  so it includes Monday's small hours and stops at midnight on Friday.
+- **Electricity rates**: a base price plus time-of-use zones, typed in cents per kWh.
+  Session cost is computed from whichever price applies as energy is delivered.
 - **Statutory holidays**: pick a country and region to load its holidays, untick the ones
   your utility doesn't count, add your own dates, and optionally set a flat holiday price.
   Every schedule and rate zone then has an *On statutory holidays* choice: treat it like
   any other day (the default), not on holidays, on its days and every holiday too, or only
   on holidays. For example "Peak, weekdays, not on holidays" plus a holiday price gives the
-  usual utility rule that holidays are off-peak all day. An overnight window belongs to
-  the day it starts on.
+  usual utility rule that holidays are off-peak all day.
 - **Sessions**: every session with duration, energy and cost, and totals for today, the
-  last 7 and 30 days, and all time.
+  last 7 and 30 days, and all time. **Recalculate costs** reprices every recorded session
+  with the current base price, rate zones and holidays, using the stored meter readings, so
+  sessions recorded before you set (or after you changed) your rates come out right.
 - **Charger settings**: name, current limit (bounded by the DIP switch), base price,
   currency and the timezone schedules are evaluated in.
 
@@ -205,6 +207,7 @@ Local extras (same auth):
 |---|---|
 | `POST /local/stations/{serial}/ocpp` | `{"action": "GetConfiguration", "payload": {}}`: send any OCPP call, get the raw reply |
 | `GET /local/stations/{serial}/sessions?limit=100` | session history incl. sessions in progress, plus totals (what the web page shows) |
+| `POST /local/stations/{serial}/sessions/recalculate` | reprice all sessions with the current rates; returns `{sessions, cost_before, cost_after}` |
 | `GET` / `PUT /local/stations/{serial}/holidays` | holiday settings: `{"enabled", "country", "subdivision", "observed", "priceKW", "excludedNames", "extraDates"}`; returns them with the next 12 months of holidays |
 | `POST /local/stations/{serial}/holidays/preview` | the same response for settings you haven't saved |
 | `GET /local/holidays/countries` | supported countries and subdivisions |
@@ -214,7 +217,8 @@ Local extras (same auth):
 | `DELETE /local/stations/{serial}` | forget a station (only while it's disconnected) |
 | `GET /health` | no auth |
 
-Schedules and rate zones (the `price` object) accept one field the cloud doesn't have:
+Prices in the API are per kWh in the main currency unit (`0.0923`), as in the cloud; only the web
+page shows cents. Schedules and rate zones (the `price` object) accept one field the cloud doesn't have:
 `"holidays": "same" | "skip" | "also" | "only"`. Stations also report `holidaysSettings`,
 the upcoming `holidays` and `holidayToday`.
 

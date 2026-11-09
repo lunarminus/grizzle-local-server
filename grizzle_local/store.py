@@ -161,6 +161,19 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def energy_samples(self, station: str, tid: int) -> list[dict[str, Any]]:
+        """A transaction's energy readings in time order, for repricing."""
+        rows = self._db.execute(
+            "SELECT at, energy_wh FROM samples WHERE station=? AND transaction_id=? AND energy_wh IS NOT NULL"
+            " ORDER BY at",
+            (station, tid),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_session_cost(self, tid: int, cost: float, price_kwh: float | None) -> None:
+        with self._db:
+            self._db.execute("UPDATE sessions SET cost=?, price_kwh=? WHERE id=?", (cost, price_kwh, tid))
+
     def prune_samples(self, keep_days: int = 90) -> None:
         with self._db:
             self._db.execute("DELETE FROM samples WHERE at < datetime('now', ?)", (f"-{keep_days} days",))

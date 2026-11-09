@@ -6,6 +6,9 @@ and ``connectorId`` (0 = every connector). A zone with ``isSchedule`` is a plain
 window; one with ``priceKW`` is a rate zone. Either acts as a charging window when
 ``scheduleEnabled`` is true. Times are in the station's local timezone.
 
+``days`` are calendar days. A range that wraps past midnight (20:00-06:00) covers the small hours
+and the late evening of each of those days; it does not run from a listed day into the next.
+
 Our own extension, ``holidays``, says how a zone treats statutory holidays: ``"same"``
 (default: a holiday is just its weekday), ``"skip"`` (never on a holiday), ``"also"`` (its
 days plus every holiday) or ``"only"`` (holidays only; ``days`` is ignored).
@@ -64,20 +67,22 @@ def applies_to(zone: dict[str, Any], connector_id: int) -> bool:
 
 
 def zone_active(zone: dict[str, Any], now: datetime, is_holiday: HolidayCheck | None = None) -> bool:
-    """Is ``now`` (timezone-aware, in the station's zone) inside this zone's time ranges?"""
-    today = now.date()
-    on_today = _eligible(zone, today, is_holiday)
-    on_yesterday = _eligible(zone, today - timedelta(days=1), is_holiday)
+    """Is ``now`` (timezone-aware, in the station's zone) inside this zone?
+
+    Days are calendar days: a range that wraps past midnight, say 20:00-06:00, covers 00:00-06:00
+    and 20:00-24:00 of every day the zone applies to. It does not start on a listed day and spill
+    into the next one, so "weekdays 20:00-06:00" includes Monday's small hours and stops at
+    midnight on Friday. That is how utility rate plans (and the Grizzl-E app) read it.
+    """
+    if not _eligible(zone, now.date(), is_holiday):
+        return False
     minute = now.hour * 60 + now.minute + now.second / 60
     for start, end in _ranges(zone):
         if start < end:
-            if on_today and start <= minute < end:
+            if start <= minute < end:
                 return True
-        else:  # crosses midnight: belongs to the day it starts on
-            if on_today and minute >= start:
-                return True
-            if on_yesterday and minute < end:
-                return True
+        elif minute >= start or minute < end:  # wraps past midnight
+            return True
     return False
 
 
@@ -112,11 +117,11 @@ def price_now(
 def _boundaries(zone: dict[str, Any], day: datetime) -> list[datetime]:
     """Instants on ``day`` (a local midnight) where this zone may switch state."""
     tz = day.tzinfo
-    out = []
+    midnight = datetime.combine(day.date(), time(0), tz)
+    out = [midnight]  # a new calendar day can change whether the zone applies at all
     for start, end in _ranges(zone):
-        out.append(datetime.combine(day.date(), time(0), tz) + timedelta(minutes=start))
-        end_day = day.date() if start < end else day.date() + timedelta(days=1)
-        out.append(datetime.combine(end_day, time(0), tz) + timedelta(minutes=end))
+        out.append(midnight + timedelta(minutes=start))
+        out.append(midnight + timedelta(minutes=end))
     return out
 
 

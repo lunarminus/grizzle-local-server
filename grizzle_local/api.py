@@ -463,6 +463,12 @@ async def local_sessions(request: web.Request) -> web.Response:
     )
 
 
+async def local_sessions_recalculate(request: web.Request) -> web.Response:
+    """Reprice all recorded sessions with the current base price, rate zones and holidays."""
+    station = _station_or_404(request)
+    return web.json_response(await _controller(request).recalculate_costs(station["id"]))
+
+
 def _holiday_payload(controller: Controller, station: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
     today = datetime.now(controller.tz(station)).date()
     return {
@@ -575,6 +581,7 @@ def add_routes(app: web.Application) -> None:
     app.router.add_get("/client/stations/{station_id}/events", events)
     app.router.add_get("/local/stations/{station_id}/samples", local_samples)
     app.router.add_get("/local/stations/{station_id}/sessions", local_sessions)
+    app.router.add_post("/local/stations/{station_id}/sessions/recalculate", local_sessions_recalculate)
     app.router.add_get("/local/holidays/countries", local_holiday_countries)
     app.router.add_get("/local/stations/{station_id}/holidays", local_holidays_get)
     app.router.add_put("/local/stations/{station_id}/holidays", local_holidays_put)

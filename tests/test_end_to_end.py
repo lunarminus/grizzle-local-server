@@ -395,3 +395,63 @@ async def test_session_history_with_live_and_finished_sessions(server, charger):
     assert done["cost"] == pytest.approx(done["energy_wh"] / 1000 * 0.5, rel=0.05)
     assert data["summary"]["week"]["cost"] == pytest.approx(done["cost"], abs=1e-4)
     assert (await server.get(f"/local/stations/{SERIAL}/sessions")).status == 401
+
+
+async def test_recalculate_reprices_past_and_running_sessions(tmp_path):
+    """Sessions recorded before any price existed get repriced from their stored meter samples."""
+    from grizzle_local.controller import Controller
+
+    settings = Settings(data_dir=tmp_path / "data", timezone="America/Denver")
+    controller = Controller(settings, Store(settings.data_dir))
+    station = controller._ensure_station(SERIAL)
+
+    def sample(tid: int, stamp: str, wh: float) -> dict:
+        value = {"value": str(wh), "measurand": "Energy.Active.Import.Register", "unit": "Wh"}
+        return {"connectorId": 1, "transactionId": tid, "meterValue": [{"timestamp": stamp, "sampledValue": [value]}]}
+
+    # Monday 2026-11-09, Denver is UTC-7: 08:00 -> 10:00 local, straddling the start of a 09:00 peak zone.
+    await controller._on_StartTransaction(
+        station, {"connectorId": 1, "idTag": "t", "meterStart": 500000, "timestamp": "2026-11-09T15:00:00Z"}
+    )
+    await controller._on_MeterValues(station, sample(1, "2026-11-09T15:30:00Z", 2000))  # 08:30, 2 kWh so far
+    await controller._on_MeterValues(station, sample(1, "2026-11-09T16:30:00Z", 5000))  # 09:30, 5 kWh so far
+    await controller._on_StopTransaction(
+        station, {"transactionId": 1, "meterStop": 506000, "timestamp": "2026-11-09T17:00:00Z", "reason": "Remote"}
+    )
+    assert controller.store.sessions(SERIAL)[0]["cost"] == 0  # no price was set while it ran
+
+    await controller.set_base_rate(SERIAL, 0.10)
+    await controller.upsert_zone(
+        SERIAL,
+        {
+            "name": "Peak",
+            "priceKW": 0.30,
+            "startHours": 9,
+            "startMinutes": 0,
+            "endHours": 17,
+            "endMinutes": 0,
+            "days": [1, 2, 3, 4, 5],
+            "allDay": False,
+        },
+    )
+    # a session still running, with one sample before the peak
+    await controller._on_StartTransaction(
+        station, {"connectorId": 2, "idTag": "t", "meterStart": 800000, "timestamp": "2026-11-09T14:00:00Z"}
+    )
+    await controller._on_MeterValues(station, {**sample(2, "2026-11-09T14:30:00Z", 4000), "connectorId": 2})
+    station["connectors"]["2"]["transaction"]["priceTotal"] = 0.0  # as if it had been recorded at price 0
+
+    result = await controller.recalculate_costs(SERIAL)
+    assert result["sessions"] == 2 and result["cost_before"] == 0
+    done = next(s for s in controller.store.sessions(SERIAL) if s["id"] == 1)
+    # 2 kWh at 0.10 + 3 kWh at 0.30 + the last 1 kWh (after the final sample) at the stop-time price 0.30
+    assert done["cost"] == pytest.approx(0.2 + 0.9 + 0.3)
+    assert done["price_kwh"] == pytest.approx(1.4 / 6)
+    live = station["connectors"]["2"]["transaction"]
+    assert live["priceTotal"] == pytest.approx(0.4)  # 4 kWh at 07:30, base price
+    assert result["cost_after"] == pytest.approx(1.8)
+
+    # no samples at all (pruned after 90 days): the whole session is priced at its start time
+    controller.store._db.execute("DELETE FROM samples")
+    await controller.recalculate_costs(SERIAL)
+    assert next(s for s in controller.store.sessions(SERIAL) if s["id"] == 1)["cost"] == pytest.approx(6 * 0.10)
