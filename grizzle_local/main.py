@@ -14,7 +14,7 @@ from . import __version__
 from .api import Auth, add_routes, auth_middleware
 from .config import Settings
 from .controller import Controller
-from .ocpp import ChargePointConnection
+from .ocpp import ChargePointConnection, now_iso
 from .store import Store
 from .tls import start_tls_frontend
 
@@ -45,15 +45,21 @@ def _charge_point_id(request: web.Request) -> str:
     return f"unknown-{request.remote}"
 
 
-def _basic_password(request: web.Request) -> str | None:
+def _basic_credentials(request: web.Request) -> tuple[str | None, str | None]:
+    """The (user, password) from an HTTP Basic Authorization header, or (None, None)."""
     header = request.headers.get("Authorization", "")
     if not header.lower().startswith("basic "):
-        return None
+        return None, None
     try:
         decoded = base64.b64decode(header[6:]).decode(errors="replace")
     except ValueError:
-        return None
-    return decoded.split(":", 1)[1] if ":" in decoded else ""
+        return None, None
+    user, sep, password = decoded.partition(":")
+    return user, (password if sep else None)
+
+
+def _basic_password(request: web.Request) -> str | None:
+    return _basic_credentials(request)[1]
 
 
 async def websocket_handler(request: web.Request) -> web.StreamResponse:
@@ -65,15 +71,27 @@ async def websocket_handler(request: web.Request) -> web.StreamResponse:
             return web.Response(text=html, content_type="text/html", headers=PAGE_HEADERS)
         raise web.HTTPNotFound()
     cp_id = _charge_point_id(request)
-    if settings.ocpp_password is not None and _basic_password(request) != settings.ocpp_password:
+    auth_user, auth_key = _basic_credentials(request)
+    if settings.ocpp_password is not None and auth_key != settings.ocpp_password:
         _LOGGER.warning("%s: rejected, wrong OCPP password (from %s)", cp_id, request.remote)
         raise web.HTTPUnauthorized()
     offered = [p.strip() for p in request.headers.get("Sec-WebSocket-Protocol", "").split(",") if p.strip()]
     ws = web.WebSocketResponse(protocols=("ocpp1.6",) if "ocpp1.6" in offered else (), heartbeat=120, autoping=True)
     await ws.prepare(request)
     _LOGGER.info("%s: websocket from %s path=%s subprotocol=%s", cp_id, request.remote, request.path, ws.ws_protocol)
+    # Record how the charger connected, so its cloud identity (serial + Auth key) can be
+    # reused by tools/firmware_capture.py. This is never exposed through the HTTP API.
+    handshake = {
+        "path": request.path,
+        "query": request.query_string or None,
+        "authUser": auth_user,
+        "protocols": offered,
+        "userAgent": request.headers.get("User-Agent"),
+        "remote": request.remote,
+        "recordedAt": now_iso(),
+    }
     conn = ChargePointConnection(cp_id, ws, controller.handle)
-    await controller.on_connect(conn)
+    await controller.on_connect(conn, handshake=handshake, auth_key=auth_key)
     try:
         await conn.run()
     finally:

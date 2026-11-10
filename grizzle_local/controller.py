@@ -177,11 +177,22 @@ class Controller:
 
     # --- connection lifecycle ------------------------------------------------
 
-    async def on_connect(self, conn: ChargePointConnection) -> None:
+    async def on_connect(
+        self,
+        conn: ChargePointConnection,
+        handshake: dict[str, Any] | None = None,
+        auth_key: str | None = None,
+    ) -> None:
         old = self.connections.get(conn.id)
         self.connections[conn.id] = conn
         station = self._ensure_station(conn.id)
         station["lastSeen"] = now_iso()
+        if handshake is not None:
+            station["ocppHandshake"] = handshake
+        # Keep the last non-empty Auth key the charger presented; a connection with no
+        # Basic auth or an empty password must not wipe a previously captured key.
+        if auth_key:
+            station["ocppAuthKey"] = auth_key
         self._dirty = True
         _LOGGER.info("%s connected", conn.id)
         if old is not None and old is not conn:
