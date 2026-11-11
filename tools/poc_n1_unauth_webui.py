@@ -44,7 +44,6 @@ from __future__ import annotations
 import argparse
 import socket
 import ssl
-import sys
 import urllib.error
 import urllib.request
 
@@ -98,14 +97,17 @@ def _snippet(text: str, n: int = 120) -> str:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Confirm finding N1 (unauthenticated web control plane) non-destructively.")
+    ap = argparse.ArgumentParser(
+        description="Confirm finding N1 (unauthenticated web control plane) non-destructively."
+    )
     ap.add_argument("--host", required=True, help="charger IP or hostname")
     ap.add_argument("--port", type=int, default=None, help="port (default 80, or 443 with --https)")
     ap.add_argument("--https", action="store_true", help="use TLS (default: plain HTTP, as the Duo serves)")
     ap.add_argument("--insecure", action="store_true", help="with --https, do not verify the cert")
     ap.add_argument("--timeout", type=float, default=6.0)
     ap.add_argument("--prove-write", action="store_true",
-                    help="also send an OVER-LENGTH (and thus firmware-REJECTED) /configHttp field to elicit the handler's own validation echo. Still changes nothing.")
+                    help="also send an OVER-LENGTH (and thus firmware-REJECTED) /configHttp field to elicit "
+                    "the handler's own validation echo. Still changes nothing.")
     args = ap.parse_args()
 
     scheme = "https" if args.https else "http"
