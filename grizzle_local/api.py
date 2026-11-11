@@ -244,7 +244,10 @@ def _json_error(status: int, message: str) -> web.Response:
 @web.middleware
 async def auth_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
     path = request.path
-    if path in PUBLIC_PATHS or request.headers.get("Upgrade", "").lower() == "websocket":
+    # Chargers connect outside /client and /local, so they never need a token. Do NOT exempt
+    # requests by their Upgrade header: aiohttp still routes such a request to the REST handler
+    # for its path, so a header check would let anyone skip authentication.
+    if path in PUBLIC_PATHS:
         return await handler(request)
     if not (path.startswith("/client/") or path.startswith("/local/")):
         return await handler(request)
@@ -550,6 +553,16 @@ async def local_delete_station(request: web.Request) -> web.Response:
     return web.json_response({})
 
 
+async def local_clear_auth_key(request: web.Request) -> web.Response:
+    """Forget the Auth key a charger is pinned to, so the next connection can pin a new one.
+
+    Needed after changing the charger's Auth key, or replacing the charger under the same serial.
+    """
+    station = _station_or_404(request)
+    await _controller(request).clear_auth_key(station["id"])
+    return web.json_response({})
+
+
 async def health(request: web.Request) -> web.Response:
     controller = _controller(request)
     return web.json_response(
@@ -611,3 +624,4 @@ def add_routes(app: web.Application) -> None:
     app.router.add_post("/local/stations/{station_id}/ocpp", local_ocpp_call)
     app.router.add_put("/local/stations/{station_id}/settings", local_settings)
     app.router.add_delete("/local/stations/{station_id}", local_delete_station)
+    app.router.add_delete("/local/stations/{station_id}/auth-key", local_clear_auth_key)

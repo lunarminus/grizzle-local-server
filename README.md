@@ -78,7 +78,7 @@ Environment variables (all optional):
 | `TZ` / `GRIZZLE_TIMEZONE` | `UTC` | Timezone schedules are evaluated in (new stations inherit it) |
 | `GRIZZLE_PORT` | `9000` | WebSocket + REST port |
 | `GRIZZLE_API_EMAIL`, `GRIZZLE_API_PASSWORD` | `admin@local`, `grizzle` | Login for the REST API (what Home Assistant uses). **Change the password.** |
-| `GRIZZLE_OCPP_PASSWORD` | unset | If set, the charger's HTTP Basic password ("Auth key") must match |
+| `GRIZZLE_OCPP_PASSWORD` | unset | If set, the charger's HTTP Basic password ("Auth key") must match; this is the strongest option. Without it, each station is pinned to the first Auth key it presents (see below) |
 | `GRIZZLE_HEARTBEAT_INTERVAL` | `300` | Seconds, pushed to the charger at boot |
 | `GRIZZLE_METER_INTERVAL` | `30` | Seconds between MeterValues while charging |
 | `GRIZZLE_ID_TAG` | `uc_default_auth` | idTag used for RemoteStartTransaction |
@@ -144,6 +144,23 @@ charger does not verify the certificate), and the built-in `GET /commercial/ext-
 {serial}` endpoint answers it. On by default; set `GRIZZLE_OCPP_UNLOCK=0` to disable. Leave
 it off unless your firmware actually enforces the unlock — if local OCPP already works, you
 don't need it.
+
+**Who may connect as a charger.** A charger is identified by its serial (the last path segment, else
+the HTTP Basic user), which must match `[A-Za-z0-9][A-Za-z0-9._:-]{0,63}`.
+
+- With `GRIZZLE_OCPP_PASSWORD` set, the Basic password must equal it, and that is the only check.
+- Without it, the first Auth key (Basic password) a station presents is pinned and saved at once.
+  From then on a connection for that serial with a different key, or none, is refused
+  (`rejected connection ... Auth key does not match` in the log). If you change the charger's Auth key
+  or replace the charger, call `DELETE /local/stations/{serial}/auth-key`; the charger is
+  disconnected and its reconnect pins the new key. Whoever connects first under a serial the server
+  has never seen gets to pin it, so connect your charger before exposing the server to other devices.
+- A station whose charger connects without a key is never pinned automatically, so nobody can lock
+  it out by presenting a key while it's offline. Such a connection can't be authenticated: it may add a
+  new station, and may replace a station's existing connection only if that one stops answering
+  (a 5 s probe). Set `GRIZZLE_OCPP_PASSWORD` if your charger sends no key.
+- WebSocket handshakes carrying an `Origin` header (that is, from a browser) are refused; the
+  charger's firmware doesn't send one.
 
 You can test the whole chain without the real charger: `tools/fake_charger.py` accepts
 `wss://…` URLs with `--insecure`. The plain `ws://` listener on port 9000 also accepts
@@ -226,6 +243,7 @@ Local extras (same auth):
 | `GET /local/stations/{serial}/samples?since=ISO&connector=1` | meter history (kept 90 days) |
 | `PUT /local/stations/{serial}/settings` | `{"displayName", "timezone", "connectorCount", "maxCurrent", "minCurrent", "dipSwitchCurrentLimit"}` |
 | `DELETE /local/stations/{serial}` | forget a station (only while it's disconnected) |
+| `DELETE /local/stations/{serial}/auth-key` | forget the Auth key the station is pinned to and drop its connection; the charger's reconnect pins its key again |
 | `GET /health` | no auth |
 
 Prices in the API are per kWh in the main currency unit (`0.0923`), as in the cloud; only the web
