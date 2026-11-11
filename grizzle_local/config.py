@@ -17,6 +17,13 @@ def _opt(name: str) -> str | None:
     return value or None
 
 
+def _bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return default
+    return value in ("1", "true", "yes", "on")
+
+
 @dataclass
 class Settings:
     data_dir: Path = field(default_factory=lambda: Path(os.environ.get("GRIZZLE_DATA_DIR", "/data")))
@@ -38,6 +45,10 @@ class Settings:
     api_password: str = field(default_factory=lambda: os.environ.get("GRIZZLE_API_PASSWORD", "grizzle"))
     # If set, the charger's HTTP Basic auth password must match (its "Auth key").
     ocpp_password: str | None = field(default_factory=lambda: _opt("GRIZZLE_OCPP_PASSWORD"))
+    # Answer the firmware's "third-party OCPP unlock" check locally so a custom OCPP backend stays
+    # enabled without the vendor's paid unlock. Only reached if connect-api.unitedchargers.com is
+    # also DNS-overridden to this server. Set GRIZZLE_OCPP_UNLOCK=0 to disable.
+    ocpp_unlock: bool = field(default_factory=lambda: _bool("GRIZZLE_OCPP_UNLOCK", True))
     timezone: str = field(default_factory=lambda: os.environ.get("GRIZZLE_TIMEZONE") or os.environ.get("TZ") or "UTC")
     currency: str = field(default_factory=lambda: os.environ.get("GRIZZLE_CURRENCY", "USD"))
     heartbeat_interval: int = field(default_factory=lambda: _int("GRIZZLE_HEARTBEAT_INTERVAL", 300))

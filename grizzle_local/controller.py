@@ -11,9 +11,12 @@ How the Grizzl-E Connect family behaves (from evcc's and others' experience):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import secrets
 import time as _time
 from datetime import UTC, datetime
+from collections.abc import AsyncIterator
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -49,6 +52,13 @@ MEASURANDS = {
 }
 
 
+def _same_secret(given: str | None, expected: str) -> bool:
+    """Constant-time comparison that also copes with non-ASCII input (compare_digest on str doesn't)."""
+    if not given:
+        return False
+    return secrets.compare_digest(given.encode(), expected.encode())
+
+
 def _parse_iso(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -77,6 +87,8 @@ class Controller:
         self.connections: dict[str, ChargePointConnection] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
         self._dirty = False
+        self._last_pin_save = float("-inf")
+        self._admission_locks: dict[str, tuple[asyncio.Lock, int]] = {}  # id -> (lock, users)
         self._stopping = False
 
     # --- station state helpers ---------------------------------------------
@@ -177,16 +189,141 @@ class Controller:
 
     # --- connection lifecycle ------------------------------------------------
 
-    async def on_connect(self, conn: ChargePointConnection) -> None:
+    # How long a live connection gets to answer before an unauthenticated newcomer may replace it.
+    LIVENESS_TIMEOUT = 5.0
+
+    @contextlib.asynccontextmanager
+    async def admission(self, cp_id: str) -> AsyncIterator[None]:
+        """Serialise connection_refusal() .. on_connect() per charge point id.
+
+        Both the liveness probe and the WebSocket handshake await, so without this two handshakes
+        for the same id could both pass the check (say, two first connections with different keys)
+        and the later one would replace the earlier one despite the pin the earlier one set.
+        """
+        lock, users = self._admission_locks.get(cp_id) or (asyncio.Lock(), 0)
+        self._admission_locks[cp_id] = (lock, users + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            # Drop the entry only when nobody holds or awaits it (a released Lock looks unlocked
+            # before its next waiter runs, so locked() can't tell).
+            lock, users = self._admission_locks[cp_id]
+            if users == 1:
+                del self._admission_locks[cp_id]
+            else:
+                self._admission_locks[cp_id] = (lock, users - 1)
+
+    async def connection_refusal(self, cp_id: str, auth_key: str | None) -> tuple[int, str] | None:
+        """Decide whether a charger may connect as ``cp_id``; (HTTP status, reason) if not.
+
+        - With GRIZZLE_OCPP_PASSWORD set, the Basic password must match it, and nothing else is
+          checked (so changing the password never collides with a per-station pin).
+        - Otherwise a station is pinned to the first Auth key it presents (trust on first use):
+          any other key, or none, is refused. Clear the pin with DELETE /local/stations/{id}/auth-key.
+        - A connection that proves nothing (no password, nothing pinned) may create a new station,
+          and may replace a station's existing connection only if that one no longer answers.
+        """
+        if self.settings.ocpp_password is not None:
+            if not _same_secret(auth_key, self.settings.ocpp_password):
+                return 401, "wrong OCPP password (GRIZZLE_OCPP_PASSWORD)"
+            return None
+        pinned = (self.station(cp_id) or {}).get("ocppAuthKey")
+        if pinned:
+            if not _same_secret(auth_key, pinned):
+                return 401, (
+                    "Auth key does not match the one this charger registered with; if you changed it, "
+                    f"clear the old one with DELETE /local/stations/{cp_id}/auth-key"
+                )
+            return None
+        if await self._answers(cp_id):
+            return 409, "already connected and still answering; an unauthenticated connection may not replace it"
+        return None
+
+    async def _answers(self, cp_id: str) -> bool:
+        """True if the station's current connection replies to a harmless call in time.
+
+        A charger that reconnects doesn't close its old socket first, so a dead socket can look
+        online for minutes; probing tells a stale socket (replace it) from a live one (keep it).
+        """
+        conn = self.connections.get(cp_id)
+        if conn is None or conn.ws.closed:
+            return False
+        try:
+            await conn.call("TriggerMessage", {"requestedMessage": "Heartbeat"}, self.LIVENESS_TIMEOUT)
+        except OcppError as err:
+            # A CallError reply still proves someone is answering; a timeout or a drop doesn't.
+            return err.code not in ("Timeout", "Disconnected") and not conn.ws.closed
+        except Exception:  # noqa: BLE001 - the socket failed while sending: it's dead
+            return False
+        return True
+
+    async def on_connect(
+        self,
+        conn: ChargePointConnection,
+        handshake: dict[str, Any] | None = None,
+        auth_key: str | None = None,
+    ) -> None:
         old = self.connections.get(conn.id)
         self.connections[conn.id] = conn
         station = self._ensure_station(conn.id)
         station["lastSeen"] = now_iso()
+        if handshake is not None:
+            station["ocppHandshake"] = handshake
+        if self._record_auth_key(station, auth_key) and _time.monotonic() - self._last_pin_save > 1.0:
+            # Don't leave a fresh pin waiting for the next tick (a crash would lose it). At most
+            # once a second, so a flood of new serials can't force a full save per handshake.
+            self._last_pin_save = _time.monotonic()
+            self.store.save()
         self._dirty = True
         _LOGGER.info("%s connected", conn.id)
         if old is not None and old is not conn:
             # A reconnecting charger doesn't close its old socket first.
             self._spawn(old.close())
+
+    def _record_auth_key(self, station: dict[str, Any], auth_key: str | None) -> bool:
+        """Store the Auth key the charger presented (for pinning and firmware_capture); True if changed.
+
+        connection_refusal() has already accepted this key, so an existing pin is never replaced
+        by a different one. An empty or missing key never wipes a stored one.
+        """
+        current = station.get("ocppAuthKey")
+        if not auth_key:
+            if not current:
+                # Remember this station connects without a key, so a key presented later (by
+                # anyone, while it's offline) isn't pinned and doesn't lock the charger out.
+                station["ocppKeyless"] = True
+            return False
+        if self.settings.ocpp_password is not None:
+            # Authenticated by the shared password; keep the recorded key current.
+            station["ocppAuthKey"] = auth_key
+            return current != auth_key
+        if current:
+            return False
+        if station.get("ocppKeyless"):
+            _LOGGER.warning(
+                "%s presented an Auth key but has connected without one before; not pinning it "
+                "(DELETE /local/stations/%s/auth-key to let the next key be pinned)",
+                station["id"],
+                station["id"],
+            )
+            return False
+        station["ocppAuthKey"] = auth_key
+        _LOGGER.info("%s: pinned to the Auth key it presented", station["id"])
+        return True
+
+    async def clear_auth_key(self, station_id: str) -> None:
+        """Forget the pinned key and drop the live connection, so the charger's reconnect pins anew."""
+        station = self.station(station_id)
+        if station is None:
+            return
+        station.pop("ocppAuthKey", None)
+        station.pop("ocppKeyless", None)
+        self.store.save()
+        _LOGGER.warning("%s: pinned OCPP Auth key cleared; the next connection will pin a new one", station_id)
+        conn = self.connections.get(station_id)
+        if conn is not None:
+            await conn.close()
 
     async def on_disconnect(self, conn: ChargePointConnection) -> None:
         if self.connections.get(conn.id) is conn:
