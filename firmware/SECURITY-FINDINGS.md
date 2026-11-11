@@ -7,6 +7,161 @@ code — a 32-bit pointer to it sits in an Xtensa literal pool in the `.text`/IR
 **NEEDS-CODE** (runtime behavior that requires decompiling the Xtensa code to confirm — stock
 Ghidra/REA can't disassemble Xtensa; see `GHIDRA-IMPORT.md`).
 
+---
+
+## Verification pass — 2026-11-11 (independent re-derivation)
+
+The six findings below were independently re-derived from the same image using a
+**separate Xtensa disassembler** — capstone 6.0 `CS_ARCH_XTENSA` (not the Ghidra Xtensa
+extension) — plus REA for the ARM main board. Each finding was re-confirmed from raw
+disassembly; a discovery sweep then hunted for new issues and each candidate was
+adversarially re-checked. Tooling + method preserved in `firmware/analysis/` is not
+required to read this; addresses below are real load addresses (IROM `0x400d0020+`).
+
+### Verdicts on findings 1–6
+
+| # | Verdict | Correction / refinement |
+|---|---------|-------------------------|
+| 1 | **Mechanism CONFIRMED; "remote backdoor" framing NOT supported** | The two credentials have **different, both-internal** arming paths (see below). No remote/attacker-inducible arming was proven. |
+| 2 | **CONFIRMED** | Open questions resolved (creds/ordering/`/debug`) — but **made moot by new finding N1** (creds are rewritable without auth). |
+| 3 | **CONFIRMED** | JSON key is `type:"register"` (no `"register"` key); transport is **HTTPS with CA validation**. |
+| 4 | **CONFIRMED** | Forgeable as described. (Helper addresses in the v0.6.0 capture note were mis-offset: the hash is `0x4013ba44`, hex-encode `0x400e82e8`, main fn `0x400ef108`.) |
+| 5 | **CONFIRMED (sharpened)** | Image *does* contain RSA/ECDSA (for TLS); the precise, confirmed claim is **"no signature gates the OTA."** See also N4 (MD5 is skippable). |
+| 6 | **Part A CONFIRMED; Part B UNVERIFIABLE** | No embedded private key; ISRG Root X1 present. Main-board UART→relay gating **not proven** — REA mis-decoded the Thumb image (loaded as ARM mode), so that pass is low-confidence; needs the Ghidra Cortex-M import. |
+
+### Corrections to finding 1 (important — changes the risk classification)
+
+- The set-config helper `FUN_0001f834` (`0x400ef854`) is **confirmed**: `memset` of a
+  `0x8c`-byte `wifi_config_t`, `strcpy` SSID at `buf+0`, `strcpy` password at `buf+0x20`,
+  then `esp_wifi_set_config(WIFI_IF_STA, …)` at `0x400ef923`. The caller
+  `FUN_0001f2d8` (`0x400ef2f8`) selects AndroidPapa on event bit `0x8000` and Pinpellets
+  on `0x10000`. All four credential strings are referenced exactly once. **No change.**
+- **But the doc conflates the two arming paths.** `FUN_0001d9a4` (`0x400ed9c4`) arms
+  **only** the Pinpellets timer (`+0x800[0xf8]`), and its sole caller is `0x400d924d`
+  inside TaskSys, gated on TaskSys event bit `0x10000`. The **AndroidPapa** timer
+  (`+0x900[2]`) is armed by the **production-test routine `RunProdTest`** (entry
+  `0x400da9ac`; also does "Set 8A"/"Set 16A"), called from TaskSys `0x400d92cd` and
+  `0x400e4879` — **not** from `FUN_0001d9a4`.
+- Both triggers are **internal state transitions** (a connectivity/service event and a
+  production-test path); **no remote or attacker-inducible path to arm either bit was
+  found** in the loaded segments. `FUN_0001f834` is a **general** Wi-Fi-config helper
+  (6 call sites, incl. `0x400efa01`/`0x400efc69` for normal config), not a
+  backdoor-dedicated routine.
+- **Reclassification:** hardcoded cleartext STA credentials + a real credential-join
+  code path, whose arming is internal and (one path) production-test. The
+  "deauth-and-wait for an attacker-inducible fallback → remote takeover" model in the
+  original note is **not supported by the static evidence** and should be treated as
+  unproven. Still a genuine shipped-credential defect; just not a demonstrated remote
+  backdoor.
+
+### Resolved open questions from the original "Still open"
+
+- **F2 `/ocppconfig` ordering:** username `UC_OCPP`, password `Uc_Ocpp` (dispatcher
+  `0x400f0eba`, helper `0x400f0b9c`). `/service` cred `eveus`. **`/debug` is
+  unauthenticated** (confirmed) and read-only telemetry. `/init` masks password fields
+  (empty-string pointer) — no cred leak.
+- **F1 trigger:** resolved as above (internal; two distinct paths), except the top-level
+  condition that *enters* the production-test / connectivity-recovery state, which spans
+  tasks and was not root-caused.
+
+---
+
+## Additional findings (second pass) — not in the original report
+
+### N1. Unauthenticated web control plane — **CONFIRMED — CRITICAL (most exploitable)**
+`/pageEvent` (`0x400f4974`), `/config` (`0x400f3f0c`), `/configHttp` (`0x400f44fc`) and
+`/configAP` (`0x400f4710`) are registered in the **no-auth** route table (`0x400d21e0+`)
+and make **zero** calls into the Basic-auth routine cluster (`0x400f0eba`–`0x400f13c0`) —
+verified by disassembling each handler end to end. They perform real state changes:
+- **`/pageEvent`** (POST) dispatches `reboot`, `factoryReset` (`0x400ed671`),
+  `fullFactoryReset` (`0x400ed673`), `stationCurrentLimit` (`0x400ed6f5`), `maxCurrent`
+  (`0x400ec85d`), `minCurrent` (`0x400ed73a`), `typeRelay` (`0x400ed786`), `stationSN`,
+  **`md5hash`** (the stored web-UI password hash), `broadcastMode`, and many more.
+- **`/configHttp`** sets `httpUsername` (`0x3f417054`) and `httpPassword` (`0x3f417038`)
+  into the live config (`memcpy 0x4000c2c8` + field extract `0x40136e00`), with only
+  length checks (`0x1f`/`0x3f`) — **no auth, and no need to present the current password.**
+- **Impact:** any device on the LAN or the charger's SoftAP can, with a single
+  unauthenticated POST, factory-reset the unit, change current limits, rewrite the serial,
+  and **overwrite the web-admin credentials** — which **fully defeats finding 2's Basic
+  auth**. No preconditions (unlike finding 1). A non-destructive confirmation PoC is in
+  `tools/poc_n1_unauth_webui.py`.
+- **Runtime-confirmed on hardware (2026-11-11):** the PoC was run against a live Duo on
+  `UDGRW070L-04.03.2`. `/ocppconfig` and `/service` returned `401` (realm "Please enter
+  login and password"), while `/pageEvent`, `/config`, `/configAP` and `/configHttp` all
+  returned `200` with no credentials — N1 reproduced end to end, not just statically.
+
+### N2. OCPP response-parser stack overflow — **CONFIRMED reachable from network — HIGH (RCE-plausible)**
+Three OCPP central-system→charger response parsers `strcpy` attacker-sized cJSON
+valuestrings into small fixed stack frames, guarded only by null/`cJSON_IsString`
+(`0x4019b618`) checks — no length bound:
+- `0x400e34c0` (`entry a1,0x70` = 112-byte frame) — `idTagInfo{status,expiryDate,
+  parentIdTag}` (shape of `StartTransaction.conf` / `Authorize.conf`): `status`→`a1+0x2e`,
+  `expiryDate`→`a1+0x00`, `parentIdTag`→`a1+0x19`, all via ROM `strcpy` (`0x400013ac`).
+- `0x400e3064` — `DataTransfer.conf`: `status`→`a1+0x10` is **unbounded**; the `data`
+  field copy at `0x400e30c0` **is** length-bounded (`0x80`), so only `status` overflows.
+- `0x400e3268` (`entry a1,0x50`) — `Heartbeat.conf` `currentTime`→`a1+0x10`, unbounded.
+- **Reachability — now traced end to end (correcting the first-pass "inferred" note).**
+  An earlier scan missed the callers because of an Xtensa `call`-target alignment bug (the
+  computed target lands +0..3 high; mask `&~3`). With that fixed, each parser has exactly
+  **one** direct `call8` site, all inside a single dispatcher `0x400e38a4` that routes by an
+  **OCPP action-string `strcmp` chain** (`StartTransaction`→`0x400e34c0`,
+  `DataTransfer`→`0x400e3064`, `Heartbeat`→`0x400e3268`; `Authorize`→a *different*, safe
+  parser `0x400e2d1d`). The full inbound chain is proven:
+  `esp_websocket_client` (OCPP 1.6-J wss to `ocpp.unitedchargers.com`) →
+  `TaskOcppController` (`0x400e1f78`) → `ProcessReceivedMessage` (`0x400e1a78`, copies the
+  frame to a stack buffer) → `cJSON_Parse` (`0x400fee74`) at the RX router `0x400e6129` →
+  messageTypeId switch → payload = cJSON array item[2] → dispatcher `0x400e38a4` → parser,
+  which does `GetObjectItem`→`IsString`→`strcpy` of the **network-supplied** `valuestring`.
+  The parser's JSON-root arg (`a3`) is wired from the dispatcher's payload (`a4`) via
+  `or a11,a4,a4` at each call site — confirmed.
+- **Trigger shape:** these are **CALLRESULT responses to charger-initiated requests**, so a
+  malicious or MITM'd OCPP server (enabled by N3 — no cert validation) simply answers the
+  charger's routine `Heartbeat`/`Authorize`/`StartTransaction` with an oversized field
+  (e.g. `idTagInfo.status`). For `0x400e34c0` (112-byte frame, `status`→`a1+0x2e`) a value
+  ≥ ~50 bytes reaches the register save area and ≥ 66 bytes overruns the frame top; there is
+  no canary/length guard. **Guaranteed outcome: remote stack corruption (DoS).** RCE is
+  plausible but conditional on the windowed-ABI spill state (ESP32 has no ASLR and the
+  attacker has this exact image, which favors a crafted payload). Adversarially re-verified:
+  verdict `REACHABLE_NETWORK`, impact `rce_plausible`.
+- **Residual (not load-bearing):** the exact `WEBSOCKET_EVENT_DATA`→receive-buffer store
+  inside `WebSocketEventHandler`, and `CheckInputRequestMessage`'s uniqueId→action recovery
+  for CALLRESULTs, were inferred rather than instruction-traced — neither is required for
+  network bytes to reach the `strcpy`.
+- **Note for this project:** on your setup *your own* local server is the OCPP endpoint, so
+  this is not a risk *from* your server — it is a vulnerability in the shipped firmware that
+  a rogue/MITM OCPP server (or the cloud) could exploit.
+
+### N3. OCPP (wss) channel does not validate the server certificate — **CONFIRMED — HIGH**
+The bundled ISRG Root X1 CA is wired via accessor `0x400d8c48` **only** to the evse.center
+`RegisterSn` client (`0x400db2ec`); the OCPP `wss` client is configured with **no trust
+anchor** (no alternate anchor found). This is *why* the DNS-override local-server route
+works — and it means a network MITM can impersonate the cloud and deliver OCPP commands
+and `UpdateFirmware`. This is the enabler that governs finding 5's exploitability.
+
+### N4. OTA MD5 integrity is runtime-skippable — **CONFIRMED — HIGH**
+The OTA integrity routine `0x400db9e8` reads a one-byte flag at `ctx+0xa4`
+(`l8ui` at `0x400dba60`) and, when zero, `beqz` (`0x400dba63`) branches past the entire
+MD5 compute/compare to the **success** tail at `0x400dbaf0` (`"MD5 disabled!"`). With MD5
+skipped, only CRC32 + a constant magic byte remain — both recomputable by whoever delivers
+the image. Compounds finding 5.
+
+### N5. Weak RNG for registration uid — **CONFIRMED — LOW**
+The 10-char `uid` in `RegisterSn` is generated by `0x400db238` (called ×10 from
+`0x400db328`) using the ROM libc `rand()` LCG (`0x40001058`), not `esp_random`. The `uid`
+is a per-registration nonce, not an auth token, so impact is low (hygiene).
+
+### N6. Plaintext SNTP — **CONFIRMED — LOW**
+`time.google.com` (`0x3f40d314`) over unauthenticated SNTP; a network attacker can spoof
+device time (could affect TLS validity windows or schedules). Low.
+
+### Rejected during adversarial review (recorded to avoid re-reporting)
+- *"`/pageEvent` injects commands to the STM32 over UART (`S_RX`)"* — **false positive**:
+  `0x400905fc` is not the ESP32→main-board UART driver.
+- *OCPP "host is operator-controlled" posture* — real facts, but no independent defect
+  beyond N3.
+
+---
+
 ## Image layout
 - `UC\0\0` container (0x000–0x400 header incl. an ASCII SHA-256), then ~2 MiB region
   (littlefs/web assets + main-board `GRD077L-01.10.0` image), then the ESP32 app at
