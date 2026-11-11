@@ -27,7 +27,7 @@ required to read this; addresses below are real load addresses (IROM `0x400d0020
 | 3 | **CONFIRMED** | JSON key is `type:"register"` (no `"register"` key); transport is **HTTPS with CA validation**. |
 | 4 | **CONFIRMED** | Forgeable as described. (Helper addresses in the v0.6.0 capture note were mis-offset: the hash is `0x4013ba44`, hex-encode `0x400e82e8`, main fn `0x400ef108`.) |
 | 5 | **CONFIRMED (sharpened)** | Image *does* contain RSA/ECDSA (for TLS); the precise, confirmed claim is **"no signature gates the OTA."** See also N4 (MD5 is skippable). |
-| 6 | **Part A CONFIRMED; Part B UNVERIFIABLE** | No embedded private key; ISRG Root X1 present. Main-board UART→relay gating **not proven** — REA mis-decoded the Thumb image (loaded as ARM mode), so that pass is low-confidence; needs the Ghidra Cortex-M import. |
+| 6 | **Part A CONFIRMED; Part B leans safe-by-design, not proven** | No embedded private key; ISRG Root X1 present. Main-board Ghidra Cortex-M pass done (see the Part B section below): independent ADC/CP/watchdog + condition-gated GPIO drives suggest UART cannot force unsafe energization, but a definitive trace is blocked by Ghidra's patchy Thumb decode. |
 
 ### Corrections to finding 1 (important — changes the risk classification)
 
@@ -153,6 +153,41 @@ is a per-registration nonce, not an auth token, so impact is low (hygiene).
 ### N6. Plaintext SNTP — **CONFIRMED — LOW**
 `time.google.com` (`0x3f40d314`) over unauthenticated SNTP; a network attacker can spoof
 device time (could affect TLS validity windows or schedules). Low.
+
+### Finding 6 Part B — main-board Ghidra Cortex-M pass (2026-11-11) — **leans safe-by-design, NOT proven**
+The STM32F4 main board was imported into Ghidra correctly this time (`ARM:LE:32:Cortex`,
+base `0x08000000`, 226 functions; vector table SP `0x20040000` / reset `0x0800f1e9` verified)
+— superseding the REA pass, which had mis-loaded it as ARM mode. What the analysis shows:
+- **Independent sensing is real.** The ADC task (`FUN_08001d74`) performs genuine ADC→float
+  current/voltage scaling (`vmul.f32`/`vcvt.s32.f32` at `0x8001da6`) and stores measured
+  values, independent of the UART. Control-pilot PWM lives in the advanced timers TIM1/TIM8
+  (`FUN_0800be8c`/`FUN_0800cbf6`/`FUN_0800cdae`), and an independent IWDG watchdog is wired
+  into the control functions.
+- **USART3 is the ESP32 link** (`FUN_0800b320` region; IRQ vector `0x0800f024`); the other
+  UARTs appear only in the base-address table at `0x800d6a8`, and USART1/2 vectors are stubs.
+- **The relay/output drive primitive is `FUN_08008746` = `HAL_GPIO_WritePin`** (`str r1,[r0,
+  #0x18]` → `GPIOx_BSRR`). The one drive site that decoded cleanly (`0x80020a0`, in the ADC
+  region) is **condition-gated**: `bl 0x80024b6 ; cbz r0,skip ; bl 0x08008746` — the GPIO is
+  written only when the computed check passes, not unconditionally.
+- **Verdict:** the architecture (independent ADC sensing + CP timers + independent watchdog +
+  condition-gated GPIO drives, with the ESP32 sending current *setpoints* like
+  `Station Current %d` rather than a raw "close relay" command) is consistent with the
+  standard EVSE model where energization requires the controller's own CP/over-current logic.
+  The balance of evidence **leans toward "a malicious UART command alone cannot force unsafe
+  energization"** — but this is an **architectural inference, not proven** from the decode.
+- **Why not proven (tooling blocker, confirmed):** Ghidra's Thumb auto-analysis is patchy
+  even after the clean re-import — the decompiler returns `bad instruction data`/register-
+  guessing on the USART3 handler and the EVSE control functions (`FUN_0800af58`,
+  `FUN_0800b320`, `FUN_08007bf4`); function boundaries lump code + literal pools together
+  (e.g. the `asrs r0,r0,#0x14` run at `0x8001dfa` is misread pool data); the call graph is
+  incomplete (only 1 of many real callers of `FUN_08008746` is resolved); and the USART3 ISR
+  at `0x0800f024` decodes as data.
+- **To close it out** (manual Thumb cleanup needed): mark the literal-pool/data regions as
+  data and re-disassemble the following bytes as Thumb functions until the EVSE/USART
+  functions decompile; find the USART3 RX frame parser (likely invoked from `SYSTEM TASK`
+  `FUN_08007bf4`) and check whether it writes a setpoint variable or ever calls `FUN_08008746`
+  directly; identify the contactor pin among the `FUN_08008746` callers and confirm its guard
+  chain includes CP-state + over-current, not just UART state. See `MAINBOARD-GHIDRA.md`.
 
 ### Rejected during adversarial review (recorded to avoid re-reporting)
 - *"`/pageEvent` injects commands to the STM32 over UART (`S_RX`)"* — **false positive**:
