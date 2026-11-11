@@ -9,4 +9,5 @@ __pycache__/
 
 # Captured vendor firmware images are not redistributed (proprietary United Chargers).
 firmware/*.bin
+firmware/**/*.bin
 firmware/*.bin.json

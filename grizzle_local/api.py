@@ -6,6 +6,7 @@ implemented. Station ids are the charger serial (the cloud uses Mongo ids).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import secrets
 import time
@@ -561,8 +562,28 @@ async def health(request: web.Request) -> web.Response:
     )
 
 
+async def ext_ocpp_check(request: web.Request) -> web.Response:
+    """Answer the Grizzl-E firmware's third-party-OCPP "unlock" check locally.
+
+    The firmware GETs ``connect-api.unitedchargers.com/commercial/ext-ocpp-check/<serial>`` and
+    expects the response body to equal the lowercase-hex MD5 of ``"<serial>;isUnlocked=true"``; on a
+    match it sets its internal ``isUnlocked`` flag, keeping a custom OCPP backend enabled. The
+    expected value contains no server-side secret (just the public serial + a constant), so we can
+    return it ourselves. Reached only if ``connect-api.unitedchargers.com`` is DNS-overridden to
+    this server as well (served over TLS; the charger does not verify the certificate). This
+    endpoint is public and unauthenticated, exactly as the charger calls it.
+    """
+    if not _controller(request).settings.ocpp_unlock:
+        raise web.HTTPNotFound()
+    serial = request.match_info["serial"]
+    digest = hashlib.md5(f"{serial};isUnlocked=true".encode(), usedforsecurity=False).hexdigest()
+    _LOGGER.info("ext-ocpp-check for %s -> isUnlocked (served %s)", serial, digest)
+    return web.Response(text=digest, content_type="text/plain")
+
+
 def add_routes(app: web.Application) -> None:
     app.router.add_get("/health", health)
+    app.router.add_get("/commercial/ext-ocpp-check/{serial}", ext_ocpp_check)
     app.router.add_post("/client/auth/login", login)
     app.router.add_post("/client/auth/refresh-token", refresh_token)
     app.router.add_post("/client/auth/logout", logout)

@@ -129,10 +129,21 @@ docker compose logs -f        # look for "and wss:// on 8443"
 Other DNS servers (Pi-hole, AdGuard Home, a router's local DNS) work the same way: add a
 local A record for `ocpp.unitedchargers.com` pointing at the server.
 
-Overriding `connect-api.unitedchargers.com` is not needed: Home Assistant is pointed at
-the server directly, and the phone app can't be made to work this way anyway (it uses
-HTTPS with normal certificate checks). Block that host at the firewall if you want the
-app silenced. Once the charger is on the local server the vendor app stops seeing it.
+Overriding `connect-api.unitedchargers.com` is not needed for normal operation: Home
+Assistant is pointed at the server directly, and the phone app can't be made to work this
+way anyway (it uses HTTPS with normal certificate checks). Block that host at the firewall
+if you want the app silenced. Once the charger is on the local server the vendor app stops
+seeing it.
+
+**Optional — keep third-party OCPP "unlocked".** Newer Grizzl-E firmware gates custom OCPP
+backends behind a check the charger makes to `connect-api.unitedchargers.com/commercial/
+ext-ocpp-check/<serial>`. The check carries no server secret (the expected answer is just a
+hash of the public serial), so this server can satisfy it: add a **second** DNS override so
+`connect-api.unitedchargers.com` also resolves to the server (same TLS listener on 443; the
+charger does not verify the certificate), and the built-in `GET /commercial/ext-ocpp-check/
+{serial}` endpoint answers it. On by default; set `GRIZZLE_OCPP_UNLOCK=0` to disable. Leave
+it off unless your firmware actually enforces the unlock — if local OCPP already works, you
+don't need it.
 
 You can test the whole chain without the real charger: `tools/fake_charger.py` accepts
 `wss://…` URLs with `--insecure`. The plain `ws://` listener on port 9000 also accepts
