@@ -335,3 +335,37 @@ async def test_clear_pinned_key_drops_live_connection_so_charger_repins(server, 
         assert controller.station(SERIAL)["ocppAuthKey"] == "rotated-key"
     finally:
         await _stop_charger(cp, task)
+
+
+async def test_concurrent_first_connections_cannot_both_get_in(server, session, monkeypatch):
+    """Two first connections for an unpinned serial race between the check and the install:
+    only one may get in, and the installed connection must be the one whose key is pinned."""
+    controller = server.app["controller"]
+    original = type(controller).connection_refusal
+
+    async def slow_refusal(self, cp_id, auth_key):
+        result = await original(self, cp_id, auth_key)
+        await asyncio.sleep(0.3)  # widen the window between the check and on_connect
+        return result
+
+    monkeypatch.setattr(type(controller), "connection_refusal", slow_refusal)
+    url = f"ws://{server.host}:{server.port}/ocpp1.6/GRD-RACE0001"
+
+    async def attempt(key):
+        auth = {"Authorization": aiohttp.BasicAuth("GRD-RACE0001", key).encode()}
+        try:
+            return key, await session.ws_connect(url, protocols=("ocpp1.6",), headers=auth)
+        except aiohttp.WSServerHandshakeError as err:
+            return key, err.status
+
+    results = await asyncio.gather(attempt("key-a"), attempt("key-b"))
+    winners = [(k, r) for k, r in results if not isinstance(r, int)]
+    try:
+        assert len(winners) == 1, results
+        assert sorted(r for _, r in results if isinstance(r, int)) == [401]
+        assert controller.station("GRD-RACE0001")["ocppAuthKey"] == winners[0][0]
+        assert controller.is_online("GRD-RACE0001")
+        assert controller._admission_locks == {}
+    finally:
+        for _, ws in winners:
+            await ws.close()

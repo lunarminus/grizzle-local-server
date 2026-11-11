@@ -11,10 +11,12 @@ How the Grizzl-E Connect family behaves (from evcc's and others' experience):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import secrets
 import time as _time
 from datetime import UTC, datetime
+from collections.abc import AsyncIterator
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -86,6 +88,7 @@ class Controller:
         self._tasks: set[asyncio.Task[Any]] = set()
         self._dirty = False
         self._last_pin_save = float("-inf")
+        self._admission_locks: dict[str, tuple[asyncio.Lock, int]] = {}  # id -> (lock, users)
         self._stopping = False
 
     # --- station state helpers ---------------------------------------------
@@ -188,6 +191,28 @@ class Controller:
 
     # How long a live connection gets to answer before an unauthenticated newcomer may replace it.
     LIVENESS_TIMEOUT = 5.0
+
+    @contextlib.asynccontextmanager
+    async def admission(self, cp_id: str) -> AsyncIterator[None]:
+        """Serialise connection_refusal() .. on_connect() per charge point id.
+
+        Both the liveness probe and the WebSocket handshake await, so without this two handshakes
+        for the same id could both pass the check (say, two first connections with different keys)
+        and the later one would replace the earlier one despite the pin the earlier one set.
+        """
+        lock, users = self._admission_locks.get(cp_id) or (asyncio.Lock(), 0)
+        self._admission_locks[cp_id] = (lock, users + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            # Drop the entry only when nobody holds or awaits it (a released Lock looks unlocked
+            # before its next waiter runs, so locked() can't tell).
+            lock, users = self._admission_locks[cp_id]
+            if users == 1:
+                del self._admission_locks[cp_id]
+            else:
+                self._admission_locks[cp_id] = (lock, users - 1)
 
     async def connection_refusal(self, cp_id: str, auth_key: str | None) -> tuple[int, str] | None:
         """Decide whether a charger may connect as ``cp_id``; (HTTP status, reason) if not.

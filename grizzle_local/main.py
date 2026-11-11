@@ -90,28 +90,32 @@ async def websocket_handler(request: web.Request) -> web.StreamResponse:
         _LOGGER.warning("rejected websocket from %s: invalid charge point id %r", request.remote, cp_id)
         raise web.HTTPBadRequest()
     auth_user, auth_key = _basic_credentials(request)
-    refusal = await controller.connection_refusal(cp_id, auth_key)
-    if refusal is not None:
-        status, reason = refusal
-        _LOGGER.warning("%s: rejected connection from %s: %s", cp_id, request.remote, reason)
-        raise web.HTTPUnauthorized() if status == 401 else web.HTTPConflict()
-    offered = [p.strip() for p in request.headers.get("Sec-WebSocket-Protocol", "").split(",") if p.strip()]
-    ws = web.WebSocketResponse(protocols=("ocpp1.6",) if "ocpp1.6" in offered else (), heartbeat=120, autoping=True)
-    await ws.prepare(request)
-    _LOGGER.info("%s: websocket from %s path=%s subprotocol=%s", cp_id, request.remote, request.path, ws.ws_protocol)
-    # Record how the charger connected, so its cloud identity (serial + Auth key) can be
-    # reused by tools/firmware_capture.py. This is never exposed through the HTTP API.
-    handshake = {
-        "path": request.path,
-        "query": request.query_string or None,
-        "authUser": auth_user,
-        "protocols": offered,
-        "userAgent": request.headers.get("User-Agent"),
-        "remote": request.remote,
-        "recordedAt": now_iso(),
-    }
-    conn = ChargePointConnection(cp_id, ws, controller.handle)
-    await controller.on_connect(conn, handshake=handshake, auth_key=auth_key)
+    # Check and install under one lock, so a concurrent handshake can't slip in between.
+    async with controller.admission(cp_id):
+        refusal = await controller.connection_refusal(cp_id, auth_key)
+        if refusal is not None:
+            status, reason = refusal
+            _LOGGER.warning("%s: rejected connection from %s: %s", cp_id, request.remote, reason)
+            raise web.HTTPUnauthorized() if status == 401 else web.HTTPConflict()
+        offered = [p.strip() for p in request.headers.get("Sec-WebSocket-Protocol", "").split(",") if p.strip()]
+        ws = web.WebSocketResponse(protocols=("ocpp1.6",) if "ocpp1.6" in offered else (), heartbeat=120, autoping=True)
+        await ws.prepare(request)
+        _LOGGER.info(
+            "%s: websocket from %s path=%s subprotocol=%s", cp_id, request.remote, request.path, ws.ws_protocol
+        )
+        # Record how the charger connected, so its cloud identity (serial + Auth key) can be
+        # reused by tools/firmware_capture.py. This is never exposed through the HTTP API.
+        handshake = {
+            "path": request.path,
+            "query": request.query_string or None,
+            "authUser": auth_user,
+            "protocols": offered,
+            "userAgent": request.headers.get("User-Agent"),
+            "remote": request.remote,
+            "recordedAt": now_iso(),
+        }
+        conn = ChargePointConnection(cp_id, ws, controller.handle)
+        await controller.on_connect(conn, handshake=handshake, auth_key=auth_key)
     try:
         await conn.run()
     finally:
