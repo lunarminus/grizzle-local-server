@@ -7,16 +7,26 @@
 # container never is root and this script simply runs the command.
 #
 # Dropping root must never be the reason an existing installation stops starting, so whenever
-# the unprivileged user could not do its job (cannot switch user, data directory not writable,
-# no place to put a readable copy of the TLS key, a port it may not bind) the script says so and
-# carries on as root.
+# the unprivileged user could not do its job (cannot switch user, data directory or the files in
+# it not writable, no place to put a readable copy of the TLS key, a port it may not bind) the
+# script says so and carries on as root. GRIZZLE_RUN_AS=root keeps root on purpose.
 set -eu
 
 RUN_AS="${GRIZZLE_RUN_AS:-grizzle}"
 DATA="${GRIZZLE_DATA_DIR:-/data}"
 CERT="${GRIZZLE_TLS_CERT:-/certs/fullchain.pem}"
 KEY="${GRIZZLE_TLS_KEY:-/certs/privkey.pem}"
-CERT_COPY="${GRIZZLE_CERT_COPY_DIR:-/run/grizzle-certs}"
+# Always a directory of our own inside the one named: it is emptied on every start, and
+# GRIZZLE_CERT_COPY_DIR=/data must not mean "empty /data".
+CERT_COPY="${GRIZZLE_CERT_COPY_DIR:-/run}/grizzle-certs"
+
+# Can whoever runs this use the data directory: the directory itself and the files the server
+# opens in it? (A directory can be writable while state.json in it is someone else's.)
+# shellcheck disable=SC2016  # the $1 belongs to the inner shell
+CAN_USE_DATA='test -d "$1" && test -w "$1" && test -x "$1" || exit 1
+for file in "$1"/state.json "$1"/state.tmp "$1"/history.sqlite "$1"/history.sqlite-journal "$1"/history.sqlite-wal; do
+    [ ! -e "$file" ] || { [ -r "$file" ] && [ -w "$file" ]; } || exit 1
+done'
 
 if [ "$(id -u)" != "0" ] || [ "$RUN_AS" = "root" ]; then
     exec "$@"
@@ -45,6 +55,11 @@ as_user() {
 stay_root() {
     echo "docker-entrypoint: $1; running as root" >&2
     shift
+    if ! sh -c "$CAN_USE_DATA" sh "$DATA" 2>/dev/null; then
+        # Root without its capabilities (cap_drop: ALL) is no better off than anybody else.
+        echo "docker-entrypoint: root cannot write '$DATA' either. Run the container as the owner of that" \
+            "directory (user: \"10001:10001\" in compose), or allow the SETUID, SETGID and CHOWN capabilities" >&2
+    fi
     exec "$@"
 }
 
@@ -56,9 +71,10 @@ if ! as_user true 2>/dev/null; then
 fi
 
 mkdir -p "$DATA" 2>/dev/null || true
-chown -R "$RUN_AS:$RUN_AS" "$DATA" 2>/dev/null || true
-if ! as_user sh -c 'test -d "$1" && test -w "$1" && test -x "$1"' sh "$DATA" 2>/dev/null; then
-    stay_root "'$DATA' is not writable by '$RUN_AS' (read-only or root-squashed volume?)" "$@"
+# -H: if the data directory is a symbolic link, hand over what it points to, not the link.
+chown -R -H "$RUN_AS:$RUN_AS" "$DATA" 2>/dev/null || true
+if ! as_user sh -c "$CAN_USE_DATA" sh "$DATA" 2>/dev/null; then
+    stay_root "'$DATA' or a file in it is not writable by '$RUN_AS' (read-only or root-squashed volume?)" "$@"
 fi
 
 # The TLS key is normally mounted read-only and readable by its owner alone. Hand the
@@ -78,5 +94,8 @@ if [ -f "$CERT" ] && [ -f "$KEY" ] &&
     fi
 fi
 
+# HOME still says /root, which the unprivileged user cannot enter: tools that keep something
+# under ~ (the firmware tool's token file) get the data directory instead.
+export HOME="$DATA"
 # shellcheck disable=SC2086
 exec setpriv --reuid="$RUN_AS" --regid="$RUN_AS" --init-groups --no-new-privs $CAPS "$@"

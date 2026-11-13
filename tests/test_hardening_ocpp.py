@@ -1131,3 +1131,115 @@ def test_a_charger_without_an_id_keeps_the_station_it_had(tmp_path):
     assert _charge_point_id(Request(), {"unknown-127.0.0.1": {}}) == "unknown-127.0.0.1"
     assert _charge_point_id(Request(), {"unknown-127.0.0.1": {}, "unknown-192.168.1.50": {}}) == "unknown-192.168.1.50"
     assert _charge_point_id(Request()) == "unknown-192.168.1.50"
+
+
+# --- gaps a reviewer found by reverting fixes and watching the suite stay green ---------------------
+
+
+async def test_the_read_loop_applies_the_rate_limit():
+    """The limiter was only ever tested on its own. Nothing noticed if run() stopped calling it."""
+    from aiohttp import WSMsgType
+
+    class Message:
+        type, data = WSMsgType.TEXT, json.dumps([3, "nobody-asked", {}])
+
+    class Socket:
+        closed = False
+
+        def __init__(self, frames):
+            self.frames = frames
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self.frames:
+                raise StopAsyncIteration
+            self.frames -= 1
+            return Message()
+
+    conn = ChargePointConnection("GRD-FLOOD002", Socket(60), handler=None, rate_burst=10, rate_per_second=1000)
+    started = time.monotonic()
+    await conn.run()
+    assert time.monotonic() - started >= 0.045  # 50 frames beyond the burst, at 1000 a second
+    assert len(conn.log) == 60
+
+
+def test_pruning_removes_what_is_older_than_the_limit_and_nothing_else(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    store = Store(tmp_path / "data")
+
+    def stamp(days: float) -> str:
+        return (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    ages = (120, 91, 90.01, 89.99, 89, 1, 0)
+    store.add_samples([(SERIAL, 1, None, stamp(age), {"voltage_v": float(n)}) for n, age in enumerate(ages)])
+    store.prune_samples(keep_days=90)
+    left = [row["voltage_v"] for row in store.samples(SERIAL, "2000-01-01")]
+    assert left == [3.0, 4.0, 5.0, 6.0]  # to the minute, not "the whole day of the cutoff"
+
+
+def test_state_is_flushed_to_disk_before_it_replaces_the_old_file(tmp_path, monkeypatch):
+    """Renamed without that, a power cut can leave an empty state.json: every station and every
+    pinned Auth key forgotten."""
+    import os as os_module
+
+    store = Store(tmp_path / "data")
+    order: list[str] = []
+    real_fsync, real_replace = os_module.fsync, os_module.replace
+    monkeypatch.setattr(os_module, "fsync", lambda fd: (order.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(os_module, "replace", lambda a, b: (order.append("replace"), real_replace(a, b))[1])
+    store.state["stations"]["GRD-X"] = {"id": "GRD-X"}
+    store.save()
+    assert order == ["fsync", "replace"]
+    assert "GRD-X" in (tmp_path / "data" / "state.json").read_text()
+
+
+def test_the_first_save_after_a_crash_is_private_too(tmp_path):
+    """A temporary file left by an older version is world-readable, and the save that reuses it
+    used to hand that mode on to state.json."""
+    import stat as stat_module
+
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "state.tmp").write_text("left over from a crash")
+    (data / "state.tmp").chmod(0o644)
+    store = Store(data)
+    store.state["tokens"]["secret-token"] = {"refresh": "r", "expires": 1e12}
+    store.save()
+    assert stat_module.S_IMODE((data / "state.json").stat().st_mode) == 0o600
+    assert "secret-token" in (data / "state.json").read_text()
+
+
+async def test_long_fields_and_many_sampled_values_are_cut_to_size(server, session):
+    controller = server.app["controller"]
+    long = "L" * 5000
+    cp = await RawCharger.connect(server, session, SERIAL, path=f"/ocpp1.6/{SERIAL}?{'q' * 3000}")
+    try:
+        status = {"connectorId": 1, "status": long, "errorCode": long, "vendorErrorCode": long, "info": long}
+        assert (await cp.call("StatusNotification", status))[0] == 3
+        assert (await cp.call("StartTransaction", {"connectorId": 1, "idTag": long, "meterStart": 0}))[0] == 3
+        many = [{"value": str(n), "measurand": "Voltage", "phase": "L1"} for n in range(500)]
+        assert (await cp.call("MeterValues", {"connectorId": 1, "meterValue": [{"sampledValue": many}]}))[0] == 3
+        station = controller.station(SERIAL)
+        connector = station["connectors"]["1"]
+        assert len(connector["status"]) == 32 and len(connector["errorCode"]) == 50
+        assert len(connector["vendorErrorCode"]) == 50 and len(connector["info"]) == 255
+        assert len(connector["transaction"]["idTag"]) == 64
+        # Only the first MAX_SAMPLED_VALUES readings of a meter value are looked at.
+        assert connector["lastMeter"]["voltage_v"] == controller_module.MAX_SAMPLED_VALUES - 1
+        assert len(station["ocppHandshake"]["query"]) == 200 and len(json.dumps(station["ocppHandshake"])) < 1000
+    finally:
+        await cp.close()
+
+
+async def test_a_charger_with_an_unset_clock_repeating_itself_is_still_recognised(tmp_path):
+    controller = _controller(tmp_path)
+    station = controller._ensure_station(SERIAL)
+    start = {"connectorId": 1, "idTag": "t", "meterStart": 1000, "timestamp": "1970-01-01T00:10:00Z"}
+    first = (await controller._on_StartTransaction(station, start))["transactionId"]
+    again = (await controller._on_StartTransaction(station, start))["transactionId"]
+    assert again == first and len(controller.store.sessions(SERIAL)) == 1
+    later = {**start, "timestamp": "1970-01-01T05:00:00Z"}  # a different session by the charger's own clock
+    assert (await controller._on_StartTransaction(station, later))["transactionId"] != first

@@ -58,7 +58,15 @@ def frame_ancestors(value: str | None) -> str:
     The result goes into a response header, so anything that isn't a plain source expression is
     refused rather than passed through.
     """
-    sources = (value or "").replace(",", " ").split()
+    sources = []
+    for source in (value or "").replace(",", " ").split():
+        if "://" in source:  # pasted from the address bar: http://homeassistant.local:8123/lovelace -> its origin
+            try:
+                parts = urlsplit(source)
+                source = f"{parts.scheme}://{parts.netloc}"
+            except ValueError:
+                pass
+        sources.append(source)
     for source in sources:
         if not _CSP_SOURCE_RE.fullmatch(source):
             raise ValueError(

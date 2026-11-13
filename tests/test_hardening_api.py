@@ -287,7 +287,7 @@ def test_frame_ancestors_setting(monkeypatch):
     assert Settings().frame_ancestors == "'self'"
     monkeypatch.setenv("GRIZZLE_FRAME_ANCESTORS", "http://homeassistant.local:8123, https://ha.example.com")
     assert Settings().frame_ancestors == "http://homeassistant.local:8123 https://ha.example.com"
-    for value in ("x; script-src *", '"self"', "http://a/b", "'unsafe-inline'", "a\tb;c"):
+    for value in ("x; script-src *", '"self"', "'unsafe-inline'", "a\tb;c", "http://a;b/"):
         with pytest.raises(ValueError):
             frame_ancestors(value)
         with pytest.raises(ValueError):

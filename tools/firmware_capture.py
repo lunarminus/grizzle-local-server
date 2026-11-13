@@ -265,7 +265,16 @@ def load_identity(state_path: Path, serial: str | None) -> dict[str, Any]:
     """Pull the charger's cloud identity (serial, boot fields, Auth key) from the server's state.json."""
     if not state_path.exists():
         raise CloudError(f"no server state at {state_path}; pass --state, or --serial/--auth-key explicitly")
-    stations = (json.loads(state_path.read_text()) or {}).get("stations") or {}
+    try:
+        stations = (json.loads(state_path.read_text()) or {}).get("stations") or {}
+    except PermissionError:
+        raise CloudError(
+            f"cannot read {state_path}: it is readable only by the user the server runs as (it holds the charger's "
+            "Auth key). Run this as that user or with sudo, or inside the container: docker exec <container> "
+            "python tools/firmware_capture.py ..."
+        ) from None
+    except (OSError, ValueError) as err:
+        raise CloudError(f"cannot read {state_path}: {err}") from None
     if not stations:
         raise CloudError(f"{state_path} has no stations")
     if serial:
@@ -285,7 +294,10 @@ def image_filename(location: str) -> str:
     The location is not ours to trust. Whatever it says, the result has no directory part and is
     never ``.`` or ``..``, so the image can only land inside the output directory.
     """
-    path = urllib.parse.urlsplit(str(location)).path
+    try:
+        path = urllib.parse.urlsplit(str(location)).path
+    except ValueError:  # not a URL at all ("http://[bad"); download_image will say so
+        path = ""
     name = urllib.parse.unquote(path.rstrip("/").rsplit("/", 1)[-1])
     name = re.sub(r"[^A-Za-z0-9._-]", "_", name.replace("\\", "/").rsplit("/", 1)[-1])[:128]
     return name if name.strip("._") else "firmware.bin"
@@ -293,7 +305,10 @@ def image_filename(location: str) -> str:
 
 def download_image(location: str, out_path: Path, max_bytes: int = DEFAULT_MAX_DOWNLOAD) -> dict[str, Any]:
     """Fetch the firmware image from an UpdateFirmware location (http/https/ftp) to disk."""
-    scheme = urllib.parse.urlsplit(str(location)).scheme.lower()
+    try:
+        scheme = urllib.parse.urlsplit(str(location)).scheme.lower()
+    except ValueError:
+        scheme = ""
     if scheme not in DOWNLOAD_SCHEMES:
         raise CloudError(
             f"refusing to download {location!r}: only {', '.join(DOWNLOAD_SCHEMES)} locations are fetched"

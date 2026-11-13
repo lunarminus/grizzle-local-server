@@ -769,14 +769,18 @@ class Controller:
         id_tag = _text(payload.get("idTag"), 64)
         started = _timestamp(payload.get("timestamp"))
         meter_start = _reading(payload.get("meterStart"))
+        charger_clock = _parse_iso(payload.get("timestamp"))
+        clock_start = _iso(charger_clock) if charger_clock and charger_clock.year >= 1970 else None
         open_tx = connector.get("transaction")
         if open_tx:
-            same = (open_tx.get("startAt"), open_tx.get("meterStart"), open_tx.get("idTag")) == (
-                started,
+            # Compared by what the charger's clock said, not by the time we recorded: a charger
+            # whose clock was never set gets "now" as the start each time it repeats itself.
+            same = (open_tx.get("clockStart"), open_tx.get("meterStart"), open_tx.get("idTag")) == (
+                clock_start,
                 meter_start,
                 id_tag,
             )
-            if same and _parse_iso(payload.get("timestamp")) is not None:
+            if same and clock_start is not None:
                 # The same StartTransaction again: the charger never saw our answer and, as OCPP
                 # asks, repeats the request. Give it the same transaction, not a second session.
                 return {"transactionId": open_tx["id"], "idTagInfo": {"status": "Accepted"}}
@@ -786,14 +790,13 @@ class Controller:
         tid = self.store.next_transaction_id()
         local_now = datetime.now(self.tz(station))
         price = self.price_at(station, local_now)
-        charger_clock = _parse_iso(payload.get("timestamp"))
         connector["transaction"] = {
             "id": tid,
             "idTag": id_tag,
             "startAt": started,
             # What the charger's own clock said, however wrong the date: the length of a session
             # is the difference between two readings of that clock.
-            "clockStart": _iso(charger_clock) if charger_clock and charger_clock.year >= 1970 else None,
+            "clockStart": clock_start,
             "meterStart": meter_start,
             "energy": 0,
             "power": 0,

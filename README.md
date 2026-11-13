@@ -77,7 +77,10 @@ The container starts as root only to take over the data volume (older images wro
 then runs the server as the unprivileged user `grizzle` (uid 10001). Files in `./data` are owned by
 that uid and readable only by it: `state.json` holds the API sessions and the charger's cloud Auth
 key. If the volume can't be handed over (a read-only or root-squashed mount) the server says so in
-the log and stays root rather than fail to start. `user:` in the compose file works too.
+the log and stays root rather than fail to start; `GRIZZLE_RUN_AS=root` keeps root on purpose.
+`user: "10001:10001"` in the compose file works too, and is what to use together with
+`cap_drop: [ALL]` (to switch user by itself the container needs the SETUID, SETGID and CHOWN
+capabilities, which Docker grants by default).
 
 Environment variables (all optional):
 
@@ -344,7 +347,7 @@ Nothing needs to be migrated by hand, but a few things behave differently on pur
 ## Development
 
 ```bash
-python -m venv .venv && . .venv/bin/activate
+python3.13 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt         # everything pinned with hashes; see requirements*.in
 pytest                                      # schedules, TLS, end-to-end with the fake charger, hardening
 GRIZZLE_DATA_DIR=./data GRIZZLE_PORT=9000 python -m grizzle_local
@@ -372,7 +375,9 @@ docker-entrypoint.sh    # hands the volumes to the unprivileged user, then drops
 Dependencies are locked: `requirements.in` lists what the server needs, `requirements.txt` is
 compiled from it with every package pinned and hashed (`pip-compile --generate-hashes`), and the
 image installs with `--require-hashes`. To update, edit the `.in` file (or let Dependabot propose
-it) and recompile both lock files with the commands at the top of each `.in`.
+it) and recompile both lock files with the commands at the top of each `.in`. The lock files are
+for Python 3.13, the version the image and CI use; the code runs on 3.11 and later, and on another
+version install from the `.in` files instead (`pip install -r requirements.in pytest pytest-asyncio ruff`).
 
 ## Status
 

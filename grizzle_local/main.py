@@ -240,11 +240,17 @@ async def shutdown(runner: web.AppRunner, tls_server: asyncio.Server | None) -> 
             await asyncio.wait_for(tls_server.wait_closed(), 5)
 
 
-def main(argv: list[str] | None = None) -> None:
-    settings = Settings()
+def configure_logging(level: str) -> logging.Handler:
+    """Send everything to stderr through the formatter that keeps network-supplied text on one line."""
     handler = logging.StreamHandler()
     handler.setFormatter(SingleLineFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logging.basicConfig(level=getattr(logging, settings.log_level, logging.INFO), handlers=[handler])
+    logging.basicConfig(level=getattr(logging, level, logging.INFO), handlers=[handler], force=True)
+    return handler
+
+
+def main(argv: list[str] | None = None) -> None:
+    settings = Settings()
+    configure_logging(settings.log_level)
     try:
         asyncio.run(serve(settings))
     except KeyboardInterrupt:

@@ -25,6 +25,8 @@ jobs:
       - run: pip install --require-hashes -r requirements-dev.txt
       - run: ruff check --select F,E9,B,E --line-length 120 grizzle_local tools tests scripts
       - run: pytest -q
+      # The entrypoint's tests need root (dropping it is what they test), which this job's user is not.
+      - run: sudo env "PATH=$PATH" python -m pytest -q -p no:cacheprovider tests/test_hardening_deploy.py -k entrypoint
 
   # What unit tests can't see: the real image, started the way an upgraded installation starts it.
   container:
