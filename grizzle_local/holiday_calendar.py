@@ -13,11 +13,14 @@ flat price that replaces every rate zone on a holiday.
 
 from __future__ import annotations
 
+import math
 from datetime import date, timedelta
 from functools import lru_cache
 from typing import Any
 
 import holidays as _holidays
+
+from .schedules import HOLIDAY_MODES  # noqa: F401 - the modes live with the zones; re-exported here
 
 DEFAULTS: dict[str, Any] = {
     "enabled": False,
@@ -28,7 +31,8 @@ DEFAULTS: dict[str, Any] = {
     "excludedNames": [],
     "extraDates": [],
 }
-HOLIDAY_MODES = ("same", "skip", "also", "only")
+MAX_EXCLUDED_NAMES = 500
+MAX_EXTRA_DATES = 500
 
 
 @lru_cache(maxsize=1)
@@ -51,9 +55,14 @@ def _supported() -> dict[str, list[str]]:
 def normalize(raw: dict[str, Any] | None) -> dict[str, Any]:
     """Validate settings coming from the API. Raises ValueError with a readable message."""
     raw = raw or {}
+    if not isinstance(raw, dict):
+        raise ValueError("holiday settings must be an object")
     out = dict(DEFAULTS)
     out["enabled"] = bool(raw.get("enabled"))
     out["observed"] = bool(raw.get("observed", True))
+    for key in ("country", "subdivision"):
+        if raw.get(key) is not None and not isinstance(raw[key], str):
+            raise ValueError(f"{key} must be text")
     country = (raw.get("country") or "").strip().upper() or None
     subdivision = (raw.get("subdivision") or "").strip() or None
     if country is not None:
@@ -72,13 +81,27 @@ def normalize(raw: dict[str, Any] | None) -> dict[str, Any]:
     if price in (None, ""):
         out["priceKW"] = None
     else:
-        price = float(price)
+        if isinstance(price, bool) or not isinstance(price, (int, float, str)):
+            raise ValueError("holiday price must be a number")
+        try:
+            price = float(price)
+        except (ValueError, OverflowError):
+            raise ValueError("holiday price must be a number") from None
+        if not math.isfinite(price):  # NaN would pass "< 0" and then poison every price and total
+            raise ValueError("holiday price must be a number")
         if price < 0:
             raise ValueError("holiday price can't be negative")
         out["priceKW"] = price
-    out["excludedNames"] = sorted({str(n).strip() for n in raw.get("excludedNames") or [] if str(n).strip()})
+    excluded, extras = raw.get("excludedNames") or [], raw.get("extraDates") or []
+    if not isinstance(excluded, list) or not isinstance(extras, list):
+        raise ValueError("excludedNames and extraDates must be lists")
+    if len(excluded) > MAX_EXCLUDED_NAMES or len(extras) > MAX_EXTRA_DATES:
+        raise ValueError("too many holidays in the list")
+    if not all(isinstance(n, str) and len(n) <= 200 for n in excluded):
+        raise ValueError("excludedNames must be holiday names")
+    out["excludedNames"] = sorted({n.strip() for n in excluded if n.strip()})
     extra: dict[str, str] = {}
-    for item in raw.get("extraDates") or []:
+    for item in extras:
         if isinstance(item, str):
             item = {"date": item}
         try:

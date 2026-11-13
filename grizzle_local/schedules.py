@@ -16,13 +16,158 @@ days plus every holiday) or ``"only"`` (holidays only; ``days`` is ignored).
 
 from __future__ import annotations
 
+import json
+import math
+import re
 from collections.abc import Callable
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
 MINUTES_PER_DAY = 24 * 60
+HOLIDAY_MODES = ("same", "skip", "also", "only")
 
 HolidayCheck = Callable[[date], bool]
+
+# --- validation -----------------------------------------------------------------------------
+#
+# Zones arrive from the REST API and are evaluated on every controller tick, forever. Anything
+# stored here must therefore be something the functions below can evaluate: one zone with
+# ``"startHours": "soon"`` would otherwise raise on every tick after it was saved.
+
+_TIME_KEYS = tuple(
+    f"{edge}{unit}{suffix}" for suffix in ("", "2") for edge in ("start", "end") for unit in ("Hours", "Minutes")
+)
+_FLAG_KEYS = ("allDay", "isSchedule", "scheduleEnabled", "useSeason")
+_PRICE_KEYS = ("priceKW", "priceKWSummer")
+_ZONE_ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+MAX_NAME_LENGTH = 100
+MAX_EXTRA_KEYS = 32  # fields of the cloud's format we don't interpret but hand back unchanged
+
+
+def zone_id(value: Any) -> str:
+    """A zone's ``_id`` as text. Raises ValueError for anything that can't be one."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
+    if not isinstance(value, str) or not _ZONE_ID_RE.fullmatch(value):
+        raise ValueError("_id must be 1-64 letters, digits or _ . : -")
+    return value
+
+
+def _whole(key: str, value: Any, lo: int, hi: int) -> int:
+    """An integer in ``lo..hi``; None means 0. Integral floats and digit strings are accepted."""
+    if value is None:
+        return 0
+    number: int | None = None
+    if isinstance(value, bool):
+        pass
+    elif isinstance(value, int):
+        number = value
+    elif isinstance(value, float) and value.is_integer():
+        number = int(value)
+    elif isinstance(value, str) and value.strip().isascii() and value.strip().isdigit() and len(value.strip()) <= 4:
+        number = int(value.strip())
+    if number is None or not lo <= number <= hi:
+        raise ValueError(f"{key} must be a whole number from {lo} to {hi}")
+    return number
+
+
+def _amount(key: str, value: Any) -> float | int | None:
+    """A finite number (numeric text is accepted), or None. Raises ValueError otherwise."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be a number")
+    if isinstance(value, str):
+        if len(value) > 32:
+            raise ValueError(f"{key} must be a number")
+        try:
+            value = float(value)
+        except ValueError:
+            raise ValueError(f"{key} must be a number") from None
+    if not isinstance(value, (int, float)):
+        raise ValueError(f"{key} must be a number")
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:  # an integer too large for a float
+        finite = False
+    if not finite:
+        raise ValueError(f"{key} must be a finite number")
+    return int(value) if isinstance(value, float) and value.is_integer() and abs(value) < 1e15 else value
+
+
+def _passthrough(value: Any) -> bool:
+    """Is this small enough, and plain enough, to store as a field we don't interpret?"""
+    if value is None or isinstance(value, bool):
+        return True
+    if isinstance(value, str):
+        return len(value) <= 200
+    try:
+        return len(json.dumps(value, allow_nan=False)) <= 256
+    except (TypeError, ValueError, RecursionError, OverflowError):
+        return False
+
+
+def normalize_zone(raw: Any, *, max_connector: int = 8, max_current: int = 100) -> dict[str, Any]:
+    """Validate a zone from the API (or from an old state file). Raises ValueError with a readable message.
+
+    Only the keys present are returned, typed the way the evaluation below expects; ``_id`` is left to
+    the caller. Fields of the cloud's format that we don't interpret survive if they are small.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("price object required")
+    zone: dict[str, Any] = {}
+    extras = 0
+    for key, value in raw.items():
+        if key == "_id":
+            continue
+        if key == "name":
+            if value is None:
+                value = ""
+            if not isinstance(value, str):
+                raise ValueError("name must be text")
+            value = value.strip()
+            if len(value) > MAX_NAME_LENGTH:
+                raise ValueError(f"name can't be longer than {MAX_NAME_LENGTH} characters")
+        elif key in _FLAG_KEYS:
+            if value is not None and not isinstance(value, bool) and value not in (0, 1):
+                raise ValueError(f"{key} must be true or false")
+            value = bool(value)
+        elif key in _TIME_KEYS:
+            value = _whole(key, value, 0, 24 if "Hours" in key else 59)
+        elif key == "days":
+            if value is None:
+                value = []
+            if not isinstance(value, list) or len(value) > 64 or any(day is None for day in value):
+                raise ValueError("days must be a list of numbers, 0 (Sunday) to 6 (Saturday)")
+            value = sorted({_whole("days", day, 0, 6) for day in value})
+        elif key == "connectorId":
+            value = _whole(key, value, 0, max_connector)
+        elif key == "currentLimit":
+            value = _amount(key, value)
+            if value == 0:
+                value = None  # "no limit of its own"
+            if value is not None and not 1 <= value <= max_current:
+                raise ValueError(f"currentLimit must be between 1 and {max_current} A")
+        elif key in _PRICE_KEYS:
+            value = _amount(key, value)
+            if value is not None and value < 0:
+                raise ValueError(f"{key} can't be negative")
+        elif key == "holidays":
+            if value is not None and not (isinstance(value, str) and value in HOLIDAY_MODES):
+                raise ValueError(f"holidays must be one of {HOLIDAY_MODES}")
+        else:
+            if not isinstance(key, str) or len(key) > 40 or extras >= MAX_EXTRA_KEYS or not _passthrough(value):
+                continue
+            extras += 1
+        zone[key] = value
+    for suffix in ("", "2"):
+        for edge in ("start", "end"):
+            if zone.get(f"{edge}Hours{suffix}") == 24 and zone.get(f"{edge}Minutes{suffix}"):
+                raise ValueError("a time can't be later than 24:00")
+    return zone
+
+
+# --- evaluation -----------------------------------------------------------------------------
 
 
 def _ranges(zone: dict[str, Any]) -> list[tuple[int, int]]:
