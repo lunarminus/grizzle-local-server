@@ -240,12 +240,17 @@ async def test_rate_and_cost(server, charger):
     await api.login()
     await api.request("PUT", f"/client/stations/{SERIAL}/rate", {"priceKW": 0.25})
     assert (await api.station())["priceKW"] == 0.25
+    start = charger.energy[1]
     await charger.plug_in(1)
     await wait_for(lambda: charger.status[1] == "Charging")
-    await asyncio.sleep(2)
+    # Wait for readings rather than for a time: how many fit into two seconds depends on the machine.
+    await wait_for(lambda: charger.energy[1] >= start + 4)
     charge = (await api.station())["connectors"][0]["charge"]
     assert charge["priceKW"] == 0.25
-    assert charge["priceTotal"] == pytest.approx(charge["energy"] / 1000 * 0.25, rel=0.05)
+    assert charge["energy"] >= 3  # the fourth reading may still be on its way; none at all would prove nothing
+    # The API gives the total to 4 decimal places and the fake charger counts whole Wh, so the
+    # rounding alone can be worth more than 5 %: 3 Wh cost 0.00075 and are reported as 0.0008.
+    assert charge["priceTotal"] == pytest.approx(charge["energy"] / 1000 * 0.25, rel=0.05, abs=0.00005 + 1e-9)
 
 
 async def test_reboot_and_raw_call(server, charger):
