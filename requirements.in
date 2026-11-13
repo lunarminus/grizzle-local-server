@@ -1,0 +1,4 @@
+# Direct dependencies. requirements.txt is generated from this file:
+#   pip-compile --generate-hashes --strip-extras -o requirements.txt requirements.in
+aiohttp>=3.9,<4
+holidays>=0.60

@@ -14,11 +14,20 @@ services:
     environment:
       TZ: America/Denver                # schedules are evaluated in this timezone
       GRIZZLE_API_EMAIL: admin@local    # what Home Assistant logs in with
+      # CHANGE THIS. Whoever knows it controls the charger; the server warns at every start while
+      # it is a well-known default. Changing it later signs out every existing session.
       GRIZZLE_API_PASSWORD: change-me
       # GRIZZLE_OCPP_PASSWORD: ""       # set to require the charger's OCPP "Auth key"
+      # GRIZZLE_MAX_STATIONS: "16"      # how many chargers may register (unknown serials are added on first contact)
+      # GRIZZLE_FRAME_ANCESTORS: http://homeassistant.local:8123   # who may show the page in a frame (default: nobody else)
+      # GRIZZLE_ALLOWED_HOSTS: grizzle.example.com                 # a public DNS name you open the page under (reverse proxy)
       GRIZZLE_HEARTBEAT_INTERVAL: "300"
       GRIZZLE_METER_INTERVAL: "30"
       LOG_LEVEL: info                   # debug logs every OCPP frame
     volumes:
       - ./data:/data                    # state.json + history.sqlite
       - ./certs:/certs:ro               # run scripts/make-cert.sh ./certs first; TLS turns on when the files exist
+    # The container starts as root only to take over ./data (an older image wrote it as root) and
+    # then runs the server as an unprivileged user that can never regain privileges.
+    security_opt:
+      - no-new-privileges:true

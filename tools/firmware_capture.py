@@ -34,8 +34,10 @@ import getpass
 import hashlib
 import json
 import os
+import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,6 +58,10 @@ APP_HEADERS = {
 DEFAULT_TOKEN_FILE = Path(
     os.environ.get("GRIZZLE_TOKEN_FILE", Path.home() / ".config" / "grizzle_connect" / "tokens.json")
 )
+# The location in an UpdateFirmware comes from whoever is on the other end of the OCPP connection.
+# Fetch it only over the schemes firmware is really served on (never file://), and not without end.
+DOWNLOAD_SCHEMES = ("ftp", "http", "https")
+DEFAULT_MAX_DOWNLOAD = 64 * 1024 * 1024  # the Duo image is about 3.3 MB
 
 
 class CloudError(Exception):
@@ -130,7 +136,7 @@ class CloudClient:
         return data if isinstance(data, list) else []
 
     def firmware(self, station_id: str) -> Any:
-        return self.request("GET", f"/client/stations/{station_id}/firmware")
+        return self.request("GET", f"/client/stations/{urllib.parse.quote(str(station_id), safe='')}/firmware")
 
 
 def _parse(raw: bytes) -> Any:
@@ -156,8 +162,12 @@ def load_token_file(path: Path) -> tuple[str | None, str | None]:
 
 def save_token_file(path: Path, client: CloudClient) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"token": client.token, "refreshToken": client.refresh_token}))
-    path.chmod(0o600)
+    # Created owner-only from the start: writing first and chmod-ing after leaves a moment in
+    # which anyone on the machine can read the tokens.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(json.dumps({"token": client.token, "refreshToken": client.refresh_token}))
+    path.chmod(0o600)  # the mode above only applies to a new file
 
 
 def make_client(args: argparse.Namespace) -> CloudClient:
@@ -264,8 +274,25 @@ def load_identity(state_path: Path, serial: str | None) -> dict[str, Any]:
     return station
 
 
-def download_image(location: str, out_path: Path) -> dict[str, Any]:
+def image_filename(location: str) -> str:
+    """A safe file name for the image at ``location``: its last path segment, and only that.
+
+    The location is not ours to trust. Whatever it says, the result has no directory part and is
+    never ``.`` or ``..``, so the image can only land inside the output directory.
+    """
+    path = urllib.parse.urlsplit(str(location)).path
+    name = urllib.parse.unquote(path.rstrip("/").rsplit("/", 1)[-1])
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name.replace("\\", "/").rsplit("/", 1)[-1])[:128]
+    return name if name.strip("._") else "firmware.bin"
+
+
+def download_image(location: str, out_path: Path, max_bytes: int = DEFAULT_MAX_DOWNLOAD) -> dict[str, Any]:
     """Fetch the firmware image from an UpdateFirmware location (http/https/ftp) to disk."""
+    scheme = urllib.parse.urlsplit(str(location)).scheme.lower()
+    if scheme not in DOWNLOAD_SCHEMES:
+        raise CloudError(
+            f"refusing to download {location!r}: only {', '.join(DOWNLOAD_SCHEMES)} locations are fetched"
+        )
     try:
         out_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as err:
@@ -278,9 +305,17 @@ def download_image(location: str, out_path: Path) -> dict[str, Any]:
                 chunk = resp.read(65536)
                 if not chunk:
                     break
+                size += len(chunk)
+                if size > max_bytes:
+                    raise CloudError(
+                        f"download from {location} is larger than {max_bytes} bytes; stopped "
+                        "(raise --max-size if the image really is that big)"
+                    )
                 fh.write(chunk)
                 sha.update(chunk)
-                size += len(chunk)
+    except CloudError:
+        out_path.unlink(missing_ok=True)
+        raise
     except (urllib.error.URLError, OSError, ValueError) as err:
         raise CloudError(f"download from {location} failed: {err}") from err
     return {"path": str(out_path), "size": size, "sha256": sha.hexdigest()}
@@ -402,8 +437,10 @@ async def _capture(args: argparse.Namespace) -> int:
                     out_dir = state_path.resolve().parent / "firmware"
                 else:
                     out_dir = Path.cwd() / "captured-firmware"
-                name = args.name or location.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0] or "firmware.bin"
-                info = await asyncio.to_thread(download_image, location, out_dir / name)
+                # --name is the user's own choice (a file name, not a path); the location is not.
+                name = (Path(args.name).name if args.name else "") or image_filename(location)
+                max_size = getattr(args, "max_size", None) or DEFAULT_MAX_DOWNLOAD
+                info = await asyncio.to_thread(download_image, location, out_dir / name, max_size)
                 await client.call("FirmwareStatusNotification", {"status": "Downloaded"})
                 result.update(info)
                 sidecar = Path(info["path"]).with_name(Path(info["path"]).name + ".json")
@@ -543,6 +580,8 @@ def build_parser() -> argparse.ArgumentParser:
     cap.add_argument("--timeout", type=float, default=180.0, help="seconds to wait for UpdateFirmware")
     cap.add_argument("--out", help="directory to save the image in (default <state dir>/firmware)")
     cap.add_argument("--name", help="filename to save the image as (default from the location URL)")
+    cap.add_argument("--max-size", type=int, default=DEFAULT_MAX_DOWNLOAD, metavar="BYTES",
+                     help="give up on a download larger than this (default 64 MiB)")
     cap.add_argument("--no-trigger", action="store_true",
                      help="do not POST the update trigger; just wait (e.g. trigger it from the app yourself)")
     cap.add_argument("--no-download", action="store_true", help="capture the location only; do not download")
