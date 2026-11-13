@@ -1,0 +1,22 @@
+# Everything is pinned (Python packages with hashes, actions by commit, see ci.yml), so something
+# has to propose the updates: security fixes in a pinned dependency don't arrive by themselves.
+version: 2
+updates:
+  - package-ecosystem: pip # requirements.in / requirements-dev.in and their compiled lock files
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      python:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: docker # the base image in the Dockerfile
+    directory: /
+    schedule:
+      interval: weekly

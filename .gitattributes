@@ -1,0 +1,5 @@
+# Scripts that run inside the Linux image must keep LF line endings whatever the checkout's
+# platform does: with CRLF the entrypoint's first line names an interpreter that does not exist.
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.py        text eol=lf

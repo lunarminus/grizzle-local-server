@@ -75,8 +75,13 @@ def _request(url: str, *, method: str, body: bytes | None, timeout: float,
         if insecure:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
+    # A redirect (to a login page, say) must not be followed and then read as "200, processed".
+    handlers: list = [_NoRedirect]
+    if ctx is not None:
+        handlers.append(urllib.request.HTTPSHandler(context=ctx))
+    opener = urllib.request.build_opener(*handlers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             data = resp.read(600)
             return resp.status, dict(resp.headers), data.decode("latin1", "replace"), None
     except urllib.error.HTTPError as e:
@@ -89,6 +94,11 @@ def _request(url: str, *, method: str, body: bytes | None, timeout: float,
         return e.code, dict(e.headers or {}), data.decode("latin1", "replace"), None
     except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as e:
         return None, {}, "", str(e)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):  # noqa: ANN002, ANN003 - urllib's signature
+        return None  # urllib then raises HTTPError for the 3xx, which _request reports as that status
 
 
 def _snippet(text: str, n: int = 120) -> str:
@@ -135,6 +145,7 @@ def main() -> int:
     # --- 2. N1 probe: control endpoints must NOT require auth on a vulnerable unit ---
     print("\n[2] N1 probe — control endpoints (no credentials sent):")
     unauth_hits = []
+    inconclusive = []
     for path, body in CONTROL:
         data = body.encode() if body is not None else b""
         status, headers, rbody, err = _request(base + path, method="POST", body=data,
@@ -144,9 +155,14 @@ def main() -> int:
             continue
         if status == 401:
             print(f"    {path:14} {GREEN}401 — auth required (NOT vulnerable here){RST}")
-        else:
+        elif status is not None and 200 <= status < 300:
             unauth_hits.append(path)
             print(f"    {path:14} {RED}HTTP {status} — processed WITHOUT auth{RST} {DIM}{_snippet(rbody)}{RST}")
+        else:
+            # 403, 404, 405, 5xx...: refused or absent is not "processed". Proves nothing either way.
+            inconclusive.append(path)
+            print(f"    {path:14} {YEL}HTTP {status} — inconclusive (not a 2xx, not a 401){RST} "
+                  f"{DIM}{_snippet(rbody)}{RST}")
 
     # --- 3. Optional: prove the handler executes field logic (rejected over-length write) ---
     if args.prove_write:
@@ -176,6 +192,10 @@ def main() -> int:
             print(f"{YEL}note: the protected pages did not return 401 either — verify the host/port "
                   f"and that this is the charger's web UI.{RST}")
         return 2
+    if inconclusive:
+        print(f"{YEL}N1 inconclusive{RST}: {', '.join(inconclusive)} answered neither 2xx nor 401 "
+              f"(wrong host/port, a different device, or a firmware that changed these paths).")
+        return 3
     print(f"{GREEN}N1 not reproduced{RST}: no control endpoint processed an unauthenticated request "
           f"(firmware may be patched, or host/port wrong).")
     return 0

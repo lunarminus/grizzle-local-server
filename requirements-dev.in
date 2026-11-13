@@ -1,0 +1,8 @@
+# Development and CI. requirements-dev.txt is generated from this file:
+#   pip-compile --generate-hashes --strip-extras --allow-unsafe -o requirements-dev.txt requirements-dev.in
+-r requirements.in
+# Keep the packages shared with the image on exactly the versions the image uses.
+-c requirements.txt
+pytest
+pytest-asyncio
+ruff

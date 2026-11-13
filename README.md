@@ -34,6 +34,8 @@ Nothing leaves your LAN: the charger talks to this container, and the
   integration only needs a different server URL. Plus a few `/local/...` extras:
   raw OCPP calls, the frame log, meter history.
 - Single process, single port, two dependencies (aiohttp, holidays), state survives restarts.
+- **Built for a network you don't fully trust.** Everything a charger or an API client sends is
+  validated and bounded; see [Security](#security) for what is and isn't protected.
 
 > Reverse engineered from the Grizzl-E Connect app and community OCPP work. Not
 > affiliated with United Chargers. MIT licensed. Confirmed connecting and controlling a real Grizzl-E
@@ -71,14 +73,27 @@ curl http://localhost:9000/health
 To build from source instead of pulling, swap `image:` for `build: .` in the compose file
 and run `docker compose up -d --build`.
 
+The container starts as root only to take over the data volume (older images wrote it as root),
+then runs the server as the unprivileged user `grizzle` (uid 10001). Files in `./data` are owned by
+that uid and readable only by it: `state.json` holds the API sessions and the charger's cloud Auth
+key. If the volume can't be handed over (a read-only or root-squashed mount) the server says so in
+the log and stays root rather than fail to start; `GRIZZLE_RUN_AS=root` keeps root on purpose.
+`user: "10001:10001"` in the compose file works too, and is what to use together with
+`cap_drop: [ALL]` (to switch user by itself the container needs the SETUID, SETGID and CHOWN
+capabilities, which Docker grants by default).
+
 Environment variables (all optional):
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `TZ` / `GRIZZLE_TIMEZONE` | `UTC` | Timezone schedules are evaluated in (new stations inherit it) |
 | `GRIZZLE_PORT` | `9000` | WebSocket + REST port |
-| `GRIZZLE_API_EMAIL`, `GRIZZLE_API_PASSWORD` | `admin@local`, `grizzle` | Login for the REST API (what Home Assistant uses). **Change the password.** |
+| `GRIZZLE_API_EMAIL`, `GRIZZLE_API_PASSWORD` | `admin@local`, `grizzle` | Login for the REST API (what Home Assistant uses). **Change the password**: the server warns at every start while it is a well-known default. Changing either signs out all existing sessions. An empty password lets nobody in |
 | `GRIZZLE_OCPP_PASSWORD` | unset | If set, the charger's HTTP Basic password ("Auth key") must match; this is the strongest option. Without it, each station is pinned to the first Auth key it presents (see below) |
+| `GRIZZLE_MAX_STATIONS` | `16` | How many stations may exist. A serial nobody has seen is added on its first connection, so the number is bounded; further unknown serials are refused (HTTP 503) until you delete a station or raise this |
+| `GRIZZLE_FRAME_ANCESTORS` | `'self'` | Who may show the web page in a frame (CSP `frame-ancestors`). To embed it in Home Assistant, name Home Assistant's origin, e.g. `http://homeassistant.local:8123` |
+| `GRIZZLE_ALLOWED_HOSTS` | unset | Extra host names under which browsers may use the page and API. IP addresses, names without a dot (`nas`) and names with a LAN-only ending (`.local`, `.lan`, `.home`, `.home.arpa`, `.internal`, `.intranet`, `.corp`, `.localdomain`, `.test`) always work. Any other name with a dot has to be listed, including router and VPN names such as `nas.fritz.box` or `nas.tailnet.ts.net`, and a reverse proxy's public name: to a server they look the same as a hostile site's (comma separated; `.example.com` allows every name under it; `*` allows all). The refusal names the exact value to set |
+| `GRIZZLE_TRUSTED_PROXIES` | unset | Addresses or networks of reverse proxies in front of the server (`172.18.0.2`, `10.0.0.0/8`). Only from these is `X-Forwarded-For` believed, so the sign-in limit counts the real client instead of locking everyone behind the proxy out together |
 | `GRIZZLE_HEARTBEAT_INTERVAL` | `300` | Seconds, pushed to the charger at boot |
 | `GRIZZLE_METER_INTERVAL` | `30` | Seconds between MeterValues while charging |
 | `GRIZZLE_ID_TAG` | `uc_default_auth` | idTag used for RemoteStartTransaction |
@@ -161,6 +176,9 @@ the HTTP Basic user), which must match `[A-Za-z0-9][A-Za-z0-9._:-]{0,63}`.
   (a 5 s probe). Set `GRIZZLE_OCPP_PASSWORD` if your charger sends no key.
 - WebSocket handshakes carrying an `Origin` header (that is, from a browser) are refused; the
   charger's firmware doesn't send one.
+- A serial the server has never seen becomes a new station, and there may be at most
+  `GRIZZLE_MAX_STATIONS` (16) of those. If something on your network fills the list with invented
+  serials, delete them (`DELETE /local/stations/{serial}`) and set `GRIZZLE_OCPP_PASSWORD`.
 
 You can test the whole chain without the real charger: `tools/fake_charger.py` accepts
 `wss://…` URLs with `--insecure`. The plain `ws://` listener on port 9000 also accepts
@@ -178,7 +196,11 @@ Browse to `http://<server-ip>:9000/` and sign in with `GRIZZLE_API_EMAIL` /
 - **Charging schedules**: windows in which a connector set to *Scheduled* may charge, with
   days, an optional connector and an optional current limit for that window. Days are
   calendar days: "weekdays 20:00-06:00" covers 00:00-06:00 and 20:00-24:00 of each weekday,
-  so it includes Monday's small hours and stops at midnight on Friday.
+  so it includes Monday's small hours and stops at midnight on Friday. A window's current
+  limit applies to the whole charger for as long as the window is in force, whatever mode the
+  connectors are in (the charger takes one limit, not one per connector): with several windows
+  in force the lowest of their limits applies, and when the last one ends the charger goes
+  back to its own limit, or to its full current if it has none.
 - **Electricity rates**: a base price plus time-of-use zones, typed in cents per kWh.
   Session cost is computed from whichever price applies as energy is delivered.
 - **Statutory holidays**: pick a country and region to load its holidays, untick the ones
@@ -196,9 +218,15 @@ Browse to `http://<server-ip>:9000/` and sign in with `GRIZZLE_API_EMAIL` /
 
 The page is a single self-contained file (no external scripts or fonts), follows the
 browser's light or dark theme and works on a phone. To show it inside Home Assistant, add
-a *Webpage* card pointing at the same address; that only works when Home Assistant itself
-is opened over plain `http://`, because browsers won't embed an `http://` page in an
+a *Webpage* card pointing at the same address and tell the server who may frame it:
+`GRIZZLE_FRAME_ANCESTORS=http://homeassistant.local:8123` (the address you open Home Assistant
+under; by default no other site may show the page in a frame). It only works when Home Assistant
+itself is opened over plain `http://`, because browsers won't embed an `http://` page in an
 `https://` one.
+
+The same page and API are also served over TLS on the `wss://` port (`https://<server-ip>/` with the
+compose file's `443:8443` mapping; self-signed, so the browser asks once). Use that address if you
+don't want the password and session token to cross the network in the clear.
 
 ## 4. Connect Home Assistant
 
@@ -211,7 +239,14 @@ switch.
 
 ## REST API
 
-Same paths and bodies as the cloud, Bearer-token auth:
+Same paths and bodies as the cloud, Bearer-token auth (`Authorization: Bearer <token>`; a token
+in the query string is not accepted). A token works for 7 days and its refresh token for 30;
+`POST /client/auth/logout` ends the session (named by its token, or by `{"refreshToken"}`; it
+needs no valid token, so a session can still be ended after its token has expired). Ten failed
+sign-ins from one address (one /64 for IPv6) within five minutes get `429` with `Retry-After`; a
+flood of failures from many addresses closes sign-in for a while to every address that has never
+signed in successfully. Input that doesn't make sense is answered with `400` and a `message`,
+and changes nothing.
 
 | Method & path | Body |
 |---|---|
@@ -240,23 +275,81 @@ Local extras (same auth):
 | `POST /local/stations/{serial}/holidays/preview` | the same response for settings you haven't saved |
 | `GET /local/holidays/countries` | supported countries and subdivisions |
 | `GET /local/stations/{serial}/log` | the last 200 OCPP frames in either direction |
-| `GET /local/stations/{serial}/samples?since=ISO&connector=1` | meter history (kept 90 days) |
-| `PUT /local/stations/{serial}/settings` | `{"displayName", "timezone", "connectorCount", "maxCurrent", "minCurrent", "dipSwitchCurrentLimit"}` |
-| `DELETE /local/stations/{serial}` | forget a station (only while it's disconnected) |
+| `GET /local/stations/{serial}/samples?since=ISO&connector=1` | meter history (kept 90 days, and at most a million readings per station) |
+| `PUT /local/stations/{serial}/settings` | `{"displayName", "timezone", "currency", "connectorCount", "maxCurrent", "minCurrent", "dipSwitchCurrentLimit"}`; checked as a whole, applied only if all of it is valid |
+| `DELETE /local/stations/{serial}` | forget a station (only while it's disconnected), together with its recorded sessions and samples |
 | `DELETE /local/stations/{serial}/auth-key` | forget the Auth key the station is pinned to and drop its connection; the charger's reconnect pins its key again |
-| `GET /health` | no auth |
+| `GET /health` | no auth: `{"status", "version", "time", "stationCount", "stationsOnline"}`. With a token it also lists `stations` (serial → online); serials are not shown to strangers |
 
 Prices in the API are per kWh in the main currency unit (`0.0923`), as in the cloud; only the web
 page shows cents. Schedules and rate zones (the `price` object) accept one field the cloud doesn't have:
 `"holidays": "same" | "skip" | "also" | "only"`. Stations also report `holidaysSettings`,
 the upcoming `holidays` and `holidayToday`.
 
+## Security
+
+What the server assumes and what it does about it:
+
+- **The REST API and web page are protected by one password.** Sign-in attempts are throttled per
+  client address, sessions end on sign-out and when the email or password changes, and a browser
+  page opened under a name that could be a public one is refused (that is what both a hostile site
+  posting to your server and a DNS-rebinding attack look like; see `GRIZZLE_ALLOWED_HOSTS`). The
+  check is on the `Origin` header, which browsers send with every request that changes anything;
+  Home Assistant and other non-browser clients are not affected. Whoever is signed in controls
+  the charger completely, including raw OCPP calls, so choose a real password. Plain `http://` on
+  port 9000 does not hide it from someone who can sniff your LAN; the TLS port does.
+- **Chargers are untrusted.** Unless `GRIZZLE_OCPP_PASSWORD` is set, anything that can reach the
+  port can connect as a charger with a serial the server has never seen. So every OCPP message is
+  type-checked and bounded (connector ids 1-8, 256 KiB frames, at most ~10 frames a second after
+  a burst), a misbehaving station can't stall or corrupt the others, and the number of stations is
+  capped. It can still fill *its own* station with nonsense; delete it and set the password.
+- **A charger's identity is its serial plus its Auth key.** The first key a serial presents is
+  pinned. A charger that sends no key can't be authenticated at all (see section 2); `/health`
+  therefore doesn't list serials to callers who aren't signed in.
+- **The DNS-override setup works only because the charger does not verify TLS certificates**
+  (`firmware/SECURITY-FINDINGS.md`, N3). That is a weakness of the charger which this project relies
+  on: anything else on the charger's network that can answer its DNS or sit in its path can
+  impersonate the cloud the same way. Keep the charger on a network you control.
+- **`/data` is sensitive.** `state.json` holds live API sessions and the charger's cloud Auth key;
+  it and `history.sqlite` are created owner-only (mode 600).
+- **Logs** escape control characters in everything that came off the network, so a serial or OCPP
+  field can't forge a log line.
+
+### Upgrading from 0.6.0
+
+Nothing needs to be migrated by hand, but a few things behave differently on purpose:
+
+- **Container user.** The data volume is handed over to uid 10001 on first start and its files
+  become owner-only. Reading `data/state.json` from the host (for `tools/firmware_capture.py`, say)
+  now needs that user or `sudo`.
+- **Saved state is repaired on load.** Values the old version stored as it received them (an
+  impossible connector count, a schedule with something other than a time in it) are mended or
+  dropped, with a warning in the log saying what and why. Recorded sessions, schedules, rates and
+  pinned Auth keys are kept.
+- **Framing.** Other sites can no longer show the web page in a frame. For a Home Assistant
+  *Webpage* card set `GRIZZLE_FRAME_ANCESTORS` to Home Assistant's address.
+- **Host names.** Opening the page by IP address, by a name without a dot or by a name ending in
+  `.local`, `.lan` and the like needs nothing. Under any other name (`nas.fritz.box`, a Tailscale
+  name, a reverse proxy's public name) the page loads but signing in answers 403 until the name
+  is in `GRIZZLE_ALLOWED_HOSTS`; the message and the log say exactly what to set. Behind a reverse
+  proxy also set `GRIZZLE_TRUSTED_PROXIES`.
+- **Everyone signs in again, once.** Sessions saved by 0.6.0 are ended on the first start (nothing
+  recorded which password they belonged to). Home Assistant signs in again by itself.
+- **API details.** `/health` lists serials only for a signed-in caller; `?token=` in the URL no
+  longer authenticates; a refresh token expires after 30 days; changing the password signs
+  everyone out; requests that used to be accepted and then misbehave (a connector that doesn't
+  exist, a schedule with `"days": [7]`, a price of `NaN`) now get a `400`. Deleting a station
+  deletes its history too.
+- **Stations.** At most 16 can exist unless `GRIZZLE_MAX_STATIONS` says otherwise.
+- **Host networking.** With `network_mode: host` and a port below 1024 the server keeps the one
+  capability it needs to bind it; nothing to change.
+
 ## Development
 
 ```bash
-python -m venv .venv && . .venv/bin/activate
-pip install -r requirements-dev.txt
-pytest                                      # schedules, TLS, end-to-end with the fake charger
+python3.13 -m venv .venv && . .venv/bin/activate
+pip install -r requirements-dev.txt         # everything pinned with hashes; see requirements*.in
+pytest                                      # schedules, TLS, end-to-end with the fake charger, hardening
 GRIZZLE_DATA_DIR=./data GRIZZLE_PORT=9000 python -m grizzle_local
 python tools/fake_charger.py ws://localhost:9000/ocpp1.6/GRD-FAKE0001 --plug-in 5
 ```
@@ -275,7 +368,16 @@ grizzle_local/
 └── main.py        # aiohttp app: WebSocket upgrade on any path, REST
 tools/fake_charger.py   # simulated Grizzl-E, also used by the tests
 scripts/make-cert.sh    # self-signed certificate for ocpp.unitedchargers.com
+scripts/container-smoke-test.sh   # builds nothing; starts an image and checks it end to end (CI runs it)
+docker-entrypoint.sh    # hands the volumes to the unprivileged user, then drops root
 ```
+
+Dependencies are locked: `requirements.in` lists what the server needs, `requirements.txt` is
+compiled from it with every package pinned and hashed (`pip-compile --generate-hashes`), and the
+image installs with `--require-hashes`. To update, edit the `.in` file (or let Dependabot propose
+it) and recompile both lock files with the commands at the top of each `.in`. The lock files are
+for Python 3.13, the version the image and CI use; the code runs on 3.11 and later, and on another
+version install from the `.in` files instead (`pip install -r requirements.in pytest pytest-asyncio ruff`).
 
 ## Status
 

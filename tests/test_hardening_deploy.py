@@ -1,0 +1,900 @@
+"""Deployment-side behaviour: shutting down, the TLS front end, the container entrypoint, the firmware tool."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import grp
+import json
+import logging
+import os
+import pwd
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import aiohttp
+import pytest
+from aiohttp.test_utils import TestClient, TestServer
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+import firmware_capture as fc  # noqa: E402
+from fake_charger import FakeCharger  # noqa: E402
+
+from grizzle_local.config import Settings
+from grizzle_local.main import serve
+from grizzle_local.tls import PEERS_KEY, client_ip, start_tls_frontend, upstream_host
+
+from .support import EMAIL, PASSWORD, RawCharger, make_app, wait_for
+
+ROOT = Path(__file__).resolve().parents[1]
+ENTRYPOINT = ROOT / "docker-entrypoint.sh"
+SERIAL = "GRD-L0000HARD3"
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@pytest.fixture(scope="module")
+def certs(tmp_path_factory):
+    out = tmp_path_factory.mktemp("certs")
+    subprocess.run([str(ROOT / "scripts/make-cert.sh"), str(out)], check=True, capture_output=True)
+    return out / "fullchain.pem", out / "privkey.pem"
+
+
+# --- shutting down ------------------------------------------------------------------------------
+
+
+async def test_sigterm_with_chargers_connected_saves_and_exits_promptly(tmp_path, certs):
+    """`docker stop` with a charger connected (that is: always). aiohttp waits for open connections
+    before it runs cleanup handlers, and closing the chargers' sockets used to be a cleanup handler:
+    the server sat out the timeout, Docker killed it, and the final save never ran."""
+    settings = Settings(
+        data_dir=tmp_path / "data", host="127.0.0.1", port=free_port(), tls_port=free_port(),
+        tls_cert=str(certs[0]), tls_key=str(certs[1]), api_email=EMAIL, api_password=PASSWORD, tick_seconds=3600,
+    )
+    server = asyncio.create_task(serve(settings))
+    async with aiohttp.ClientSession() as session:
+        plain = FakeCharger(f"ws://127.0.0.1:{settings.port}/ocpp1.6/GRD-PLAIN001", "GRD-PLAIN001", connectors=2)
+        secure = FakeCharger(
+            f"wss://127.0.0.1:{settings.tls_port}/ocpp1.6/GRD-TLS00001", "GRD-TLS00001", connectors=2, insecure=True
+        )
+        runners = []
+        for charger in (plain, secure):
+            await wait_for_listener(charger, session)
+            runners.append(asyncio.create_task(charger.run()))
+            await asyncio.wait_for(charger.booted.wait(), 10)
+
+        # Something only the shutdown save can have written: the tick is an hour away.
+        resp = await session.post(
+            f"http://127.0.0.1:{settings.port}/client/auth/login", json={"emailOrPhone": EMAIL, "password": PASSWORD}
+        )
+        token = (await resp.json())["token"]
+
+        started = time.monotonic()
+        assert not server.done()  # it is up (the chargers are connected), so its handler takes the signal, not pytest
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(server, 8)  # Docker waits ten seconds, then kills
+        assert time.monotonic() - started < 6
+        for runner in runners:
+            runner.cancel()
+
+    state = json.loads((tmp_path / "data" / "state.json").read_text())
+    assert token in state["tokens"]
+    assert {"GRD-PLAIN001", "GRD-TLS00001"} <= set(state["stations"])
+    assert state["stations"]["GRD-PLAIN001"]["boot"]["chargePointModel"] == "GRD 40A 2025"
+
+
+async def wait_for_listener(charger: FakeCharger, session: aiohttp.ClientSession) -> None:
+    for _ in range(100):
+        try:
+            await charger.connect(session)
+            return
+        except aiohttp.ClientConnectorError:
+            await asyncio.sleep(0.05)
+    raise AssertionError("the server never started listening")
+
+
+async def test_stop_saves_before_it_waits_for_sockets_to_close(tmp_path):
+    """A peer that never acknowledges the close must not stand between us and the save."""
+    async with TestServer(make_app(tmp_path)) as ts, TestClient(ts) as client:
+        controller = client.app["controller"]
+        saved_while_closing = []
+
+        class SlowToClose:
+            id = "GRD-SLOW0001"
+
+            class ws:
+                closed = False
+
+            async def close(self):
+                state = json.loads(controller.store._state_path.read_text())
+                saved_while_closing.append("GRD-SLOW0001" in state["stations"])
+                await asyncio.sleep(3600)
+
+        controller._ensure_station("GRD-SLOW0001")
+        controller.connections["GRD-SLOW0001"] = SlowToClose()
+        controller.CLOSE_TIMEOUT = 0.3
+        started = time.monotonic()
+        await controller.stop()
+        assert time.monotonic() - started < 2
+        assert saved_while_closing == [True]
+        del controller.connections["GRD-SLOW0001"]
+
+
+# --- the TLS front end and who the client really is ---------------------------------------------------
+
+
+async def test_tls_frontend_reports_the_real_peer(tmp_path, certs):
+    async with TestServer(make_app(tmp_path)) as server, TestClient(server) as client:
+        peers = client.app[PEERS_KEY]
+        tls_port = free_port()
+        frontend = await start_tls_frontend("127.0.0.1", tls_port, str(certs[0]), str(certs[1]), server.port, peers)
+        try:
+            # The client connects from 127.0.0.3; the front end reaches the plain listener from 127.0.0.1.
+            connector = aiohttp.TCPConnector(local_addr=("127.0.0.3", 0))
+            async with aiohttp.ClientSession(connector=connector) as session:
+                url = f"wss://127.0.0.1:{tls_port}/ocpp1.6/{SERIAL}"
+                ws = await session.ws_connect(url, protocols=("ocpp1.6",), ssl=False)
+                controller = client.app["controller"]
+                await wait_for(lambda: controller.is_online(SERIAL))
+                assert list(peers.values()) == ["127.0.0.3"]  # noted while the connection lives...
+                assert controller.station(SERIAL)["ocppHandshake"]["remote"] == "127.0.0.3"
+                await ws.close()
+                # A charger that sends no id at all is named after its own address, not the front end's.
+                ws = await session.ws_connect(f"wss://127.0.0.1:{tls_port}/ocpp1.6", protocols=("ocpp1.6",), ssl=False)
+                await wait_for(lambda: "unknown-127.0.0.3" in controller.stations)
+                assert "unknown-127.0.0.1" not in controller.stations
+                await ws.close()
+            await wait_for(lambda: not peers)  # ...and forgotten when it ends
+        finally:
+            frontend.close()
+            await asyncio.wait_for(frontend.wait_closed(), 5)
+
+
+def test_client_ip_sees_through_the_frontend_only():
+    class Transport:
+        def __init__(self, peername):
+            self.peername = peername
+
+        def get_extra_info(self, name):
+            return self.peername if name == "peername" else None
+
+    class Request:
+        def __init__(self, remote, peername, peers):
+            self.remote, self.transport, self.app = remote, Transport(peername), {PEERS_KEY: peers}
+
+    peers = {("127.0.0.1", 40001): "192.168.1.77", ("::1", 40003): "fd00::77"}
+    assert client_ip(Request("127.0.0.1", ("127.0.0.1", 40001), peers)) == "192.168.1.77"  # came through the frontend
+    assert client_ip(Request("::1", ("::1", 40003, 0, 0), peers)) == "fd00::77"  # IPv6 peer names have four parts
+    assert client_ip(Request("127.0.0.1", ("127.0.0.1", 40002), peers)) == "127.0.0.1"  # a local process, directly
+    # The key is one of our own sockets, address and port: a remote client can't borrow an entry by its port.
+    assert client_ip(Request("10.0.0.5", ("10.0.0.5", 40001), peers)) == "10.0.0.5"
+    assert client_ip(Request(None, None, {})) == "?"
+    request = Request("10.0.0.5", ("10.0.0.5", 1), peers)
+    request.transport = None
+    assert client_ip(request) == "10.0.0.5"
+
+
+async def test_sign_in_throttle_counts_the_real_client_not_the_frontend(tmp_path, certs):
+    """Through TLS every request arrives from loopback. Throttling "127.0.0.1" would let one client
+    lock everyone else out (and make the placeholder charger id the same for every charger)."""
+    async with TestServer(make_app(tmp_path)) as server, TestClient(server) as client:
+        peers = client.app[PEERS_KEY]
+        tls_port = free_port()
+        frontend = await start_tls_frontend("127.0.0.1", tls_port, str(certs[0]), str(certs[1]), server.port, peers)
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"https://127.0.0.1:{tls_port}/client/auth/login"
+                resp = await session.post(url, json={"emailOrPhone": EMAIL, "password": "wrong"}, ssl=False)
+                assert resp.status == 401
+                socket_name = next(iter(peers))
+                peers[socket_name] = "192.168.1.77"  # as if this TLS client were another machine on the LAN
+                for _ in range(20):
+                    resp = await session.post(url, json={"emailOrPhone": EMAIL, "password": "wrong"}, ssl=False)
+                assert resp.status == 429
+            throttle = client.app["auth"].throttle
+            assert throttle.retry_after("192.168.1.77") > 0
+            # The same address without the frontend (a different client, as far as we can tell) is unaffected.
+            resp = await client.post("/client/auth/login", json={"emailOrPhone": EMAIL, "password": PASSWORD})
+            assert resp.status == 200
+        finally:
+            frontend.close()
+            await asyncio.wait_for(frontend.wait_closed(), 5)
+
+
+async def test_placeholder_charger_id_uses_the_real_address(tmp_path):
+    async with TestServer(make_app(tmp_path)) as ts, TestClient(ts) as client, aiohttp.ClientSession() as session:
+        cp = await RawCharger.connect(client, session, "ignored", path="/ocpp1.6")  # no serial anywhere
+        try:
+            await wait_for(lambda: client.app["controller"].stations)
+            assert list(client.app["controller"].stations) == ["unknown-127.0.0.1"]
+        finally:
+            await cp.close()
+
+
+# --- the container entrypoint -------------------------------------------------------------------------
+
+
+def _unprivileged_user() -> str | None:
+    """A non-root account whose name is also a group (what `useradd --user-group` makes in the image)."""
+    for entry in pwd.getpwall():
+        if entry.pw_uid == 0:
+            continue
+        try:
+            grp.getgrnam(entry.pw_name)
+        except KeyError:
+            continue
+        return entry.pw_name
+    return None
+
+
+RUN_AS = _unprivileged_user()
+needs_root = pytest.mark.skipif(
+    os.geteuid() != 0 or shutil.which("setpriv") is None or RUN_AS is None,
+    reason="needs root, setpriv and an unprivileged account to drop to (as inside the container)",
+)
+REPORT = (
+    'echo "uid=$(id -u) home_writable=$([ -w "$HOME" ] && echo yes || echo no) cert=${GRIZZLE_TLS_CERT:-}'
+    ' key_readable=$([ -r "${GRIZZLE_TLS_KEY:-/nonexistent}" ] && echo yes || echo no)'
+    ' data_writable=$([ -w "$GRIZZLE_DATA_DIR" ] && echo yes || echo no)'
+    ' nnp=$(awk "/^NoNewPrivs:/{print \\$2}" /proc/self/status) caps=$(awk "/^CapEff:/{print \\$2}" /proc/self/status)"'
+)
+
+
+def _entrypoint(tmp_path, *command, **env) -> subprocess.CompletedProcess:
+    base = {"PATH": os.environ["PATH"], "GRIZZLE_RUN_AS": RUN_AS or "", "GRIZZLE_DATA_DIR": str(tmp_path / "data"),
+            "GRIZZLE_TLS_CERT": str(tmp_path / "certs" / "fullchain.pem"),
+            "GRIZZLE_TLS_KEY": str(tmp_path / "certs" / "privkey.pem"),
+            "GRIZZLE_CERT_COPY_DIR": str(tmp_path / "cert-copy")}
+    base.update(env)
+    command = command or ("sh", "-c", REPORT)
+    script = tmp_path / "docker-entrypoint.sh"
+    return subprocess.run(["sh", str(script), *command], env=base, capture_output=True, text=True, timeout=30)
+
+
+@pytest.fixture
+def volumes():
+    """Root-owned volumes as an earlier image (which ran as root) left them.
+
+    In a directory of their own that the unprivileged account can reach (pytest's temporary
+    directories are private to root, and so may the checkout be), with a copy of the script.
+    """
+    tmp_path = Path(tempfile.mkdtemp(prefix="grizzle-entrypoint-"))
+    tmp_path.chmod(0o755)
+    try:
+        shutil.copy(ENTRYPOINT, tmp_path / "docker-entrypoint.sh")
+        (tmp_path / "docker-entrypoint.sh").chmod(0o755)
+        yield _fill_volumes(tmp_path)
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
+def _fill_volumes(tmp_path: Path) -> Path:
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "state.json").write_text("{}")
+    (tmp_path / "data" / "state.json").chmod(0o600)
+    (tmp_path / "certs").mkdir()
+    (tmp_path / "certs" / "fullchain.pem").write_text("CERT")
+    (tmp_path / "certs" / "privkey.pem").write_text("KEY")
+    (tmp_path / "certs" / "privkey.pem").chmod(0o600)
+    return tmp_path
+
+
+@needs_root
+def test_entrypoint_drops_privileges_and_hands_over_the_volumes(volumes):
+    result = _entrypoint(volumes)
+    assert result.returncode == 0, result.stderr
+    uid = pwd.getpwnam(RUN_AS).pw_uid
+    fields = dict(part.split("=", 1) for part in result.stdout.split())
+    assert fields["uid"] == str(uid) and fields["caps"] == "0000000000000000" and fields["nnp"] == "1"
+    assert fields["data_writable"] == "yes" and fields["key_readable"] == "yes"
+    assert fields["home_writable"] == "yes"  # HOME no longer says /root, which that user cannot enter
+    assert (volumes / "data" / "state.json").stat().st_uid == uid
+    # The key in the (read-only) certs volume is untouched; the server got a private copy.
+    assert (volumes / "certs" / "privkey.pem").stat().st_uid == 0
+    copy = volumes / "cert-copy" / "grizzle-certs" / "privkey.pem"
+    assert fields["cert"] == str(volumes / "cert-copy" / "grizzle-certs" / "fullchain.pem")
+    assert copy.read_text() == "KEY" and copy.stat().st_uid == uid and stat.S_IMODE(copy.stat().st_mode) == 0o600
+    assert stat.S_IMODE(copy.parent.stat().st_mode) == 0o700
+    assert result.stderr == ""
+
+
+@needs_root
+def test_entrypoint_passes_arguments_through_unchanged(volumes):
+    result = _entrypoint(volumes, "sh", "-c", 'printf "[%s]" "$@"', "sh", "a b", "c  d", "")
+    assert result.returncode == 0 and result.stdout == "[a b][c  d][]"
+
+
+@needs_root
+@pytest.mark.parametrize(
+    "env,reason",
+    [
+        ({"GRIZZLE_RUN_AS": "no-such-user"}, "cannot switch to user"),
+        ({"GRIZZLE_DATA_DIR": "/proc/sys/kernel"}, "is not writable"),
+        ({"GRIZZLE_CERT_COPY_DIR": "/proc/nope/certs"}, "TLS key is not readable"),
+    ],
+)
+def test_entrypoint_stays_root_rather_than_break_an_installation(volumes, env, reason):
+    result = _entrypoint(volumes, **env)
+    assert result.returncode == 0, result.stderr
+    assert "uid=0 " in result.stdout
+    assert reason in result.stderr and "running as root" in result.stderr
+
+
+@needs_root
+def test_entrypoint_does_nothing_when_told_to_stay_root_or_already_unprivileged(volumes):
+    result = _entrypoint(volumes, GRIZZLE_RUN_AS="root")
+    assert result.returncode == 0 and "uid=0 " in result.stdout and result.stderr == ""
+    assert (volumes / "data" / "state.json").stat().st_uid == 0  # nothing was handed over
+
+    uid = pwd.getpwnam(RUN_AS).pw_uid
+    base = {"PATH": os.environ["PATH"], "GRIZZLE_DATA_DIR": str(volumes / "data"), "HOME": "/root"}
+    as_user = ["setpriv", f"--reuid={RUN_AS}", f"--regid={RUN_AS}", "--init-groups"]
+    script = str(volumes / "docker-entrypoint.sh")
+    result = subprocess.run(  # `user:` in compose: the container never is root
+        [*as_user, "sh", script, "sh", "-c", REPORT], env=base, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0 and f"uid={uid} " in result.stdout and result.stderr == ""
+
+
+def test_entrypoint_and_dockerfile_agree():
+    dockerfile = (ROOT / "Dockerfile").read_text()
+    assert 'ENTRYPOINT ["docker-entrypoint.sh"]' in dockerfile
+    assert "--require-hashes" in dockerfile and "useradd" in dockerfile and "--user-group" in dockerfile
+    assert os.access(ENTRYPOINT, os.X_OK)
+    assert subprocess.run(["sh", "-n", str(ENTRYPOINT)]).returncode == 0  # parses as POSIX sh
+    locked = (ROOT / "requirements.txt").read_text()
+    for line in locked.splitlines():  # every requirement is pinned exactly, with a hash
+        if line and not line.startswith((" ", "#")):
+            assert "==" in line and line.rstrip().endswith("\\"), line
+    assert locked.count("--hash=sha256:") > 50
+
+
+# --- tools/firmware_capture.py --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "file:///etc/passwd",
+        "FILE:///etc/shadow",
+        "data:text/plain,hi",
+        "gopher://x/1",
+        "/etc/passwd",
+        "",
+        "None",
+        "javascript:1",
+    ],
+)
+def test_download_refuses_locations_that_are_not_ftp_or_http(tmp_path, location):
+    """The location comes from the other end of the OCPP connection. urllib would happily "download"
+    file:///etc/passwd into the output directory."""
+    target = tmp_path / "out" / "image.bin"
+    with pytest.raises(fc.CloudError, match="only ftp, http, https"):
+        fc.download_image(location, target)
+    assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    "location,name",
+    [
+        ("ftp://host/files/UDGRW070L-04.03.2.bin", "UDGRW070L-04.03.2.bin"),
+        ("http://host/fw/image.bin?token=1#frag", "image.bin"),
+        ("ftp://host/..", "firmware.bin"),
+        ("ftp://host/a/../../etc/passwd", "passwd"),
+        ("http://host/%2e%2e%2f%2e%2e%2fetc%2fcron.d%2fevil", "evil"),
+        ("http://host/a\\..\\..\\boot.ini", "boot.ini"),
+        ("http://host/", "firmware.bin"),
+        ("http://host/....", "firmware.bin"),
+        ("http://host/na me;rm -rf.bin", "na_me_rm_-rf.bin"),
+        ("http://host/" + "A" * 500, "A" * 128),
+    ],
+)
+def test_image_filename_is_always_a_plain_name(location, name):
+    result = fc.image_filename(location)
+    assert result == name
+    assert "/" not in result and "\\" not in result and result not in (".", "..") and result
+
+
+class _Firmware(BaseHTTPRequestHandler):
+    body = b"\xe9" + b"F" * 5000
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):  # noqa: N802
+        self.send_response(200)
+        self.end_headers()
+        if self.path == "/endless":
+            try:
+                while True:
+                    self.wfile.write(b"x" * 65536)
+            except OSError:
+                return
+        self.wfile.write(self.body)
+
+
+@pytest.fixture
+def firmware_host():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Firmware)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+
+
+def test_download_stops_at_the_size_limit(tmp_path, firmware_host, monkeypatch):
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+    info = fc.download_image(f"{firmware_host}/image.bin", tmp_path / "image.bin")
+    assert info["size"] == 5001 and (tmp_path / "image.bin").read_bytes() == _Firmware.body
+
+    endless = tmp_path / "endless.bin"
+    with pytest.raises(fc.CloudError, match="larger than"):
+        fc.download_image(f"{firmware_host}/endless", endless, max_bytes=300_000)
+    assert not endless.exists()  # and nothing half-written is left behind
+
+
+def test_token_file_is_never_readable_by_others(tmp_path):
+    path = tmp_path / "config" / "tokens.json"
+    client = fc.CloudClient(token="T0KEN", refresh_token="REFRESH")
+    old_umask = os.umask(0o022)
+    try:
+        fc.save_token_file(path, client)
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        path.chmod(0o644)  # an existing, too-open file is tightened as well
+        fc.save_token_file(path, client)
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        # And it is private from the moment it exists, not from a chmod afterwards: with that
+        # chmod taken away, a file written first and restricted second would stay at 0644.
+        path.unlink()
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(Path, "chmod", lambda self, mode: None)
+            fc.save_token_file(path, client)
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    finally:
+        os.umask(old_umask)
+    assert json.loads(path.read_text()) == {"token": "T0KEN", "refreshToken": "REFRESH"}
+
+
+def test_station_id_from_the_cloud_is_quoted_into_the_path():
+    seen = []
+
+    class Client(fc.CloudClient):
+        def request(self, method, path, body=None):
+            seen.append(path)
+            return {}
+
+    Client().firmware("abc/../../admin?x=1")
+    assert seen == ["/client/stations/abc%2F..%2F..%2Fadmin%3Fx%3D1/firmware"]
+
+
+# --- the TLS front end and GRIZZLE_HOST ---------------------------------------------------------------
+
+
+def test_upstream_host_follows_the_listen_address():
+    assert upstream_host("0.0.0.0") == "127.0.0.1"
+    assert upstream_host("") == "127.0.0.1" and upstream_host(None) == "127.0.0.1"
+    assert upstream_host("::") == "::1"
+    assert upstream_host("192.168.1.5") == "192.168.1.5"
+    assert upstream_host("127.0.0.1") == "127.0.0.1"
+
+
+def _has_ipv6_loopback() -> bool:
+    try:
+        with socket.socket(socket.AF_INET6) as s:
+            s.bind(("::1", 0))
+        return True
+    except OSError:
+        return False
+
+
+@pytest.mark.parametrize(
+    "host,url_host",
+    [
+        ("127.0.0.2", "127.0.0.2"),  # one specific address (any 127.x.x.x is local on Linux)
+        pytest.param("::", "[::1]", marks=pytest.mark.skipif(not _has_ipv6_loopback(), reason="no IPv6 loopback")),
+    ],
+)
+async def test_tls_reaches_a_plain_listener_that_is_not_on_ipv4_loopback(tmp_path, certs, host, url_host):
+    """The front end always dialled 127.0.0.1. With GRIZZLE_HOST=:: or one specific address nothing
+    listens there: every TLS client finished the handshake and was dropped."""
+    settings = Settings(
+        data_dir=tmp_path / "data", host=host, port=free_port(), tls_port=free_port(),
+        tls_cert=str(certs[0]), tls_key=str(certs[1]), api_email=EMAIL, api_password=PASSWORD, tick_seconds=3600,
+    )
+    server = asyncio.create_task(serve(settings))
+    try:
+        async with aiohttp.ClientSession() as session:
+            for _ in range(100):
+                try:
+                    resp = await session.get(f"https://{url_host}:{settings.tls_port}/health", ssl=False)
+                    break
+                except aiohttp.ClientError:
+                    await asyncio.sleep(0.05)
+            else:
+                raise AssertionError("no answer through the TLS front end")
+            assert resp.status == 200 and (await resp.json())["status"] == "ok"
+    finally:
+        server.cancel()  # not a signal: if the server never came up, a SIGTERM would end the test run instead
+        with contextlib.suppress(asyncio.CancelledError, OSError):
+            await asyncio.wait_for(server, 8)
+
+
+# --- the certificate script -------------------------------------------------------------------------
+
+
+def test_generated_certificate_is_a_server_certificate_not_a_ca(certs):
+    """`openssl req -x509` makes a CA by default: whoever copied privkey.pem could have signed
+    certificates for any site, valid wherever this certificate had been trusted."""
+    text = subprocess.run(
+        ["openssl", "x509", "-in", str(certs[0]), "-noout", "-text"], check=True, capture_output=True, text=True
+    ).stdout
+    assert "CA:FALSE" in text and "CA:TRUE" not in text
+    assert "TLS Web Server Authentication" in text
+    assert "DNS:ocpp.unitedchargers.com" in text and "DNS:connect-api.unitedchargers.com" in text
+    assert stat.S_IMODE(certs[1].stat().st_mode) == 0o600
+
+
+# --- tools/poc_n1_unauth_webui.py --------------------------------------------------------------------
+
+
+class _WebUi(BaseHTTPRequestHandler):
+    control_status = 200
+
+    def log_message(self, *args):
+        pass
+
+    def _answer(self):
+        if self.path in ("/ocppconfig", "/service"):
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="Please enter login and password"')
+        elif self.control_status == 302:
+            self.send_response(302)
+            self.send_header("Location", "/login-page")
+        elif self.path == "/login-page":
+            self.send_response(200)
+        else:
+            self.send_response(self.control_status)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    do_GET = do_POST = _answer  # noqa: N815
+
+
+@pytest.mark.parametrize(
+    "status,expected_exit,verdict",
+    [
+        (200, 2, "N1 CONFIRMED"),
+        (401, 0, "N1 not reproduced"),
+        (403, 3, "inconclusive"),  # refused is not "processed without auth"
+        (404, 3, "inconclusive"),
+        (500, 3, "inconclusive"),
+        (302, 3, "inconclusive"),  # a redirect to a login page must not be followed and counted as 200
+    ],
+)
+def test_n1_poc_only_counts_a_success_as_confirmation(monkeypatch, capsys, status, expected_exit, verdict):
+    import poc_n1_unauth_webui as poc
+
+    handler = type("Handler", (_WebUi,), {"control_status": status})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+        monkeypatch.setenv("no_proxy", "127.0.0.1")
+        monkeypatch.setattr(sys, "argv", ["poc", "--host", "127.0.0.1", "--port", str(server.server_address[1])])
+        assert poc.main() == expected_exit
+    finally:
+        server.shutdown()
+    assert verdict in capsys.readouterr().out
+
+
+# --- firmware_capture keeps a refreshed token ---------------------------------------------------------
+
+
+def test_a_refreshed_cloud_token_is_written_back(tmp_path):
+    token_file = tmp_path / "tokens.json"
+    token_file.write_text(json.dumps({"token": "expired", "refreshToken": "single-use"}))
+
+    class Cloud(fc.CloudClient):
+        def _raw(self, method, path, body=None, auth=True):
+            if path == "/client/auth/refresh-token":
+                return 200, {"token": "fresh", "refreshToken": "next"}
+            return (200, {"stations": []}) if self.token == "fresh" else (401, {"message": "expired"})
+
+    client = Cloud()
+    client.token, client.refresh_token = fc.load_token_file(token_file)
+    client.token_file = token_file
+    assert client.stations() == []
+    assert json.loads(token_file.read_text()) == {"token": "fresh", "refreshToken": "next"}
+    assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+
+
+# --- low ports, and the health check ------------------------------------------------------------------
+
+BIND_PROBE = (
+    "import socket, sys\n"
+    "caps = [l.split()[1] for l in open('/proc/self/status') if l.startswith('CapEff')][0]\n"
+    "def bind(port):\n"
+    "    try:\n"
+    "        socket.socket().bind(('127.0.0.1', port)); return 'ok'\n"
+    "    except OSError: return 'refused'\n"
+    "print(caps, bind(int(sys.argv[1])))\n"
+)
+
+
+def _low_port() -> int | None:
+    """A free port below the unprivileged range, if this system has one."""
+    try:
+        limit = int(Path("/proc/sys/net/ipv4/ip_unprivileged_port_start").read_text())
+    except (OSError, ValueError):
+        return None
+    for port in range(min(limit, 1024) - 1, 0, -1):
+        with socket.socket() as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    return None
+
+
+@needs_root
+def test_entrypoint_keeps_only_the_bind_capability_for_a_low_port(volumes):
+    """With host networking and GRIZZLE_TLS_PORT=443 the unprivileged server could not bind its
+    port, and the container that started fine as root no longer started at all."""
+    port = _low_port()
+    if port is None:
+        pytest.skip("every port is unprivileged here")
+    result = _entrypoint(volumes, sys.executable, "-c", BIND_PROBE, str(port))
+    assert result.stdout.split() == ["0000000000000000", "refused"], result.stderr  # default ports: nothing kept
+    result = _entrypoint(volumes, sys.executable, "-c", BIND_PROBE, str(port), GRIZZLE_TLS_PORT="443")
+    assert result.stdout.split() == ["0000000000000400", "ok"], result.stderr  # CAP_NET_BIND_SERVICE and nothing else
+    result = _entrypoint(volumes, sys.executable, "-c", BIND_PROBE, str(port), GRIZZLE_PORT="80; echo injected")
+    assert result.stdout.split() == ["0000000000000000", "refused"] and "injected" not in result.stdout
+
+
+async def test_health_check_asks_where_the_server_listens(tmp_path, monkeypatch):
+    from grizzle_local import healthcheck
+
+    assert healthcheck.url(Settings(host="0.0.0.0", port=9000)) == "http://127.0.0.1:9000/health"
+    assert healthcheck.url(Settings(host="::", port=9123)) == "http://[::1]:9123/health"
+    assert healthcheck.url(Settings(host="192.168.1.5", port=80)) == "http://192.168.1.5:80/health"
+
+    async with TestServer(make_app(tmp_path)) as server:
+        monkeypatch.setenv("GRIZZLE_HOST", "127.0.0.1")
+        monkeypatch.setenv("GRIZZLE_PORT", str(server.port))
+        monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")  # a proxy setting must not come between us and ourselves
+        assert await asyncio.to_thread(healthcheck.main) == 0
+        monkeypatch.setenv("GRIZZLE_PORT", str(free_port()))
+        assert await asyncio.to_thread(healthcheck.main) == 1
+    assert 'CMD ["python", "-m", "grizzle_local.healthcheck"]' in (ROOT / "Dockerfile").read_text()
+
+
+async def test_no_charger_is_admitted_once_shutdown_has_begun(tmp_path, monkeypatch):
+    """A handshake that is waiting on the liveness probe when shutdown starts used to be connected
+    after "every connection" had been closed: nothing closed that one, and exit waited ten seconds."""
+    async with TestServer(make_app(tmp_path)) as ts, TestClient(ts) as client, aiohttp.ClientSession() as session:
+        controller = client.app["controller"]
+        original = type(controller)._refusal
+
+        async def slow_check(self, cp_id, auth_key):  # as the probe of an unresponsive charger would be
+            result = await original(self, cp_id, auth_key)
+            await asyncio.sleep(0.5)
+            return result
+
+        monkeypatch.setattr(type(controller), "_refusal", slow_check)
+        connecting = asyncio.create_task(RawCharger.connect(client, session, SERIAL))
+        await asyncio.sleep(0.2)  # the handshake is inside the admission check...
+        await controller.stop()  # ...when the server begins to stop
+        with pytest.raises(aiohttp.WSServerHandshakeError) as refused:
+            await connecting
+        assert refused.value.status == 503
+        assert controller.connections == {}
+
+
+# --- the entrypoint, once more: files, links, and where its own files go ---------------------------------
+
+
+@needs_root
+def test_entrypoint_checks_the_files_and_not_just_the_directory(volumes):
+    """A volume whose ownership cannot be changed (root-squashed NFS, say) with a directory anyone may
+    write: the directory test passed, root was dropped, and the server then could not open its own
+    state file or database."""
+    (volumes / "data").chmod(0o777)
+    stub = volumes / "bin"
+    stub.mkdir()
+    (stub / "chown").write_text("#!/bin/sh\nexit 1\n")  # this filesystem refuses to change owners
+    (stub / "chown").chmod(0o755)
+    result = _entrypoint(volumes, PATH=f"{stub}:{os.environ['PATH']}")
+    assert result.returncode == 0, result.stderr
+    assert "uid=0 " in result.stdout and "or a file in it is not writable" in result.stderr
+    assert (volumes / "data" / "state.json").stat().st_uid == 0
+
+
+@needs_root
+def test_entrypoint_follows_a_symlinked_data_directory(volumes):
+    (volumes / "data").rename(volumes / "real-data")
+    (volumes / "data").symlink_to(volumes / "real-data")
+    result = _entrypoint(volumes)
+    uid = pwd.getpwnam(RUN_AS).pw_uid
+    assert f"uid={uid} " in result.stdout and result.stderr == "", result.stderr
+    assert (volumes / "real-data" / "state.json").stat().st_uid == uid
+
+
+@needs_root
+def test_entrypoint_never_empties_the_directory_it_is_told_to_copy_certificates_to(volumes):
+    """It used to `rm -rf` whatever GRIZZLE_CERT_COPY_DIR named. Naming the data directory emptied it."""
+    result = _entrypoint(volumes, GRIZZLE_CERT_COPY_DIR=str(volumes / "data"))
+    assert result.returncode == 0, result.stderr
+    assert (volumes / "data" / "state.json").read_text() == "{}"
+    assert (volumes / "data" / "grizzle-certs" / "privkey.pem").read_text() == "KEY"
+
+
+def test_repository_keeps_unix_line_endings_for_what_runs_in_the_image():
+    attributes = (ROOT / ".gitattributes").read_text()
+    assert "*.sh" in attributes and "eol=lf" in attributes
+    assert b"\r" not in ENTRYPOINT.read_bytes()
+    compose = (ROOT / "docker-compose.yml").read_text()
+    assert "no-new-privileges:true" in compose
+
+
+# --- logging, as main() sets it up ----------------------------------------------------------------------
+
+
+def test_main_installs_the_formatter_that_keeps_log_lines_single():
+    from grizzle_local.main import SingleLineFormatter, configure_logging
+
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    try:
+        handler = configure_logging("WARNING")
+        assert root.handlers == [handler] and root.level == logging.WARNING
+        assert isinstance(handler.formatter, SingleLineFormatter)
+        record = logging.LogRecord("grizzle_local", logging.WARNING, __file__, 1, "from %s", ("a\nb",), None)
+        assert "\n" not in handler.format(record)
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
+
+
+async def test_startup_says_so_when_the_password_is_a_well_known_one(tmp_path, caplog):
+    settings = Settings(
+        data_dir=tmp_path / "data", host="127.0.0.1", port=free_port(), tls_port=0, api_password="change-me"
+    )
+    caplog.set_level(logging.WARNING)
+    server = asyncio.create_task(serve(settings))
+    try:
+        await wait_for(lambda: any("SECURITY:" in r.getMessage() for r in caplog.records), timeout=5)
+    finally:
+        server.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(server, 8)
+    assert any("well-known default" in r.getMessage() for r in caplog.records)
+
+
+def test_frame_ancestors_may_be_pasted_from_the_address_bar():
+    assert Settings(frame_ancestors="http://homeassistant.local:8123/").frame_ancestors == "http://homeassistant.local:8123"
+    pasted = "https://ha.example.com/lovelace/0?x=1, 'self'"
+    assert Settings(frame_ancestors=pasted).frame_ancestors == "https://ha.example.com 'self'"
+    with pytest.raises(ValueError):
+        Settings(frame_ancestors="http://a b;/")
+
+
+# --- the capture command end to end, and the fake charger ------------------------------------------------
+
+
+@pytest.fixture
+async def update_cloud():
+    """A stand-in for the vendor's OCPP cloud: answers every call, and sends one UpdateFirmware whose
+    location the test chooses."""
+    from aiohttp import web
+
+    state = {"location": None, "body": b"\xe9" + b"FW" * 2000}
+
+    async def firmware(request):
+        return web.Response(body=state["body"])
+
+    async def cloud(request):
+        ws = web.WebSocketResponse(protocols=("ocpp1.6",))
+        await ws.prepare(request)
+        async for msg in ws:
+            frame = json.loads(msg.data)
+            if frame[0] != 2:
+                continue
+            await ws.send_str(json.dumps([3, frame[1], {"status": "Accepted", "interval": 300}]))
+            if frame[2] == "BootNotification":
+                location = state["location"] or str(request.url.with_path("/fw/image.bin"))
+                await ws.send_str(json.dumps([2, "u1", "UpdateFirmware", {"location": location}]))
+        return ws
+
+    app = web.Application()
+    app.router.add_get("/ocpp1.6", cloud)
+    app.router.add_get("/{tail:.*}", firmware)
+    server = TestServer(app)
+    await server.start_server()
+    server.state = state
+    yield server
+    await server.close()
+
+
+def _capture_args(server, out, **overrides):
+    import argparse
+
+    values = dict(
+        base_url="http://unused", token_file="/unused", email=None, save_tokens=False, state=None, serial="GRD-TEST",
+        auth_key="s3cret", claim_firmware=None, cloud_ip=None, doh_url=fc.DOH_URL, timeout=10.0, out=str(out),
+        ocpp_url=f"ws://{server.host}:{server.port}/ocpp1.6", name=None, no_trigger=True, no_download=False, json=False,
+        max_size=fc.DEFAULT_MAX_DOWNLOAD,
+    )
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+async def test_capture_saves_under_a_plain_name_whatever_the_location_says(update_cloud, tmp_path):
+    out = tmp_path / "out"
+    base = f"http://{update_cloud.host}:{update_cloud.port}"
+    update_cloud.state["location"] = f"{base}/a/..%2f..%2f..%2fescaped.bin"
+    assert await asyncio.to_thread(fc.cmd_capture, _capture_args(update_cloud, out)) == 0
+    assert sorted(p.name for p in out.iterdir()) == ["escaped.bin", "escaped.bin.json"]
+    assert not (tmp_path / "escaped.bin").exists()
+
+    # --name is a file name: a path in it does not move the file out of the output directory.
+    update_cloud.state["location"] = f"{base}/fw/image.bin"
+    args = _capture_args(update_cloud, out, name="../../named.bin")
+    assert await asyncio.to_thread(fc.cmd_capture, args) == 0
+    assert (out / "named.bin").read_bytes() == update_cloud.state["body"] and not (tmp_path / "named.bin").exists()
+
+
+@pytest.mark.parametrize("location", ["file:///etc/hostname", "http://[not-a-url", "/etc/hostname"])
+async def test_capture_refuses_a_location_it_should_not_fetch(update_cloud, tmp_path, location):
+    update_cloud.state["location"] = location
+    with pytest.raises(fc.CloudError, match="only ftp, http, https"):
+        await asyncio.to_thread(fc.cmd_capture, _capture_args(update_cloud, tmp_path / "out"))
+    assert not list((tmp_path / "out").glob("*")) if (tmp_path / "out").exists() else True
+
+
+async def test_capture_honours_max_size(update_cloud, tmp_path):
+    with pytest.raises(fc.CloudError, match="larger than"):
+        await asyncio.to_thread(fc.cmd_capture, _capture_args(update_cloud, tmp_path / "out", max_size=1000))
+    assert not (tmp_path / "out" / "image.bin").exists()
+
+
+def test_capture_explains_an_unreadable_state_file(tmp_path):
+    state = tmp_path / "state.json"
+    state.write_text("{}")
+    with pytest.MonkeyPatch.context() as patch:
+
+        def refuse(self, *args, **kwargs):
+            raise PermissionError(13, "Permission denied")
+
+        patch.setattr(Path, "read_text", refuse)
+        with pytest.raises(fc.CloudError, match="readable only by the user the server runs as"):
+            fc.load_identity(state, None)
+
+
+async def test_fake_charger_rejects_a_connector_it_does_not_have():
+    """The server may assume a Duo's two connectors; the one-connector fake used to die of a KeyError."""
+
+    class Socket:
+        sent: list = []
+
+        async def send_str(self, text):
+            self.sent.append(json.loads(text))
+
+    charger = FakeCharger("ws://unused", "GRD-ONE", connectors=1)
+    charger.ws = Socket()
+    await charger._handle_call("u1", "TriggerMessage", {"requestedMessage": "StatusNotification", "connectorId": 2})
+    await charger._handle_call("u2", "RemoteStartTransaction", {"connectorId": 2, "idTag": "t"})
+    assert charger.ws.sent == [[3, "u1", {"status": "Rejected"}], [3, "u2", {"status": "Rejected"}]]

@@ -224,7 +224,7 @@ class FakeCharger:
         reply: dict[str, Any] = {}
         if action == "RemoteStartTransaction":
             cid = int(payload.get("connectorId") or 1)
-            if self.status[cid] in ("Preparing", "SuspendedEVSE") and cid not in self.transactions:
+            if self.status.get(cid) in ("Preparing", "SuspendedEVSE") and cid not in self.transactions:
                 reply = {"status": "Accepted"}
                 asyncio.create_task(self._start_transaction(cid, payload.get("idTag", "")))
             else:
@@ -257,7 +257,10 @@ class FakeCharger:
             reply = {"status": "Accepted"}
             if payload.get("requestedMessage") == "StatusNotification":
                 cid = int(payload.get("connectorId") or 1)
-                asyncio.create_task(self.send_status(cid, self.status[cid]))
+                if cid in self.status:
+                    asyncio.create_task(self.send_status(cid, self.status[cid]))
+                else:  # a connector this charger doesn't have (the server may assume a Duo's two)
+                    reply = {"status": "Rejected"}
         elif action == "Reset":
             reply = {"status": "Accepted"}
             self.reset_requested.set()

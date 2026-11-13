@@ -16,13 +16,158 @@ days plus every holiday) or ``"only"`` (holidays only; ``days`` is ignored).
 
 from __future__ import annotations
 
+import json
+import math
+import re
 from collections.abc import Callable
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 MINUTES_PER_DAY = 24 * 60
+HOLIDAY_MODES = ("same", "skip", "also", "only")
 
 HolidayCheck = Callable[[date], bool]
+
+# --- validation -----------------------------------------------------------------------------
+#
+# Zones arrive from the REST API and are evaluated on every controller tick, forever. Anything
+# stored here must therefore be something the functions below can evaluate: one zone with
+# ``"startHours": "soon"`` would otherwise raise on every tick after it was saved.
+
+_TIME_KEYS = tuple(
+    f"{edge}{unit}{suffix}" for suffix in ("", "2") for edge in ("start", "end") for unit in ("Hours", "Minutes")
+)
+_FLAG_KEYS = ("allDay", "isSchedule", "scheduleEnabled", "useSeason")
+_PRICE_KEYS = ("priceKW", "priceKWSummer")
+_ZONE_ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+MAX_NAME_LENGTH = 100
+MAX_EXTRA_KEYS = 32  # fields of the cloud's format we don't interpret but hand back unchanged
+
+
+def zone_id(value: Any) -> str:
+    """A zone's ``_id`` as text. Raises ValueError for anything that can't be one."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
+    if not isinstance(value, str) or not _ZONE_ID_RE.fullmatch(value):
+        raise ValueError("_id must be 1-64 letters, digits or _ . : -")
+    return value
+
+
+def _whole(key: str, value: Any, lo: int, hi: int) -> int:
+    """An integer in ``lo..hi``; None means 0. Integral floats and digit strings are accepted."""
+    if value is None:
+        return 0
+    number: int | None = None
+    if isinstance(value, bool):
+        pass
+    elif isinstance(value, int):
+        number = value
+    elif isinstance(value, float) and value.is_integer():
+        number = int(value)
+    elif isinstance(value, str) and value.strip().isascii() and value.strip().isdigit() and len(value.strip()) <= 4:
+        number = int(value.strip())
+    if number is None or not lo <= number <= hi:
+        raise ValueError(f"{key} must be a whole number from {lo} to {hi}")
+    return number
+
+
+def _amount(key: str, value: Any) -> float | int | None:
+    """A finite number (numeric text is accepted), or None. Raises ValueError otherwise."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be a number")
+    if isinstance(value, str):
+        if len(value) > 32:
+            raise ValueError(f"{key} must be a number")
+        try:
+            value = float(value)
+        except ValueError:
+            raise ValueError(f"{key} must be a number") from None
+    if not isinstance(value, (int, float)):
+        raise ValueError(f"{key} must be a number")
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:  # an integer too large for a float
+        finite = False
+    if not finite:
+        raise ValueError(f"{key} must be a finite number")
+    return int(value) if isinstance(value, float) and value.is_integer() and abs(value) < 1e15 else value
+
+
+def _passthrough(value: Any) -> bool:
+    """Is this small enough, and plain enough, to store as a field we don't interpret?"""
+    if value is None or isinstance(value, bool):
+        return True
+    if isinstance(value, str):
+        return len(value) <= 200
+    try:
+        return len(json.dumps(value, allow_nan=False)) <= 256
+    except (TypeError, ValueError, RecursionError, OverflowError):
+        return False
+
+
+def normalize_zone(raw: Any, *, max_connector: int = 8, max_current: int = 100) -> dict[str, Any]:
+    """Validate a zone from the API (or from an old state file). Raises ValueError with a readable message.
+
+    Only the keys present are returned, typed the way the evaluation below expects; ``_id`` is left to
+    the caller. Fields of the cloud's format that we don't interpret survive if they are small.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("price object required")
+    zone: dict[str, Any] = {}
+    extras = 0
+    for key, value in raw.items():
+        if key == "_id":
+            continue
+        if key == "name":
+            if value is None:
+                value = ""
+            if not isinstance(value, str):
+                raise ValueError("name must be text")
+            value = value.strip()
+            if len(value) > MAX_NAME_LENGTH:
+                raise ValueError(f"name can't be longer than {MAX_NAME_LENGTH} characters")
+        elif key in _FLAG_KEYS:
+            if value is not None and not isinstance(value, bool) and value not in (0, 1):
+                raise ValueError(f"{key} must be true or false")
+            value = bool(value)
+        elif key in _TIME_KEYS:
+            value = _whole(key, value, 0, 24 if "Hours" in key else 59)
+        elif key == "days":
+            if value is None:
+                value = []
+            if not isinstance(value, list) or len(value) > 64 or any(day is None for day in value):
+                raise ValueError("days must be a list of numbers, 0 (Sunday) to 6 (Saturday)")
+            value = sorted({_whole("days", day, 0, 6) for day in value})
+        elif key == "connectorId":
+            value = _whole(key, value, 0, max_connector)
+        elif key == "currentLimit":
+            value = _amount(key, value)
+            if value == 0:
+                value = None  # "no limit of its own"
+            if value is not None and not 1 <= value <= max_current:
+                raise ValueError(f"currentLimit must be between 1 and {max_current} A")
+        elif key in _PRICE_KEYS:
+            value = _amount(key, value)
+            if value is not None and value < 0:
+                raise ValueError(f"{key} can't be negative")
+        elif key == "holidays":
+            if value is not None and not (isinstance(value, str) and value in HOLIDAY_MODES):
+                raise ValueError(f"holidays must be one of {HOLIDAY_MODES}")
+        else:
+            if not isinstance(key, str) or len(key) > 40 or extras >= MAX_EXTRA_KEYS or not _passthrough(value):
+                continue
+            extras += 1
+        zone[key] = value
+    for suffix in ("", "2"):
+        for edge in ("start", "end"):
+            if zone.get(f"{edge}Hours{suffix}") == 24 and zone.get(f"{edge}Minutes{suffix}"):
+                raise ValueError("a time can't be later than 24:00")
+    return zone
+
+
+# --- evaluation -----------------------------------------------------------------------------
 
 
 def _ranges(zone: dict[str, Any]) -> list[tuple[int, int]]:
@@ -66,6 +211,25 @@ def applies_to(zone: dict[str, Any], connector_id: int) -> bool:
     return zone_connector == 0 or connector_id == 0 or zone_connector == connector_id
 
 
+def _wall_clock(now: datetime) -> datetime:
+    """The moment whose wall-clock reading decides what applies at ``now``: normally ``now`` itself.
+
+    On the night the clocks go back, an hour of wall-clock time happens twice. Read naively, a
+    window that starts at 01:30 would switch on, off again for the second 01:00-01:30, and back
+    on: a charger told to stop and to start again half an hour later. So the second time round is
+    read as the moment the repeat ends, and whatever the first pass ended with carries through.
+    """
+    if not now.fold or now.tzinfo is None or now.replace(fold=0).utcoffset() == now.utcoffset():
+        return now
+    instant = now.astimezone(timezone.utc).replace(second=0, microsecond=0)
+    for _ in range(3 * 60):
+        instant += timedelta(minutes=1)
+        local = instant.astimezone(now.tzinfo)
+        if local.replace(fold=0).utcoffset() == local.replace(fold=1).utcoffset():
+            return local
+    return now
+
+
 def zone_active(zone: dict[str, Any], now: datetime, is_holiday: HolidayCheck | None = None) -> bool:
     """Is ``now`` (timezone-aware, in the station's zone) inside this zone?
 
@@ -74,6 +238,7 @@ def zone_active(zone: dict[str, Any], now: datetime, is_holiday: HolidayCheck | 
     into the next one, so "weekdays 20:00-06:00" includes Monday's small hours and stops at
     midnight on Friday. That is how utility rate plans (and the Grizzl-E app) read it.
     """
+    now = _wall_clock(now)
     if not _eligible(zone, now.date(), is_holiday):
         return False
     minute = now.hour * 60 + now.minute + now.second / 60
@@ -136,16 +301,33 @@ def next_change(
     enabled = [z for z in zones if z.get("scheduleEnabled") and applies_to(z, connector_id)]
     if not enabled:
         return None
-    if any((z.get("holidays") or "same") == "only" for z in enabled):
-        horizon_days = max(horizon_days, 120)  # a holidays-only window may be months away
+    if is_holiday is not None and any((z.get("holidays") or "same") != "same" for z in enabled):
+        # The next day a holiday rule lets a window apply (or stops it applying) can be most of a
+        # year away: a holidays-only window in a country with one holiday left this year, a weekly
+        # window whose next few days all fall on holidays.
+        horizon_days = max(horizon_days, 370)
     current = charging_allowed(enabled, now, connector_id, is_holiday) is not None
-    midnight = datetime.combine(now.date(), time(0), now.tzinfo)
-    candidates: set[datetime] = set()
+    tz = now.tzinfo
+    midnight = datetime.combine(now.date(), time(0), tz)
+    walls: set[datetime] = set()
     for offset in range(-1, horizon_days + 1):
         day = midnight + timedelta(days=offset)
         for zone in enabled:
-            candidates.update(_boundaries(zone, day))
-    for moment in sorted(c for c in candidates if c > now):
+            walls.update(_boundaries(zone, day))
+        if tz is not None and day.utcoffset() != (day + timedelta(days=1)).utcoffset():
+            # The clocks change today, so the wall clock skips or repeats part of an hour and the
+            # state can flip at the change itself, not only at a boundary someone typed in.
+            walls.update(day + timedelta(minutes=30 * step) for step in range(49))
+    if tz is None:  # naive datetimes: nothing to convert, and no clock changes to worry about
+        candidates = sorted(wall for wall in walls if wall > now)
+    else:
+        # Compare as instants. Two datetimes in the same zone compare by their wall-clock reading,
+        # which is wrong twice a year: a time that occurs twice is two instants (both are
+        # candidates), and one that never occurs still stands for a real instant.
+        now_utc = now.astimezone(timezone.utc)
+        instants = {wall.replace(fold=fold).astimezone(timezone.utc) for wall in walls for fold in (0, 1)}
+        candidates = [instant.astimezone(tz) for instant in sorted(i for i in instants if i > now_utc)]
+    for moment in candidates:
         if (charging_allowed(enabled, moment, connector_id, is_holiday) is not None) != current:
             return moment
     return None

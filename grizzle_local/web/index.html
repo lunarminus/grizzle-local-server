@@ -436,7 +436,13 @@ function showLogin() {
   $("#app").hidden = true; $("#login").hidden = false;
   $("#loginEmail").focus();
 }
-function signOut() { state.token = null; storage("set", null); showLogin(); }
+function signOut() {
+  const token = state.token;
+  state.token = null; storage("set", null);
+  // End the session on the server too, so the token is worthless from now on (best effort: we may be here because it already is).
+  if (token) fetch("/client/auth/logout", { method: "POST", headers: { Authorization: "Bearer " + token } }).catch(() => {});
+  showLogin();
+}
 $("#loginForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   $("#loginError").textContent = "";
