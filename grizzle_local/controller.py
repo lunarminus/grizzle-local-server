@@ -803,9 +803,12 @@ class Controller:
             _text(payload.get("reason"), 50),
             _timestamp(payload.get("timestamp")),
         )
-        # transactionData may carry final meter values
+        # transactionData may carry final meter values. They are taken after the session is closed
+        # on purpose: its begin/end readings can be the lifetime register even where MeterValues
+        # count from zero, and must not be mistaken for the session's energy. Filed under the
+        # session's id they are still there for repricing, which copes with either convention.
         rows = [
-            self._apply_meter_values(station, connector, mv, tid=None)
+            self._apply_meter_values(station, connector, mv, tid)
             for mv in _dicts(payload.get("transactionData"), MAX_METER_VALUES)
         ]
         self.store.add_samples([row for row in rows if row is not None])
@@ -835,7 +838,17 @@ class Controller:
             connector["totalEnergyWh"] = float(meter_start) + energy
         start, stop = _parse_iso(tx.get("startAt")), _parse_iso(stopped_at)
         duration = max(0, int((stop - start).total_seconds())) if start and stop else None
-        cost = tx.get("priceTotal")
+        cost = float(_reading(tx.get("priceTotal")) or 0)
+        # Cost builds up with each MeterValues reading. What was delivered after the last one (all
+        # of it, if none arrived) is in the final energy but was never priced: do that now, the
+        # way recalculating does, at the price in force at the end of the session (at its start
+        # when there were no readings at all).
+        unpriced = float(_reading(energy) or 0) - float(_reading(tx.get("lastSessionEnergy")) or 0)
+        if unpriced > 0:
+            metered = isinstance(tx.get("sessionRelativeRegister"), bool)
+            moment = (stop if metered else start) or stop or start
+            price = self.price_at(station, moment.astimezone(self.tz(station))) if moment else None
+            cost += unpriced / 1000 * (price or 0)
         self.store.finish_session(
             int(tx["id"]),
             stopped_at,
@@ -848,6 +861,7 @@ class Controller:
         connector["lastSession"] = {
             **tx,
             "energy": energy,
+            "priceTotal": cost,
             "stopAt": stopped_at,
             "duration": duration,
             "reason": reason,
@@ -1050,13 +1064,21 @@ class Controller:
             station["idTag"] = auth_tag
 
     def effective_limit(self, station: dict[str, Any]) -> int | None:
-        """Station current limit, overridden by an active window's own limit."""
+        """Station current limit, overridden by an active window's own limit.
+
+        The limit goes to the charger as one profile for the whole station, so when the connectors
+        are in windows with different limits it has to be the lowest of them: taking whichever
+        connector happened to come last let one connector's 32 A replace another's 16 A.
+        """
         limit = station.get("currentLimit")
         local_now = datetime.now(self.tz(station))
+        in_force = []
         for cid in range(1, connector_count(station) + 1):
             zone = self.window_now(station, local_now, cid)
             if zone and _reading(zone.get("currentLimit")) is not None:
-                limit = int(zone["currentLimit"])
+                in_force.append(int(zone["currentLimit"]))
+        if in_force:
+            limit = min(in_force)
         return int(limit) if limit is not None else None
 
     async def _apply_limit(self, station_id: str, force: bool = False) -> None:

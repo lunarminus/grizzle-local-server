@@ -20,7 +20,7 @@ import json
 import math
 import re
 from collections.abc import Callable
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 MINUTES_PER_DAY = 24 * 60
@@ -211,6 +211,25 @@ def applies_to(zone: dict[str, Any], connector_id: int) -> bool:
     return zone_connector == 0 or connector_id == 0 or zone_connector == connector_id
 
 
+def _wall_clock(now: datetime) -> datetime:
+    """The moment whose wall-clock reading decides what applies at ``now``: normally ``now`` itself.
+
+    On the night the clocks go back, an hour of wall-clock time happens twice. Read naively, a
+    window that starts at 01:30 would switch on, off again for the second 01:00-01:30, and back
+    on: a charger told to stop and to start again half an hour later. So the second time round is
+    read as the moment the repeat ends, and whatever the first pass ended with carries through.
+    """
+    if not now.fold or now.tzinfo is None or now.replace(fold=0).utcoffset() == now.utcoffset():
+        return now
+    instant = now.astimezone(timezone.utc).replace(second=0, microsecond=0)
+    for _ in range(3 * 60):
+        instant += timedelta(minutes=1)
+        local = instant.astimezone(now.tzinfo)
+        if local.replace(fold=0).utcoffset() == local.replace(fold=1).utcoffset():
+            return local
+    return now
+
+
 def zone_active(zone: dict[str, Any], now: datetime, is_holiday: HolidayCheck | None = None) -> bool:
     """Is ``now`` (timezone-aware, in the station's zone) inside this zone?
 
@@ -219,6 +238,7 @@ def zone_active(zone: dict[str, Any], now: datetime, is_holiday: HolidayCheck | 
     into the next one, so "weekdays 20:00-06:00" includes Monday's small hours and stops at
     midnight on Friday. That is how utility rate plans (and the Grizzl-E app) read it.
     """
+    now = _wall_clock(now)
     if not _eligible(zone, now.date(), is_holiday):
         return False
     minute = now.hour * 60 + now.minute + now.second / 60
@@ -281,16 +301,33 @@ def next_change(
     enabled = [z for z in zones if z.get("scheduleEnabled") and applies_to(z, connector_id)]
     if not enabled:
         return None
-    if any((z.get("holidays") or "same") == "only" for z in enabled):
-        horizon_days = max(horizon_days, 120)  # a holidays-only window may be months away
+    if is_holiday is not None and any((z.get("holidays") or "same") != "same" for z in enabled):
+        # The next day a holiday rule lets a window apply (or stops it applying) can be most of a
+        # year away: a holidays-only window in a country with one holiday left this year, a weekly
+        # window whose next few days all fall on holidays.
+        horizon_days = max(horizon_days, 370)
     current = charging_allowed(enabled, now, connector_id, is_holiday) is not None
-    midnight = datetime.combine(now.date(), time(0), now.tzinfo)
-    candidates: set[datetime] = set()
+    tz = now.tzinfo
+    midnight = datetime.combine(now.date(), time(0), tz)
+    walls: set[datetime] = set()
     for offset in range(-1, horizon_days + 1):
         day = midnight + timedelta(days=offset)
         for zone in enabled:
-            candidates.update(_boundaries(zone, day))
-    for moment in sorted(c for c in candidates if c > now):
+            walls.update(_boundaries(zone, day))
+        if tz is not None and day.utcoffset() != (day + timedelta(days=1)).utcoffset():
+            # The clocks change today, so the wall clock skips or repeats part of an hour and the
+            # state can flip at the change itself, not only at a boundary someone typed in.
+            walls.update(day + timedelta(minutes=30 * step) for step in range(49))
+    if tz is None:  # naive datetimes: nothing to convert, and no clock changes to worry about
+        candidates = sorted(wall for wall in walls if wall > now)
+    else:
+        # Compare as instants. Two datetimes in the same zone compare by their wall-clock reading,
+        # which is wrong twice a year: a time that occurs twice is two instants (both are
+        # candidates), and one that never occurs still stands for a real instant.
+        now_utc = now.astimezone(timezone.utc)
+        instants = {wall.replace(fold=fold).astimezone(timezone.utc) for wall in walls for fold in (0, 1)}
+        candidates = [instant.astimezone(tz) for instant in sorted(i for i in instants if i > now_utc)]
+    for moment in candidates:
         if (charging_allowed(enabled, moment, connector_id, is_holiday) is not None) != current:
             return moment
     return None

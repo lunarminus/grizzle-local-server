@@ -58,8 +58,11 @@ def normalize(raw: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("holiday settings must be an object")
     out = dict(DEFAULTS)
+    for key in ("enabled", "observed"):
+        if raw.get(key) is not None and not isinstance(raw[key], bool) and raw[key] not in (0, 1):
+            raise ValueError(f"{key} must be true or false")  # "false" is a non-empty string: it would mean true
     out["enabled"] = bool(raw.get("enabled"))
-    out["observed"] = bool(raw.get("observed", True))
+    out["observed"] = bool(raw.get("observed", True)) if raw.get("observed") is not None else True
     for key in ("country", "subdivision"):
         if raw.get(key) is not None and not isinstance(raw[key], str):
             raise ValueError(f"{key} must be text")
@@ -117,15 +120,18 @@ def normalize(raw: dict[str, Any] | None) -> dict[str, Any]:
 def _year(country: str, subdivision: str | None, observed: bool, year: int) -> tuple[tuple[date, str, str], ...]:
     """(date, name, key) for one year. ``key`` is the holiday's own name, shared with its observed day."""
     base = _holidays.country_holidays(country, subdiv=subdivision, years=year, observed=False, language="en_US")
-    entries = {day: (name, name) for day, name in base.items()}
-    if observed:
-        full = _holidays.country_holidays(country, subdiv=subdivision, years=year, observed=True, language="en_US")
-        base_names = sorted(set(base.values()), key=len, reverse=True)
-        for day, name in full.items():
-            if day not in entries:
-                key = next((b for b in base_names if name.startswith(b)), name)
-                entries[day] = (name, key)
-    return tuple(sorted((day, name, key) for day, (name, key) in entries.items()))
+    if not observed:
+        return tuple(sorted((day, name, name) for day, name in base.items()))
+    # The observed calendar is the list of days. It is not always the plain calendar plus a few
+    # days: where a holiday is legally moved (Colombia's Epiphany to the following Monday, and
+    # the like in a dozen countries) the original date is an ordinary working day, and it must
+    # not come back in from the plain calendar. That one only tells us which holiday a day
+    # belongs to, so that excluding a holiday by name also drops its observed day.
+    full = _holidays.country_holidays(country, subdiv=subdivision, years=year, observed=True, language="en_US")
+    base_names = sorted(set(base.values()), key=len, reverse=True)
+    return tuple(
+        sorted((day, name, next((b for b in base_names if name.startswith(b)), name)) for day, name in full.items())
+    )
 
 
 def _calendar(settings: dict[str, Any], years: range) -> list[tuple[date, str, str]]:
