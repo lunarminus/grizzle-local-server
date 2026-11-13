@@ -647,3 +647,25 @@ async def test_health_check_asks_where_the_server_listens(tmp_path, monkeypatch)
         monkeypatch.setenv("GRIZZLE_PORT", str(free_port()))
         assert await asyncio.to_thread(healthcheck.main) == 1
     assert 'CMD ["python", "-m", "grizzle_local.healthcheck"]' in (ROOT / "Dockerfile").read_text()
+
+
+async def test_no_charger_is_admitted_once_shutdown_has_begun(tmp_path, monkeypatch):
+    """A handshake that is waiting on the liveness probe when shutdown starts used to be connected
+    after "every connection" had been closed: nothing closed that one, and exit waited ten seconds."""
+    async with TestServer(make_app(tmp_path)) as ts, TestClient(ts) as client, aiohttp.ClientSession() as session:
+        controller = client.app["controller"]
+        original = type(controller)._refusal
+
+        async def slow_check(self, cp_id, auth_key):  # as the probe of an unresponsive charger would be
+            result = await original(self, cp_id, auth_key)
+            await asyncio.sleep(0.5)
+            return result
+
+        monkeypatch.setattr(type(controller), "_refusal", slow_check)
+        connecting = asyncio.create_task(RawCharger.connect(client, session, SERIAL))
+        await asyncio.sleep(0.2)  # the handshake is inside the admission check...
+        await controller.stop()  # ...when the server begins to stop
+        with pytest.raises(aiohttp.WSServerHandshakeError) as refused:
+            await connecting
+        assert refused.value.status == 503
+        assert controller.connections == {}

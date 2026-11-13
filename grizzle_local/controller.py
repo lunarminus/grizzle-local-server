@@ -517,7 +517,16 @@ class Controller:
           and may replace a station's existing connection only if that one no longer answers.
         - A serial nobody has seen is a new station, and there may only be GRIZZLE_MAX_STATIONS of
           those: whoever can reach the port can invent serials, and each one is kept.
+        - Nobody is admitted while the server is shutting down. The check below can wait seconds
+          for a liveness probe; a handshake let in after stop() has closed "every" connection would
+          be the one nobody closes, and exit would wait out its timeout (past Docker's patience).
         """
+        refusal = await self._refusal(cp_id, auth_key)
+        if refusal is None and self._stopping:
+            return 503, "the server is shutting down"
+        return refusal
+
+    async def _refusal(self, cp_id: str, auth_key: str | None) -> tuple[int, str] | None:
         if self.settings.ocpp_password is not None:
             if not _same_secret(auth_key, self.settings.ocpp_password):
                 return 401, "wrong OCPP password (GRIZZLE_OCPP_PASSWORD)"
