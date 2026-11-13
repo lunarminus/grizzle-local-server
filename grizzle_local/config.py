@@ -6,6 +6,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # Passwords this project has shipped in its documentation or compose file, plus the obvious ones.
 WELL_KNOWN_PASSWORDS = frozenset({"grizzle", "change-me", "changeme", "password", "admin", "admin@local"})
@@ -123,5 +124,12 @@ class Settings:
             warnings.append(
                 "GRIZZLE_FRAME_ANCESTORS=* lets any web site show the page in a frame (clickjacking); "
                 "name the origin that embeds it instead"
+            )
+        try:
+            ZoneInfo(self.timezone)
+        except Exception:  # noqa: BLE001 - unknown name, or not a zone name at all
+            warnings.append(
+                f"timezone {self.timezone[:64]!r} (TZ / GRIZZLE_TIMEZONE) is not a zone this system knows: schedules "
+                "and rates for new stations will be evaluated in UTC. Use a name such as America/Denver"
             )
         return warnings

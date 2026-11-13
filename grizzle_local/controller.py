@@ -216,6 +216,7 @@ class Controller:
         self._last_pin_save = float("-inf")
         self._admission_locks: dict[str, tuple[asyncio.Lock, int]] = {}  # id -> (lock, users)
         self._stopping = False
+        self._unknown_zones: set[Any] = set()  # timezone names already reported as unusable
         self._sanitize_state()
 
     # --- station state helpers ---------------------------------------------
@@ -284,9 +285,19 @@ class Controller:
         return connectors[key]
 
     def tz(self, station: dict[str, Any]) -> ZoneInfo:
+        name = station.get("timezone") or self.settings.timezone
         try:
-            return ZoneInfo(station.get("timezone") or self.settings.timezone)
+            return ZoneInfo(name)
         except Exception:  # noqa: BLE001 - bad tz name in state
+            if name not in self._unknown_zones:
+                # Once per name: this is asked on every tick, but silently charging on UTC's clock
+                # instead of the owner's is exactly the kind of thing a log should mention.
+                self._unknown_zones.add(name)
+                _LOGGER.warning(
+                    "%s: timezone %s is not known here; evaluating schedules and rates in UTC",
+                    printable(station.get("id"), 80),
+                    printable(name, 64),
+                )
             return ZoneInfo("UTC")
 
     # --- state from disk ------------------------------------------------------
@@ -381,9 +392,14 @@ class Controller:
                 )
 
         zones = []
+        limits = {"max_connector": MAX_CONNECTORS, "max_current": MAX_CURRENT}
         for zone in station.get("pricesByZone") if isinstance(station.get("pricesByZone"), list) else []:
             try:
-                clean = normalize_zone(zone, max_connector=MAX_CONNECTORS, max_current=MAX_CURRENT)
+                try:
+                    clean = normalize_zone(zone, **limits)
+                except ValueError:
+                    # Refused as it stands; mend what the old code merely tolerated before giving up.
+                    clean = normalize_zone(self._mended_zone(zone), **limits)
                 clean["_id"] = parse_zone_id(zone.get("_id"))
             except ValueError as err:
                 _LOGGER.warning("%s: dropping an unusable schedule/rate zone from the saved state: %s", station_id, err)
@@ -396,6 +412,27 @@ class Controller:
             except (TypeError, ValueError, AttributeError) as err:
                 _LOGGER.warning("%s: dropping unusable holiday settings from the saved state: %s", station_id, err)
                 del station["holidaysSettings"]
+
+    @staticmethod
+    def _mended_zone(zone: Any) -> Any:
+        """A saved zone with the values an older version accepted, and coped with, brought into range.
+
+        Only what leaves the zone meaning the same: an over-long name is cut, a current limit beyond
+        the bounds is clamped (the old code clamped it when applying it), day numbers that never
+        matched any day are removed. A zone that is still refused after this (a word where an hour
+        belongs) is dropped by the caller: guessing its times could turn it into an all-day window.
+        """
+        if not isinstance(zone, dict):
+            return zone
+        mended = dict(zone)
+        if isinstance(mended.get("name"), str):
+            mended["name"] = mended["name"].strip()[:MAX_NAME_LENGTH]
+        if "currentLimit" in mended:
+            limit = _reading(mended["currentLimit"])
+            mended["currentLimit"] = None if limit is None or limit <= 0 else min(max(limit, 1), MAX_CURRENT)
+        if isinstance(mended.get("days"), list):
+            mended["days"] = [d for d in mended["days"] if _small_int(d, 0, 6) is not None]
+        return mended
 
     # --- holidays, windows and prices -------------------------------------------
 

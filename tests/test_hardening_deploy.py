@@ -497,3 +497,92 @@ async def test_tls_reaches_a_plain_listener_that_is_not_on_ipv4_loopback(tmp_pat
     finally:
         os.kill(os.getpid(), signal.SIGTERM)
         await asyncio.wait_for(server, 8)
+
+
+# --- the certificate script -------------------------------------------------------------------------
+
+
+def test_generated_certificate_is_a_server_certificate_not_a_ca(certs):
+    """`openssl req -x509` makes a CA by default: whoever copied privkey.pem could have signed
+    certificates for any site, valid wherever this certificate had been trusted."""
+    text = subprocess.run(
+        ["openssl", "x509", "-in", str(certs[0]), "-noout", "-text"], check=True, capture_output=True, text=True
+    ).stdout
+    assert "CA:FALSE" in text and "CA:TRUE" not in text
+    assert "TLS Web Server Authentication" in text
+    assert "DNS:ocpp.unitedchargers.com" in text and "DNS:connect-api.unitedchargers.com" in text
+    assert stat.S_IMODE(certs[1].stat().st_mode) == 0o600
+
+
+# --- tools/poc_n1_unauth_webui.py --------------------------------------------------------------------
+
+
+class _WebUi(BaseHTTPRequestHandler):
+    control_status = 200
+
+    def log_message(self, *args):
+        pass
+
+    def _answer(self):
+        if self.path in ("/ocppconfig", "/service"):
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="Please enter login and password"')
+        elif self.control_status == 302:
+            self.send_response(302)
+            self.send_header("Location", "/login-page")
+        elif self.path == "/login-page":
+            self.send_response(200)
+        else:
+            self.send_response(self.control_status)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    do_GET = do_POST = _answer  # noqa: N815
+
+
+@pytest.mark.parametrize(
+    "status,expected_exit,verdict",
+    [
+        (200, 2, "N1 CONFIRMED"),
+        (401, 0, "N1 not reproduced"),
+        (403, 3, "inconclusive"),  # refused is not "processed without auth"
+        (404, 3, "inconclusive"),
+        (500, 3, "inconclusive"),
+        (302, 3, "inconclusive"),  # a redirect to a login page must not be followed and counted as 200
+    ],
+)
+def test_n1_poc_only_counts_a_success_as_confirmation(monkeypatch, capsys, status, expected_exit, verdict):
+    import poc_n1_unauth_webui as poc
+
+    handler = type("Handler", (_WebUi,), {"control_status": status})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+        monkeypatch.setenv("no_proxy", "127.0.0.1")
+        monkeypatch.setattr(sys, "argv", ["poc", "--host", "127.0.0.1", "--port", str(server.server_address[1])])
+        assert poc.main() == expected_exit
+    finally:
+        server.shutdown()
+    assert verdict in capsys.readouterr().out
+
+
+# --- firmware_capture keeps a refreshed token ---------------------------------------------------------
+
+
+def test_a_refreshed_cloud_token_is_written_back(tmp_path):
+    token_file = tmp_path / "tokens.json"
+    token_file.write_text(json.dumps({"token": "expired", "refreshToken": "single-use"}))
+
+    class Cloud(fc.CloudClient):
+        def _raw(self, method, path, body=None, auth=True):
+            if path == "/client/auth/refresh-token":
+                return 200, {"token": "fresh", "refreshToken": "next"}
+            return (200, {"stations": []}) if self.token == "fresh" else (401, {"message": "expired"})
+
+    client = Cloud()
+    client.token, client.refresh_token = fc.load_token_file(token_file)
+    client.token_file = token_file
+    assert client.stations() == []
+    assert json.loads(token_file.read_text()) == {"token": "fresh", "refreshToken": "next"}
+    assert stat.S_IMODE(token_file.stat().st_mode) == 0o600

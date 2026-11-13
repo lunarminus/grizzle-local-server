@@ -18,6 +18,11 @@ capture` impersonates **your** station to the cloud (serial + the OCPP Auth key 
     --state data/state.json --claim-firmware UDGRW070L-04.00.0 --out firmware
 ```
 
+`data/state.json` is readable only by the user the server runs as (it holds that Auth key and the
+API sessions); since 0.7.0 that is uid 10001 in the container. Run the capture as that user or with
+`sudo`, or inside the container: `docker exec grizzle-local python tools/firmware_capture.py capture
+--out /data/firmware`. Only `ftp`, `http` and `https` locations are downloaded, up to `--max-size`.
+
 ## What the Duo image is (UDGRW070L-04.03.2)
 
 - Delivered over **FTP** (`ftp://<do-host>/files/UDGRW070L-04.03.2.bin`), ~3.29 MB.

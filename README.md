@@ -302,11 +302,27 @@ What the server assumes and what it does about it:
 - **Logs** escape control characters in everything that came off the network, so a serial or OCPP
   field can't forge a log line.
 
-Upgrading from 0.6.0 to 0.7.0: the data volume is handed over to uid 10001 on first start; a state file
-written by the old version is repaired on load (impossible connector counts, malformed schedules
-and the like are dropped with a warning); the web page can no longer be framed by other sites
-unless `GRIZZLE_FRAME_ANCESTORS` says so; `/health` no longer lists serials without a token; and
-`?token=` in the URL no longer authenticates.
+### Upgrading from 0.6.0
+
+Nothing needs to be migrated by hand, but a few things behave differently on purpose:
+
+- **Container user.** The data volume is handed over to uid 10001 on first start and its files
+  become owner-only. Reading `data/state.json` from the host (for `tools/firmware_capture.py`, say)
+  now needs that user or `sudo`.
+- **Saved state is repaired on load.** Values the old version stored as it received them (an
+  impossible connector count, a schedule with something other than a time in it) are mended or
+  dropped, with a warning in the log saying what and why. Sessions, schedules, rates, pinned Auth
+  keys and sign-ins are kept.
+- **Framing.** Other sites can no longer show the web page in a frame. For a Home Assistant
+  *Webpage* card set `GRIZZLE_FRAME_ANCESTORS` to Home Assistant's address.
+- **Public host names.** If you open the page under a public DNS name (through a reverse proxy,
+  for instance), list it in `GRIZZLE_ALLOWED_HOSTS`; until then the page loads but signing in
+  answers 403. Addresses and LAN-only names need nothing.
+- **API details.** `/health` lists serials only for a signed-in caller; `?token=` in the URL no
+  longer authenticates; a refresh token expires after 30 days; changing the password signs
+  everyone out; requests that used to be accepted and then misbehave (a connector that doesn't
+  exist, a schedule with `"days": [7]`, a price of `NaN`) now get a `400`.
+- **Stations.** At most 16 can exist unless `GRIZZLE_MAX_STATIONS` says otherwise.
 
 ## Development
 

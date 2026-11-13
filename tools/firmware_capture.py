@@ -75,6 +75,7 @@ class CloudClient:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.refresh_token = refresh_token
+        self.token_file: Path | None = None  # where the tokens were loaded from, if they were
 
     # --- transport ---------------------------------------------------------
 
@@ -121,6 +122,9 @@ class CloudClient:
         if status >= 400 or not isinstance(data, dict) or "token" not in data:
             raise CloudError(f"token refresh failed (HTTP {status}); log in again")
         self._store(data)
+        if self.token_file is not None:
+            # A refresh token is good for one use: the pair on disk is dead now. Keep the new one.
+            save_token_file(self.token_file, self)
         return data
 
     def _store(self, data: dict) -> None:
@@ -179,6 +183,7 @@ def make_client(args: argparse.Namespace) -> CloudClient:
             save_token_file(Path(args.token_file), client)
     else:
         client.token, client.refresh_token = load_token_file(Path(args.token_file))
+        client.token_file = Path(args.token_file)
     return client
 
 

@@ -679,3 +679,27 @@ async def test_odd_content_types_are_not_server_errors(server, content_type):
     body = json.dumps({"emailOrPhone": EMAIL, "password": "wrong"}).encode()
     resp = await server.post("/client/auth/login", data=body, headers={"Content-Type": content_type})
     assert resp.status in (400, 401), resp.status
+
+
+# --- a timezone the system doesn't know -------------------------------------------------------------
+
+
+def test_an_unknown_timezone_is_reported_not_silently_utc(tmp_path, caplog):
+    """TZ=US/Mountain on an image without the legacy zone names, or a typo: schedules were quietly
+    evaluated in UTC, hours away from the owner's clock."""
+    from grizzle_local.controller import Controller
+    from grizzle_local.store import Store
+
+    settings = Settings(data_dir=tmp_path / "data", timezone="Mars/Olympus_Mons", api_password="a long passphrase")
+    assert any("Mars/Olympus_Mons" in warning and "UTC" in warning for warning in settings.security_warnings())
+    assert not Settings(timezone="America/Denver", api_password="a long passphrase").security_warnings()
+    # An old alias that the base image's zone database no longer carries: the tzdata dependency does.
+    assert not Settings(timezone="US/Mountain", api_password="a long passphrase").security_warnings()
+
+    caplog.set_level(logging.WARNING)
+    controller = Controller(settings, Store(settings.data_dir))
+    station = controller._ensure_station(SERIAL)
+    for _ in range(5):
+        assert str(controller.tz(station)) == "UTC"
+    reports = [r for r in caplog.records if "Mars/Olympus_Mons" in r.getMessage()]
+    assert len(reports) == 1  # said once, not on every tick

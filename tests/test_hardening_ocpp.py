@@ -161,7 +161,14 @@ async def test_poisoned_state_file_is_repaired_at_startup(tmp_path, caplog):
                     "x": {},
                     "03": {"id": 3},
                 },
-                "pricesByZone": [good_zone, {"_id": "bad", "startHours": "soon"}, "junk", {"name": "no id"}],
+                "pricesByZone": [
+                    good_zone,
+                    {"_id": "bad", "startHours": "soon"},
+                    "junk",
+                    {"name": "no id"},
+                    # Values the old code accepted and coped with are mended, not thrown away:
+                    {"_id": "mend1", "name": "n" * 300, "isSchedule": True, "currentLimit": 120, "days": [1, 7, 9]},
+                ],
                 "holidaysSettings": {"enabled": True, "country": 12},
             },
             "GRD-BROKEN": "not a station",
@@ -187,7 +194,9 @@ async def test_poisoned_state_file_is_repaired_at_startup(tmp_path, caplog):
         assert station["config"]["NumberOfConnectors"] == "2" and len(station["config"]["Huge"]) == 500
         assert station["config"]["Nested"] is None
         assert len(station["dataTransfers"][0]["data"]) == 1000
-        assert [z["_id"] for z in station["pricesByZone"]] == ["abc123"]
+        assert [z["_id"] for z in station["pricesByZone"]] == ["abc123", "mend1"]
+        mended = station["pricesByZone"][1]
+        assert len(mended["name"]) == 100 and mended["currentLimit"] == 100 and mended["days"] == [1]
         assert "holidaysSettings" not in station
         assert client.app["controller"].store.state["tokens"] == {}
 
