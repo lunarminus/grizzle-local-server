@@ -31,10 +31,15 @@ _LOGGER = logging.getLogger(__name__)
 TOKEN_TTL = 7 * 24 * 3600  # how long a bearer token works
 REFRESH_TTL = 30 * 24 * 3600  # how long its refresh token can still get a new one
 MAX_TOKENS = 100  # sessions kept; the oldest make room
-PUBLIC_PATHS = ("/client/auth/login", "/client/auth/refresh-token", "/health", "/")
-# Failed sign-ins allowed per client address within the window, before it has to wait.
+# Logout is public on purpose: a session whose token has just expired must still be endable (its
+# refresh token lives on for weeks). Tokens are unguessable, so there is nothing to protect here.
+PUBLIC_PATHS = ("/client/auth/login", "/client/auth/refresh-token", "/client/auth/logout", "/health", "/")
+# Failed sign-ins allowed per client within the window before it has to wait, and from all clients
+# together before sign-in closes for clients that have never signed in successfully.
 LOGIN_MAX_FAILURES = 10
+LOGIN_MAX_TOTAL_FAILURES = 200
 LOGIN_WINDOW_SECONDS = 300
+MAX_SESSION_ROWS = 1000  # most sessions one request returns
 MAX_OCPP_CALL_TIMEOUT = 120.0
 # PBKDF2-HMAC-SHA256 rounds for the mark that tells us the sign-in credentials have changed.
 CREDENTIAL_ROUNDS = 600_000
@@ -46,9 +51,14 @@ PRIVATE_NAME_SUFFIXES = (
     ".home.arpa",
     ".internal",
     ".intranet",
+    ".corp",
     ".localdomain",
     ".localhost",
+    ".test",
 )
+# The names the charger calls us by (and the certificate from scripts/make-cert.sh is for). Only a
+# DNS override on the owner's own network makes them lead here.
+VENDOR_HOSTS = ("ocpp.unitedchargers.com", "connect-api.unitedchargers.com")
 _INTEGER_RE = re.compile(r"-?[0-9]{1,10}")
 
 
@@ -219,42 +229,82 @@ def build_station(controller: Controller, station: dict[str, Any]) -> dict[str, 
 
 
 class LoginThrottle:
-    """Slows password guessing: a client address gets a few failures per window, then has to wait.
+    """Slows password guessing.
 
-    Per address, so one noisy client can't lock everybody else out; bounded, so inventing
-    addresses can't grow it without limit.
+    - Per client: a few failures per window, then that client waits. IPv6 clients are counted by
+      their /64, since one machine can use any address in its own.
+    - Overall: when failures pour in from many clients at once, sign-in closes for every client
+      that has not signed in successfully before. The owner's usual address keeps working, and
+      sessions that already exist are not affected at all.
     """
 
     MAX_CLIENTS = 4096
+    MAX_KNOWN = 256
 
-    def __init__(self, max_failures: int = LOGIN_MAX_FAILURES, window: float = LOGIN_WINDOW_SECONDS) -> None:
+    def __init__(
+        self,
+        max_failures: int = LOGIN_MAX_FAILURES,
+        window: float = LOGIN_WINDOW_SECONDS,
+        max_total: int = LOGIN_MAX_TOTAL_FAILURES,
+    ) -> None:
         self.max_failures = max_failures
         self.window = window
+        self.max_total = max_total
         self._failures: dict[str, deque[float]] = {}
+        self._all: deque[float] = deque(maxlen=max_total)
+        self._known: dict[str, None] = {}  # clients that have signed in (a dict for its insertion order)
 
-    def retry_after(self, client: str, now: float | None = None) -> int:
-        """Seconds this client must wait before trying again; 0 if it may try now."""
-        now = time.monotonic() if now is None else now
-        failures = self._failures.get(client)
+    @staticmethod
+    def key(client: str) -> str:
+        """What counts as one client: an IPv4 address, or an IPv6 /64."""
+        try:
+            address = ipaddress.ip_address(client.split("%", 1)[0])
+        except ValueError:
+            return client
+        if address.version == 4:
+            return str(address)
+        if address.ipv4_mapped is not None:
+            return str(address.ipv4_mapped)  # ::ffff:192.0.2.1 is the IPv4 client 192.0.2.1
+        return f"{ipaddress.ip_network((address, 64), strict=False).network_address}/64"
+
+    def _wait(self, failures: deque[float] | None, limit: int, now: float) -> int:
         if not failures:
             return 0
         while failures and now - failures[0] >= self.window:
             failures.popleft()
-        if not failures:
-            del self._failures[client]
-            return 0
-        if len(failures) < self.max_failures:
+        if len(failures) < limit:
             return 0
         return max(1, math.ceil(self.window - (now - failures[0])))
 
+    def retry_after(self, client: str, now: float | None = None) -> int:
+        """Seconds this client must wait before trying again; 0 if it may try now."""
+        now = time.monotonic() if now is None else now
+        key = self.key(client)
+        wait = self._wait(self._failures.get(key), self.max_failures, now)
+        if key in self._failures and not self._failures[key]:
+            del self._failures[key]
+        if not wait and key not in self._known:
+            wait = self._wait(self._all, self.max_total, now)
+        return wait
+
     def failed(self, client: str, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
-        if client not in self._failures and len(self._failures) >= self.MAX_CLIENTS:
-            del self._failures[next(iter(self._failures))]  # the one that has gone longest without a new entry
-        self._failures.setdefault(client, deque(maxlen=self.max_failures)).append(now)
+        key = self.key(client)
+        if key not in self._failures and len(self._failures) >= self.MAX_CLIENTS:
+            # Make room, but not by forgetting a client that is locked out right now if there is
+            # any other: otherwise a crowd of addresses would be a way to reset one's own count.
+            idle = (k for k, f in self._failures.items() if not self._wait(f, self.max_failures, now))
+            del self._failures[next(idle, next(iter(self._failures)))]
+        self._failures.setdefault(key, deque(maxlen=self.max_failures)).append(now)
+        self._all.append(now)
 
     def succeeded(self, client: str) -> None:
-        self._failures.pop(client, None)
+        key = self.key(client)
+        self._failures.pop(key, None)
+        self._known.pop(key, None)
+        self._known[key] = None
+        while len(self._known) > self.MAX_KNOWN:
+            del self._known[next(iter(self._known))]
 
 
 def origin_allowed(origin: str, host_header: str, allowed_hosts: tuple[str, ...]) -> bool:
@@ -277,7 +327,9 @@ def origin_allowed(origin: str, host_header: str, allowed_hosts: tuple[str, ...]
         return False
     if parts.scheme not in ("http", "https") or not host:
         return False  # "null" (a sandboxed frame, a local file), browser extensions, anything else
-    if host in allowed_hosts or any(host.endswith(suffix) for suffix in allowed_hosts if suffix.startswith(".")):
+    if host in allowed_hosts or host in VENDOR_HOSTS:
+        return True
+    if any(host.endswith(suffix) for suffix in allowed_hosts if suffix.startswith(".")):
         return True
     try:
         address = ipaddress.ip_address(host)
@@ -318,7 +370,8 @@ class Auth:
         saved = state.get("credentials")
         if isinstance(saved, dict) and isinstance(saved.get("salt"), str) and isinstance(saved.get("mark"), str):
             try:
-                same = secrets.compare_digest(self._credentials_mark(bytes.fromhex(saved["salt"])), saved["mark"])
+                mark = self._credentials_mark(bytes.fromhex(saved["salt"]))
+                same = secrets.compare_digest(mark.encode(), saved["mark"].encode("utf-8", "surrogatepass"))
             except ValueError:
                 same = False
             if same:
@@ -328,7 +381,15 @@ class Auth:
                     "the API email or password has changed: signing out %d existing session(s)", len(self._tokens)
                 )
                 self._tokens.clear()
-        # First run with this check (sessions are kept: an upgrade is not a password change), or new credentials.
+        elif self._tokens:
+            # Sessions from a version that kept no mark. Nothing says which password they were
+            # signed in with (it may be the one that was just changed, in this very restart), and
+            # their tokens may have travelled in URLs. Everyone signs in once more.
+            _LOGGER.warning(
+                "signing out %d session(s) saved by an earlier version: sign in again (Home Assistant does so itself)",
+                len(self._tokens),
+            )
+            self._tokens.clear()
         salt = secrets.token_bytes(16)
         state["credentials"] = {"salt": salt.hex(), "mark": self._credentials_mark(salt)}
         self.controller.mark_dirty()
@@ -375,9 +436,14 @@ class Auth:
         info = self._tokens.get(token) if token else None
         return bool(info) and info["expires"] > time.time()
 
-    def revoke(self, token: str) -> None:
-        """Forget a session: neither its token nor its refresh token works afterwards."""
-        if self._tokens.pop(token, None) is not None:
+    def revoke(self, token: str = "", refresh_token: str = "") -> None:
+        """Forget a session, named by its token or its refresh token: neither works afterwards."""
+        doomed = [token] if token in self._tokens else []
+        if refresh_token:
+            doomed += [t for t, info in self._tokens.items() if _same_secret(refresh_token, info["refresh"])]
+        for found in doomed:
+            self._tokens.pop(found, None)
+        if doomed:
             self.controller.mark_dirty()
 
     def _gc(self) -> None:
@@ -457,16 +523,23 @@ def _refuse_origin(request: web.Request) -> web.Response | None:
     settings = request.app["settings"]
     if origin_allowed(origin, request.headers.get("Host", ""), settings.allowed_hosts):
         return None
+    try:
+        name = printable(urlsplit(origin).hostname or origin, 100)
+    except ValueError:
+        name = printable(origin, 100)
     _LOGGER.warning(
-        "refused %s %s from a web page at %s (not this server's own address; see GRIZZLE_ALLOWED_HOSTS)",
+        "refused %s %s from a web page at %s. If that is how you open this server, set GRIZZLE_ALLOWED_HOSTS=%s "
+        "(names with a dot that are not LAN-only by their ending have to be listed; it guards against DNS rebinding)",
         request.method,
         printable(request.path, 100),
         printable(origin, 100),
+        name,
     )
     return _json_error(
         403,
-        f"Requests from the web page at {printable(origin, 100)} are not accepted. If you open this server "
-        "under that name on purpose, add the name to GRIZZLE_ALLOWED_HOSTS.",
+        f"This server does not accept requests from a page opened as {name}. If that is how you open it, set "
+        f"GRIZZLE_ALLOWED_HOSTS={name} in the server's configuration and restart it; opening the page by its IP "
+        "address works without that.",
     )
 
 
@@ -478,8 +551,12 @@ async def _body(request: web.Request) -> dict[str, Any]:
         return {}
     try:
         data = await request.json()
-    except (ValueError, RecursionError, LookupError):
-        # RecursionError: thousands of nested brackets. LookupError: "charset=no-such-codec".
+    except web.HTTPException:
+        raise  # 413 for a body over the size limit, and the like
+    except Exception:  # noqa: BLE001
+        # Not JSON, thousands of nested brackets (RecursionError), "charset=no-such-codec"
+        # (LookupError), a Content-Encoding the body doesn't match (aiohttp's payload errors)...
+        # however a body fails to read, it is the sender's mistake, not a server error.
         raise _bad_request("invalid JSON") from None
     return data if isinstance(data, dict) else {}
 
@@ -515,15 +592,24 @@ def _whole(value: Any, name: str, lo: int, hi: int, default: int | None = None) 
     return number
 
 
+def _row_limit(request: web.Request, default: int) -> int:
+    """``?limit=``: any whole number, brought into 1..MAX_SESSION_ROWS (as before); anything else is a 400."""
+    asked = _whole(request.query.get("limit"), "limit", -(10**9), 10**9, default=default)
+    return max(1, min(asked, MAX_SESSION_ROWS))
+
+
 async def login(request: web.Request) -> web.Response:
     auth: Auth = request.app["auth"]
     client = client_ip(request)
+    # The body first. From here to the end nothing awaits, so checking the limit, comparing and
+    # recording the outcome are one step: asked before the body was read, a hundred requests
+    # held open together would all have been let through before any of them had failed.
+    body = await _body(request)
     wait = auth.throttle.retry_after(client)
     if wait:
         return _json_error(
             429, "Too many failed sign-in attempts. Try again later.", headers={"Retry-After": str(wait)}
         )
-    body = await _body(request)
     settings = _controller(request).settings
     email = str(body.get("emailOrPhone") or body.get("email") or "").strip().lower()
     password = str(body.get("password") or "")
@@ -549,7 +635,13 @@ async def refresh_token(request: web.Request) -> web.Response:
 
 
 async def logout(request: web.Request) -> web.Response:
-    request.app["auth"].revoke(_bearer(request))
+    """End a session, given its token (the Authorization header) or ``{"refreshToken": ...}``.
+
+    Always 200: an expired or unknown token simply has no session left to end.
+    """
+    body = await _body(request)
+    refresh = body.get("refreshToken")
+    request.app["auth"].revoke(_bearer(request), refresh if isinstance(refresh, str) else "")
     return _json({})
 
 
@@ -657,7 +749,7 @@ async def reboot(request: web.Request) -> web.Response:
 
 async def events(request: web.Request) -> web.Response:
     station = _station_or_404(request)
-    limit = _whole(request.query.get("limit"), "limit", 1, 1000, default=50)
+    limit = _row_limit(request, 50)
     return _json({"sessions": _controller(request).store.sessions(station["id"], limit)})
 
 
@@ -684,7 +776,7 @@ async def local_sessions(request: web.Request) -> web.Response:
     """Session history for the web page: finished sessions plus the ones in progress, with totals."""
     station = _station_or_404(request)
     controller = _controller(request)
-    limit = _whole(request.query.get("limit"), "limit", 1, 1000, default=100)
+    limit = _row_limit(request, 100)
     live = {
         int(c["transaction"]["id"]): c["transaction"] for c in station["connectors"].values() if c.get("transaction")
     }
@@ -775,7 +867,7 @@ async def local_holiday_countries(request: web.Request) -> web.Response:
 async def local_log(request: web.Request) -> web.Response:
     station = _station_or_404(request)
     conn = _controller(request).connections.get(station["id"])
-    return _json({"online": conn is not None, "frames": list(conn.log) if conn else []})
+    return _json({"online": conn is not None, "frames": conn.frames() if conn else []})
 
 
 async def local_ocpp_call(request: web.Request) -> web.Response:

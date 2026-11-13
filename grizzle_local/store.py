@@ -17,6 +17,11 @@ _LOGGER = logging.getLogger(__name__)
 
 # state.json holds the API's bearer tokens and the charger's cloud Auth key: owner-only.
 PRIVATE_FILE = 0o600
+# History kept per station, whatever its age. A charger reporting every 30 s fills about a
+# quarter of this in the 90 days samples are kept for; what a station sends beyond it replaces
+# its own oldest rows instead of growing the database without end.
+MAX_SAMPLES_PER_STATION = 1_000_000
+MAX_SESSIONS_PER_STATION = 100_000
 
 
 def _finite(value: Any) -> Any:
@@ -51,7 +56,9 @@ class Store:
             and isinstance(info.get("refresh"), str)
             and isinstance(info.get("expires"), (int, float))
             and not isinstance(info.get("expires"), bool)
+            and (info.get("refreshExpires") is None or type(info["refreshExpires"]) in (int, float))
         }
+        self._sample_counts: dict[str, int] = {}  # rows per station, counted once and kept up to date
         self._lock = threading.Lock()
         db_path = data_dir / "history.sqlite"
         self._db = sqlite3.connect(db_path, check_same_thread=False)
@@ -81,11 +88,15 @@ class Store:
             backup = self._state_path.with_suffix(".corrupt.json")
             _LOGGER.error("state.json is corrupt, moving it to %s", backup)
             os.replace(self._state_path, backup)
+            _restrict(backup)  # it may still hold sessions and the charger's Auth key
             return {}
 
     def save(self) -> None:
         tmp = self._state_path.with_suffix(".tmp")
-        payload = json.dumps(self.state, indent=1, sort_keys=True)
+        # No sort_keys: sorting compares the keys, and one stray non-string key next to string ones
+        # (it happened: a number as a configuration key) makes that raise on every save from then on.
+        # Unsorted, json writes such a key as its string and carries on.
+        payload = json.dumps(self.state, indent=1)
         with self._lock:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE)
             with os.fdopen(fd, "w") as handle:
@@ -99,7 +110,15 @@ class Store:
             os.replace(tmp, self._state_path)
 
     def next_transaction_id(self) -> int:
-        tid = int(self.state.get("next_transaction_id", 1))
+        """A transaction id no recorded session has, whatever state.json remembers.
+
+        The counter is saved with the rest of the state, a few seconds after the session row is
+        committed: after a crash in between (or a lost state file) it is behind the history.
+        """
+        counter = self.state.get("next_transaction_id")
+        counter = counter if isinstance(counter, int) and not isinstance(counter, bool) and counter >= 1 else 1
+        newest = self._db.execute("SELECT MAX(id) FROM sessions").fetchone()[0]
+        tid = max(counter, (newest or 0) + 1)
         self.state["next_transaction_id"] = tid + 1
         return tid
 
@@ -153,8 +172,10 @@ class Store:
         price_kwh: float | None,
     ) -> None:
         with self._db:
+            # A plain INSERT: ids are never reused, and if one ever were, failing here is better
+            # than quietly replacing a recorded session.
             self._db.execute(
-                "INSERT OR REPLACE INTO sessions(id, station, connector, id_tag, start_at, meter_start, price_kwh)"
+                "INSERT INTO sessions(id, station, connector, id_tag, start_at, meter_start, price_kwh)"
                 " VALUES (?,?,?,?,?,?,?)",
                 (tid, station, connector, id_tag, start_at, meter_start, price_kwh),
             )
@@ -168,11 +189,14 @@ class Store:
         duration_s: int | None,
         cost: float | None,
         reason: str | None,
+        price_kwh: float | None = None,
     ) -> None:
+        """Close a session. ``price_kwh`` (the average it was charged at) replaces the starting price if given."""
         with self._db:
             self._db.execute(
-                "UPDATE sessions SET stop_at=?, meter_stop=?, energy_wh=?, duration_s=?, cost=?, reason=? WHERE id=?",
-                (stop_at, meter_stop, energy_wh, duration_s, cost, reason, tid),
+                "UPDATE sessions SET stop_at=?, meter_stop=?, energy_wh=?, duration_s=?, cost=?, reason=?,"
+                " price_kwh=COALESCE(?, price_kwh) WHERE id=?",
+                (stop_at, meter_stop, energy_wh, duration_s, cost, reason, price_kwh, tid),
             )
 
     def add_sample(self, station: str, connector: int, tid: int | None, at: str, values: dict[str, Any]) -> None:
@@ -202,6 +226,26 @@ class Store:
                     for station, connector, tid, at, values in rows
                 ],
             )
+        for station in {row[0] for row in rows}:
+            self._trim_samples(station, sum(1 for row in rows if row[0] == station))
+
+    def _trim_samples(self, station: str, added: int) -> None:
+        """Keep a station within MAX_SAMPLES_PER_STATION (plus a tenth of slack, so trimming is rare)."""
+        count = self._sample_counts.get(station)
+        if count is None:
+            count = self._db.execute("SELECT COUNT(*) FROM samples WHERE station=?", (station,)).fetchone()[0]
+        else:
+            count += added
+        excess = count - MAX_SAMPLES_PER_STATION
+        if excess > MAX_SAMPLES_PER_STATION // 10:
+            with self._db:
+                self._db.execute(
+                    "DELETE FROM samples WHERE rowid IN"
+                    " (SELECT rowid FROM samples WHERE station=? ORDER BY at LIMIT ?)",
+                    (station, excess),
+                )
+            count -= excess
+        self._sample_counts[station] = count
 
     def sessions(self, station: str, limit: int = 50) -> list[dict[str, Any]]:
         rows = self._db.execute(
@@ -250,6 +294,25 @@ class Store:
         cutoff = (datetime.now(UTC) - timedelta(days=keep_days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
         with self._db:
             self._db.execute("DELETE FROM samples WHERE at < ?", (cutoff,))
+            # Sessions are kept for good, up to a number no real charger reaches in decades.
+            crowded = self._db.execute(
+                "SELECT station, COUNT(*) FROM sessions GROUP BY station HAVING COUNT(*) > ?",
+                (MAX_SESSIONS_PER_STATION,),
+            ).fetchall()
+            for station, count in crowded:
+                self._db.execute(
+                    "DELETE FROM sessions WHERE id IN"
+                    " (SELECT id FROM sessions WHERE station=? AND stop_at IS NOT NULL ORDER BY start_at LIMIT ?)",
+                    (station, count - MAX_SESSIONS_PER_STATION),
+                )
+        self._sample_counts.clear()  # recount after pruning
+
+    def delete_history(self, station: str) -> None:
+        """Remove everything recorded for a station (it is being forgotten)."""
+        with self._db:
+            self._db.execute("DELETE FROM samples WHERE station=?", (station,))
+            self._db.execute("DELETE FROM sessions WHERE station=?", (station,))
+        self._sample_counts.pop(station, None)
 
     def close(self) -> None:
         self._db.close()

@@ -512,10 +512,11 @@ async def test_large_frames_are_not_kept_in_the_frame_log(server, session):
     try:
         for _ in range(5):
             assert (await cp.call("DataTransfer", {"vendorId": "v", "data": "x" * 100_000}))[0] == 3
-        log = list(controller.connections[SERIAL].log)
-        kept = sum(len(json.dumps(entry["data"])) for entry in log)
-        assert kept < 5_000
-        assert any(entry["data"].get("bytes", 0) > 100_000 for entry in log if isinstance(entry["data"], dict))
+        conn = controller.connections[SERIAL]
+        assert sum(len(entry["text"]) for entry in conn.log) < 5_000  # what is actually held in memory
+        frames = conn.frames()
+        assert any(entry["data"].get("bytes", 0) > 100_000 for entry in frames if isinstance(entry["data"], dict))
+        assert any(entry["label"] == "-> result DataTransfer" and entry["data"][0] == 3 for entry in frames)
         stored = controller.station(SERIAL)["dataTransfers"]
         assert len(stored) == 5 and all(len(item["data"]) == 1000 for item in stored)
     finally:
@@ -928,3 +929,205 @@ async def test_recalculating_costs_uses_one_transaction_and_the_index(tmp_path):
     assert len(commits) == 1
     assert all(s["cost"] == pytest.approx(0.6) for s in store.sessions(SERIAL, 1000))
     assert station["id"] == SERIAL
+
+
+# --- found reviewing the fixes above ---------------------------------------------------------------
+
+
+async def test_a_lifetime_reading_rounded_just_below_meter_start_is_still_lifetime(tmp_path):
+    """Deciding the register convention once must not hinge on rounding: a charger that reports the
+    lifetime register in kWh with one decimal starts a hair below the exact meterStart."""
+    controller = _controller(tmp_path)
+    station = controller._ensure_station(SERIAL)
+    await controller._on_StartTransaction(station, {"connectorId": 1, "idTag": "t", "meterStart": 819_392})
+
+    def reading(kwh: str) -> dict:
+        sampled = [{"value": kwh, "measurand": "Energy.Active.Import.Register", "unit": "kWh"}]
+        return {"connectorId": 1, "meterValue": [{"sampledValue": sampled}]}
+
+    await controller._on_MeterValues(station, reading("819.3"))  # 92 Wh "below" the start
+    tx = station["connectors"]["1"]["transaction"]
+    assert tx["sessionRelativeRegister"] is False and tx["energy"] == 0
+    await controller._on_MeterValues(station, reading("821.4"))
+    assert tx["energy"] == pytest.approx(2008)  # not 821 400
+
+    # A register that really counts from zero is still recognised, next to a small lifetime total too.
+    for meter_start, first in ((819_392, "0"), (5000, "0.01"), (300, "0")):
+        controller = _controller(tmp_path / str(meter_start))
+        station = controller._ensure_station(SERIAL)
+        await controller._on_StartTransaction(station, {"connectorId": 1, "idTag": "t", "meterStart": meter_start})
+        await controller._on_MeterValues(station, reading(first))
+        assert station["connectors"]["1"]["transaction"]["sessionRelativeRegister"] is True, meter_start
+
+
+async def test_a_session_reported_by_an_unset_clock_keeps_its_length(tmp_path):
+    """A charger whose clock was never set (1970) reports a session after the fact. Both ends are
+    stamped with the time we heard of them, milliseconds apart; the charger's clock, wrong date and
+    all, still measured how long the session was."""
+    controller = _controller(tmp_path)
+    station = controller._ensure_station(SERIAL)
+    start = {"connectorId": 1, "idTag": "t", "meterStart": 1000, "timestamp": "1970-01-01T00:10:00Z"}
+    await controller._on_StartTransaction(station, start)
+    stop = {"transactionId": 1, "meterStop": 8000, "timestamp": "1970-01-01T01:40:00Z"}
+    await controller._on_StopTransaction(station, stop)
+    def recorded(tid: int) -> dict:
+        return next(s for s in controller.store.sessions(SERIAL) if s["id"] == tid)
+
+    assert recorded(1)["duration_s"] == 90 * 60
+    assert abs(_parse_iso(recorded(1)["start_at"]).timestamp() - time.time()) < 60  # the dates are ours
+
+    # With a sane clock nothing changes; and a clock that runs backwards is not believed.
+    start = {"connectorId": 1, "idTag": "t", "meterStart": 8000, "timestamp": "2026-11-08T16:12:17Z"}
+    await controller._on_StartTransaction(station, start)
+    await controller._on_StopTransaction(station, {"transactionId": 2, "timestamp": "2026-11-08T17:00:00Z"})
+    assert recorded(2)["duration_s"] == 2863
+    start = {"connectorId": 1, "idTag": "t", "meterStart": 8000, "timestamp": "1970-01-02T00:00:00Z"}
+    await controller._on_StartTransaction(station, start)
+    await controller._on_StopTransaction(station, {"transactionId": 3, "timestamp": "1970-01-01T00:00:00Z"})
+    assert recorded(3)["duration_s"] < 5
+
+
+async def test_forgetting_a_station_removes_its_history(server, session):
+    controller = server.app["controller"]
+    cp = await RawCharger.connect(server, session, SERIAL)
+    keep = await RawCharger.connect(server, session, "GRD-KEEP0001")
+    try:
+        for charger in (cp, keep):
+            tid = (await charger.call("StartTransaction", {"connectorId": 1, "idTag": "t", "meterStart": 0}))[2]
+            sampled = [{"value": "230", "measurand": "Voltage"}]
+            await charger.call("MeterValues", {"connectorId": 1, "meterValue": [{"sampledValue": sampled}]})
+            await charger.call("StopTransaction", {"transactionId": tid["transactionId"], "meterStop": 10})
+    finally:
+        await cp.close()
+        await keep.close()
+    await wait_for(lambda: not controller.is_online(SERIAL))
+    assert (await server.delete(f"/local/stations/{SERIAL}", headers=await bearer(server))).status == 200
+    db = controller.store._db
+    for table in ("sessions", "samples"):
+        left = db.execute(f"SELECT DISTINCT station FROM {table}").fetchall()  # noqa: S608 - fixed table names
+        assert [row[0] for row in left] == ["GRD-KEEP0001"], table
+
+
+async def test_history_per_station_is_bounded(tmp_path, monkeypatch):
+    """Age was the only limit on stored samples, and sessions had none: a peer that keeps reporting
+    could grow the database without end, and deleting its station did not give the space back."""
+    from grizzle_local import store as store_module
+
+    monkeypatch.setattr(store_module, "MAX_SAMPLES_PER_STATION", 100)
+    monkeypatch.setattr(store_module, "MAX_SESSIONS_PER_STATION", 5)
+    controller = _controller(tmp_path)
+    station = controller._ensure_station(SERIAL)
+    other = controller._ensure_station("GRD-OTHER001")
+    sampled = [{"value": "230", "measurand": "Voltage"}]
+    await controller._on_MeterValues(other, {"connectorId": 1, "meterValue": [{"sampledValue": sampled}]})
+    for n in range(400):
+        stamp = f"2026-11-01T{n // 60:02d}:{n % 60:02d}:00Z"
+        entry = {"timestamp": stamp, "sampledValue": sampled}
+        await controller._on_MeterValues(station, {"connectorId": 1, "meterValue": [entry]})
+    db = controller.store._db
+    count = db.execute("SELECT COUNT(*) FROM samples WHERE station=?", (SERIAL,)).fetchone()[0]
+    assert 100 <= count <= 110
+    oldest = db.execute("SELECT MIN(at) FROM samples WHERE station=?", (SERIAL,)).fetchone()[0]
+    assert oldest > "2026-11-01T04:40:00"  # the newest are the ones kept
+    assert db.execute("SELECT COUNT(*) FROM samples WHERE station='GRD-OTHER001'").fetchone()[0] == 1
+
+    for n in range(12):
+        start = {"connectorId": 1, "idTag": "t", "meterStart": 0, "timestamp": f"2026-11-02T{n:02d}:00:00Z"}
+        tid = (await controller._on_StartTransaction(station, start))["transactionId"]
+        if n < 11:
+            await controller._on_StopTransaction(station, {"transactionId": tid, "meterStop": 5})
+    controller.store.prune_samples()
+    sessions = controller.store.sessions(SERIAL, 100)
+    assert len(sessions) == 5  # the newest; the oldest closed ones went, the one still running never does
+    assert sessions[0]["stop_at"] is None and sessions[-1]["start_at"] == "2026-11-02T07:00:00.000Z"
+
+
+def test_transaction_ids_follow_the_history_at_every_allocation(tmp_path):
+    store = Store(tmp_path / "data")
+    assert store.next_transaction_id() == 1
+    store.start_session(50, SERIAL, 1, "t", "2026-11-01T10:00:00.000Z", 0, 0.1)  # the history is ahead of the counter
+    assert store.next_transaction_id() == 51
+    import sqlite3
+
+    with pytest.raises(sqlite3.IntegrityError):  # and an id can no longer silently replace a session
+        store.start_session(50, SERIAL, 1, "t", "2026-11-02T10:00:00.000Z", 0, 0.1)
+    assert store.sessions(SERIAL)[0]["start_at"] == "2026-11-01T10:00:00.000Z"
+
+
+async def test_saving_survives_odd_keys_and_a_failed_save_does_not_refuse_a_charger(server, session, monkeypatch):
+    controller = server.app["controller"]
+    controller._ensure_station(SERIAL)["oddKeys"] = {1: "a", "b": "c", 2.5: "d", None: "e"}
+    controller.store.save()  # sorting these keys used to raise, on every save from then on
+    assert SERIAL in json.loads(controller.store._state_path.read_text())["stations"]
+
+    def full_disk():
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(controller.store, "save", full_disk)
+    cp = await RawCharger.connect(server, session, "GRD-NEWPIN01", auth=("GRD-NEWPIN01", "its-key"))
+    try:
+        assert (await cp.call("Heartbeat", {}))[0] == 3  # connected, although the pin could not be saved yet
+        assert controller.station("GRD-NEWPIN01")["ocppAuthKey"] == "its-key"
+    finally:
+        await cp.close()
+
+
+async def test_frames_nested_absurdly_deep_are_dropped(server, session, caplog):
+    assert ocpp._too_deep([2, "u", "Heartbeat", {}]) is False
+    nested: object = "x"
+    for _ in range(ocpp.MAX_FRAME_DEPTH + 5):
+        nested = [nested]
+    assert ocpp._too_deep(nested) is True
+    assert ocpp.parse_frame(json.dumps([2, "u", "DataTransfer", {"data": nested}])) is None
+    profile = {"csChargingProfiles": {"chargingSchedule": {"chargingSchedulePeriod": [{"limit": 16}]}}}
+    # Real messages are nowhere near the limit.
+    assert ocpp.parse_frame(json.dumps([2, "u", "SetChargingProfile", profile])) is not None
+
+    caplog.set_level(logging.ERROR)
+    cp = await RawCharger.connect(server, session, SERIAL)
+    try:
+        await cp.send_text(json.dumps([3, "u", {"a": nested}]))
+        await cp.send_text(json.dumps([2, "v", "DataTransfer", {"vendorId": "x", "data": nested}]))
+        assert (await cp.call("Heartbeat", {}))[0] == 3
+        resp = await server.get(f"/local/stations/{SERIAL}/log", headers=await bearer(server))
+        assert resp.status == 200
+        strict_json(await resp.text())
+    finally:
+        await cp.close()
+    _no_failures(caplog)
+
+
+async def test_status_text_is_cleaned_like_every_other_field(server, session):
+    controller = server.app["controller"]
+    cp = await RawCharger.connect(server, session, SERIAL)
+    cp.replies["GetConfiguration"] = {"configurationKey": [{"key": "Odd\udcffKey", "value": "v"}]}
+    try:
+        assert (await cp.call("StatusNotification", {**OK_STATUS, "status": "Odd\udcff"}))[0] == 3
+        assert (await cp.call("StatusNotification", {"connectorId": 0, "status": "Odd\ud800"}))[0] == 3
+        assert (await cp.call("BootNotification", {"chargePointModel": "GRD 40A"}))[0] == 3
+        station = controller.station(SERIAL)
+        await wait_for(lambda: station["config"], timeout=6)
+        json.dumps(station, ensure_ascii=False).encode("utf-8")  # nothing left that UTF-8 cannot carry
+    finally:
+        await cp.close()
+
+
+def test_a_charger_without_an_id_keeps_the_station_it_had(tmp_path):
+    """Through the TLS front end such a charger used to be "unknown-127.0.0.1" (the front end's own
+    address). Now that the real address is known it would have become a new station, without its
+    mode, schedules or history."""
+    from grizzle_local.main import _charge_point_id
+    from grizzle_local.tls import PEERS_KEY
+
+    class Transport:
+        def get_extra_info(self, name):
+            return ("127.0.0.1", 40001) if name == "peername" else None
+
+    class Request:
+        path, headers, remote, transport = "/ocpp1.6", {}, "127.0.0.1", Transport()
+        app = {PEERS_KEY: {("127.0.0.1", 40001): "192.168.1.50"}}
+
+    assert _charge_point_id(Request(), {}) == "unknown-192.168.1.50"
+    assert _charge_point_id(Request(), {"unknown-127.0.0.1": {}}) == "unknown-127.0.0.1"
+    assert _charge_point_id(Request(), {"unknown-127.0.0.1": {}, "unknown-192.168.1.50": {}}) == "unknown-192.168.1.50"
+    assert _charge_point_id(Request()) == "unknown-192.168.1.50"

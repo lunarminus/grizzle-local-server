@@ -227,6 +227,7 @@ async def test_energy_after_the_last_reading_is_paid_for(tmp_path):
     await controller._on_StopTransaction(station, {"transactionId": 1, "meterStop": 106_000})
     recorded = controller.store.sessions(SERIAL)[0]
     assert recorded["energy_wh"] == 6000 and recorded["cost"] == pytest.approx(0.60)
+    assert recorded["price_kwh"] == pytest.approx(0.10)  # the average the session was charged at
     assert station["connectors"]["1"]["lastSession"]["priceTotal"] == pytest.approx(0.60)
 
     # No readings at all: the whole session is priced when it ends.

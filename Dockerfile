@@ -24,8 +24,9 @@ RUN useradd --system --uid 10001 --user-group --home-dir /app --shell /usr/sbin/
 VOLUME ["/data"]
 EXPOSE 9000 8443
 
+# Asks the server on whatever GRIZZLE_HOST / GRIZZLE_PORT make it listen on.
 HEALTHCHECK --interval=60s --timeout=5s --start-period=10s \
-  CMD python -c "import os,sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('GRIZZLE_PORT', '9000'), timeout=4).status == 200 else 1)"
+  CMD ["python", "-m", "grizzle_local.healthcheck"]
 
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["python", "-m", "grizzle_local"]

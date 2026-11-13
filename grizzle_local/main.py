@@ -24,6 +24,12 @@ _LOGGER = logging.getLogger("grizzle_local")
 
 WEB_DIR = Path(__file__).parent / "web"
 MAX_LOG_MESSAGE = 4000
+# How the HTTP server is run (the tests start theirs with the same options).
+# - auto_decompress off: nothing we talk to compresses its requests, and a body that claims
+#   "Content-Encoding: gzip" without being gzip makes aiohttp drop the connection and log a
+#   traceback, for anyone who asks, before any handler of ours can answer 400.
+# - shutdown_timeout: how long a request still in flight gets at exit (Docker waits 10 s in all).
+RUNNER_OPTIONS = {"access_log": None, "auto_decompress": False, "shutdown_timeout": 5.0}
 _REFUSALS = {401: web.HTTPUnauthorized, 409: web.HTTPConflict, 503: web.HTTPServiceUnavailable}
 
 
@@ -52,8 +58,13 @@ class SingleLineFormatter(logging.Formatter):
         return super().formatMessage(record)
 
 
-def _charge_point_id(request: web.Request) -> str:
-    """The charger's identity: last path segment, else the Basic auth user, else a placeholder."""
+def _charge_point_id(request: web.Request, known: dict | None = None) -> str:
+    """The charger's identity: last path segment, else the Basic auth user, else a placeholder.
+
+    The placeholder names the charger by its address. Through our TLS frontend that used to be
+    the frontend's own (loopback) address; a station ``known`` under that name is kept in use, so
+    a charger that sends no id is still the station it was, with its mode, schedules and history.
+    """
     tail = request.path.rstrip("/").rsplit("/", 1)[-1]
     if tail and tail not in ("ocpp1.6", "ocpp", "ocpp16"):
         return tail
@@ -65,7 +76,10 @@ def _charge_point_id(request: web.Request) -> str:
                 return user
         except ValueError:
             pass
-    return f"unknown-{client_ip(request)}"
+    placeholder, earlier = f"unknown-{client_ip(request)}", f"unknown-{request.remote}"
+    if known is not None and placeholder not in known and earlier in known:
+        return earlier
+    return placeholder
 
 
 def _basic_credentials(request: web.Request) -> tuple[str | None, str | None]:
@@ -107,7 +121,7 @@ async def websocket_handler(request: web.Request) -> web.StreamResponse:
             request.headers["Origin"],
         )
         raise web.HTTPForbidden()
-    cp_id = _charge_point_id(request)
+    cp_id = _charge_point_id(request, controller.stations)
     if not CP_ID_RE.fullmatch(cp_id):
         _LOGGER.warning("rejected websocket from %s: invalid charge point id %r", remote, cp_id[:100])
         raise web.HTTPBadRequest()
@@ -182,8 +196,7 @@ def create_app(settings: Settings, store: Store | None = None) -> web.Applicatio
 
 async def serve(settings: Settings) -> None:
     app = create_app(settings)
-    # shutdown_timeout: how long a request still in flight gets at exit (Docker waits 10 s in all).
-    runner = web.AppRunner(app, access_log=None, shutdown_timeout=5.0)
+    runner = web.AppRunner(app, **RUNNER_OPTIONS)
     await runner.setup()
     await web.TCPSite(runner, settings.host, settings.port).start()
     tls_server = None

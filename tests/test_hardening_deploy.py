@@ -586,3 +586,64 @@ def test_a_refreshed_cloud_token_is_written_back(tmp_path):
     assert client.stations() == []
     assert json.loads(token_file.read_text()) == {"token": "fresh", "refreshToken": "next"}
     assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+
+
+# --- low ports, and the health check ------------------------------------------------------------------
+
+BIND_PROBE = (
+    "import socket, sys\n"
+    "caps = [l.split()[1] for l in open('/proc/self/status') if l.startswith('CapEff')][0]\n"
+    "def bind(port):\n"
+    "    try:\n"
+    "        socket.socket().bind(('127.0.0.1', port)); return 'ok'\n"
+    "    except OSError: return 'refused'\n"
+    "print(caps, bind(int(sys.argv[1])))\n"
+)
+
+
+def _low_port() -> int | None:
+    """A free port below the unprivileged range, if this system has one."""
+    try:
+        limit = int(Path("/proc/sys/net/ipv4/ip_unprivileged_port_start").read_text())
+    except (OSError, ValueError):
+        return None
+    for port in range(min(limit, 1024) - 1, 0, -1):
+        with socket.socket() as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    return None
+
+
+@needs_root
+def test_entrypoint_keeps_only_the_bind_capability_for_a_low_port(volumes):
+    """With host networking and GRIZZLE_TLS_PORT=443 the unprivileged server could not bind its
+    port, and the container that started fine as root no longer started at all."""
+    port = _low_port()
+    if port is None:
+        pytest.skip("every port is unprivileged here")
+    result = _entrypoint(volumes, sys.executable, "-c", BIND_PROBE, str(port))
+    assert result.stdout.split() == ["0000000000000000", "refused"], result.stderr  # default ports: nothing kept
+    result = _entrypoint(volumes, sys.executable, "-c", BIND_PROBE, str(port), GRIZZLE_TLS_PORT="443")
+    assert result.stdout.split() == ["0000000000000400", "ok"], result.stderr  # CAP_NET_BIND_SERVICE and nothing else
+    result = _entrypoint(volumes, sys.executable, "-c", BIND_PROBE, str(port), GRIZZLE_PORT="80; echo injected")
+    assert result.stdout.split() == ["0000000000000000", "refused"] and "injected" not in result.stdout
+
+
+async def test_health_check_asks_where_the_server_listens(tmp_path, monkeypatch):
+    from grizzle_local import healthcheck
+
+    assert healthcheck.url(Settings(host="0.0.0.0", port=9000)) == "http://127.0.0.1:9000/health"
+    assert healthcheck.url(Settings(host="::", port=9123)) == "http://[::1]:9123/health"
+    assert healthcheck.url(Settings(host="192.168.1.5", port=80)) == "http://192.168.1.5:80/health"
+
+    async with TestServer(make_app(tmp_path)) as server:
+        monkeypatch.setenv("GRIZZLE_HOST", "127.0.0.1")
+        monkeypatch.setenv("GRIZZLE_PORT", str(server.port))
+        monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")  # a proxy setting must not come between us and ourselves
+        assert await asyncio.to_thread(healthcheck.main) == 0
+        monkeypatch.setenv("GRIZZLE_PORT", str(free_port()))
+        assert await asyncio.to_thread(healthcheck.main) == 1
+    assert 'CMD ["python", "-m", "grizzle_local.healthcheck"]' in (ROOT / "Dockerfile").read_text()

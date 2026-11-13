@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 # Passwords this project has shipped in its documentation or compose file, plus the obvious ones.
@@ -33,6 +35,21 @@ def _bool(name: str, default: bool) -> bool:
     if not value:
         return default
     return value in ("1", "true", "yes", "on")
+
+
+def _host_name(entry: str) -> str:
+    """One GRIZZLE_ALLOWED_HOSTS entry as a bare lower-case host name (or ``*``, or a ``.suffix``).
+
+    People paste what is in the address bar. ``https://grizzle.example.com:8443/`` means the host.
+    """
+    entry = entry.strip().lower()
+    if entry == "*" or entry.startswith("."):
+        return entry.rstrip(".") if entry != "." else ""
+    try:
+        host = urlsplit(entry if "://" in entry else f"//{entry}").hostname
+    except ValueError:
+        host = None
+    return (host or entry).rstrip(".")
 
 
 def frame_ancestors(value: str | None) -> str:
@@ -88,6 +105,10 @@ class Settings:
     # (a reverse proxy's, say) has to be listed, because that is also what a DNS-rebinding attack
     # looks like. Comma or space separated; ".example.com" allows every name under it; "*" allows all.
     allowed_hosts: tuple[str, ...] = field(default_factory=lambda: os.environ.get("GRIZZLE_ALLOWED_HOSTS", ""))
+    # Reverse proxies in front of this server (addresses or networks, e.g. 172.18.0.2 or 10.0.0.0/8).
+    # Only from these is X-Forwarded-For believed, so that the sign-in limit counts the real client
+    # and not the proxy. Unset: the header is ignored, as anyone can send it.
+    trusted_proxies: tuple = field(default_factory=lambda: os.environ.get("GRIZZLE_TRUSTED_PROXIES", ""))
     timezone: str = field(default_factory=lambda: os.environ.get("GRIZZLE_TIMEZONE") or os.environ.get("TZ") or "UTC")
     currency: str = field(default_factory=lambda: os.environ.get("GRIZZLE_CURRENCY", "USD"))
     heartbeat_interval: int = field(default_factory=lambda: _int("GRIZZLE_HEARTBEAT_INTERVAL", 300))
@@ -103,7 +124,14 @@ class Settings:
         hosts = self.allowed_hosts
         if isinstance(hosts, str):
             hosts = hosts.replace(",", " ").split()
-        self.allowed_hosts = tuple(host.strip().lower().rstrip(".") for host in hosts if host.strip())
+        self.allowed_hosts = tuple(name for name in map(_host_name, hosts) if name)
+        proxies = self.trusted_proxies
+        if isinstance(proxies, str):
+            proxies = proxies.replace(",", " ").split()
+        try:
+            self.trusted_proxies = tuple(ipaddress.ip_network(str(proxy), strict=False) for proxy in proxies)
+        except ValueError as err:
+            raise ValueError(f"GRIZZLE_TRUSTED_PROXIES: {err} (use addresses or networks such as 10.0.0.0/8)") from None
         self.max_stations = max(1, int(self.max_stations))
 
     def security_warnings(self) -> list[str]:

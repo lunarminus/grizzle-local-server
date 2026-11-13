@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import stat
@@ -163,7 +164,26 @@ async def test_logout_ends_the_session_on_the_server(server):
     assert (await server.get("/client/stations", headers=headers)).status == 401
     resp = await server.post("/client/auth/refresh-token", json={"refreshToken": tokens["refreshToken"]})
     assert resp.status == 401
-    assert (await server.post("/client/auth/logout")).status == 401  # and logging out needs a session
+    assert (await server.post("/client/auth/logout")).status == 200  # nothing to end: still not an error
+
+
+async def test_a_session_can_be_ended_after_its_token_has_expired(server):
+    """After seven days the token is refused, so the page signs out. That request used to be refused
+    too (it carried the expired token), and the refresh token stayed good for three more weeks."""
+    tokens = await login(server)
+    _tokens(server)[tokens["token"]]["expires"] = time.time() - 10
+    headers = {"Authorization": f"Bearer {tokens['token']}"}
+    assert (await server.get("/client/stations", headers=headers)).status == 401
+    assert (await server.post("/client/auth/logout", headers=headers)).status == 200
+    assert _tokens(server) == {}
+    resp = await server.post("/client/auth/refresh-token", json={"refreshToken": tokens["refreshToken"]})
+    assert resp.status == 401
+
+    # A session can also be ended by its refresh token alone.
+    tokens = await login(server)
+    assert (await server.post("/client/auth/logout", json={"refreshToken": tokens["refreshToken"]})).status == 200
+    assert _tokens(server) == {}
+    assert (await server.post("/client/auth/logout", json={"refreshToken": ["x"]})).status == 200
 
 
 async def test_the_web_page_signs_out_on_the_server_too(server):
@@ -204,16 +224,36 @@ async def test_refresh_tokens_expire(server):
     assert _tokens(server) == {}
 
 
-async def test_sessions_saved_by_an_older_version_still_work(tmp_path):
+async def test_sessions_saved_by_an_older_version_are_signed_out_once(tmp_path, caplog):
+    """An older version kept no record of which password a session was signed in with. If the
+    password is changed in the same restart as the upgrade, keeping those sessions would bless
+    exactly the ones the change was meant to end; and their tokens may have travelled in URLs."""
     data = tmp_path / "data"
     data.mkdir()
     old = {"token-from-before": {"refresh": "refresh-from-before", "expires": time.time() + 3600}}
     (data / "state.json").write_text(json.dumps({"tokens": old, "stations": {}}))
+    caplog.set_level(logging.WARNING)
     async with TestServer(make_app(tmp_path)) as ts, TestClient(ts) as client:
         resp = await client.get("/client/stations", headers={"Authorization": "Bearer token-from-before"})
-        assert resp.status == 200
+        assert resp.status == 401
         resp = await client.post("/client/auth/refresh-token", json={"refreshToken": "refresh-from-before"})
+        assert resp.status == 401
+        tokens = await login(client)  # signing in again is all it takes
+    assert any("earlier version" in r.getMessage() for r in caplog.records)
+    async with TestServer(make_app(tmp_path)) as ts, TestClient(ts) as client:  # and from then on sessions are kept
+        resp = await client.get("/client/stations", headers={"Authorization": f"Bearer {tokens['token']}"})
         assert resp.status == 200
+
+
+def test_a_damaged_credentials_mark_does_not_stop_the_server(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    state = {"tokens": {"t": {"refresh": "r", "expires": time.time() + 60, "refreshExpires": "soon"},
+                        "u": {"refresh": "r2", "expires": time.time() + 60}},
+             "credentials": {"salt": "00", "mark": "m\u00e4rk"}}
+    (data / "state.json").write_text(json.dumps(state))
+    app = make_app(tmp_path)
+    assert app["controller"].store.state["tokens"] == {}  # "t" was malformed, "u" belonged to other credentials
 
 
 # --- what the public endpoints say -----------------------------------------------------------------
@@ -275,11 +315,9 @@ async def test_page_is_not_frameable_by_other_sites_unless_configured(tmp_path):
     "path",
     [
         "/client/stations/{id}/events?limit=abc",
-        "/client/stations/{id}/events?limit=0",
         "/client/stations/{id}/events?limit=--5",
         "/client/stations/{id}/events?limit=99999999999999999999",
         "/local/stations/{id}/sessions?limit=1e3",
-        "/local/stations/{id}/sessions?limit=-1",
         "/local/stations/{id}/samples?connector=abc",
         "/local/stations/{id}/samples?connector=999999",
         "/local/stations/{id}/samples?since=yesterday",
@@ -295,8 +333,16 @@ async def test_bad_query_parameters_are_400_not_500(station, path):
 
 async def test_good_query_parameters_still_work(station):
     client, headers, _ = station
-    for path in ("events", "events?limit=5", "events?limit=1000"):
-        assert (await client.get(f"/client/stations/{SERIAL}/{path}", headers=headers)).status == 200
+    store = client.app["controller"].store
+    for n in range(1, 1011):
+        store.start_session(n, SERIAL, 1, "t", f"2026-10-01T00:{n // 60:02d}:{n % 60:02d}.000Z", 0, 0.1)
+    # A whole number outside 1..1000 is brought into range, as it always was; it is not an error.
+    for path, rows in (("events", 50), ("events?limit=5", 5), ("events?limit=1000", 1000), ("events?limit=5000", 1000),
+                       ("events?limit=0", 1), ("events?limit=-7", 1)):
+        resp = await client.get(f"/client/stations/{SERIAL}/{path}", headers=headers)
+        assert resp.status == 200 and len((await resp.json())["sessions"]) == rows, path
+    resp = await client.get(f"/local/stations/{SERIAL}/sessions?limit=5000", headers=headers)
+    assert resp.status == 200 and len((await resp.json())["sessions"]) == 1000
     for path in ("sessions?limit=5", "samples", "samples?connector=1", "samples?since=2026-11-08T00:00:00Z",
                  "samples?since=2026-11-08T02:00:00%2B02:00&connector=2"):
         assert (await client.get(f"/local/stations/{SERIAL}/{path}", headers=headers)).status == 200
@@ -703,3 +749,142 @@ def test_an_unknown_timezone_is_reported_not_silently_utc(tmp_path, caplog):
         assert str(controller.tz(station)) == "UTC"
     reports = [r for r in caplog.records if "Mars/Olympus_Mons" in r.getMessage()]
     assert len(reports) == 1  # said once, not on every tick
+
+
+# --- the sign-in limit, again: in parallel, over IPv6, behind a proxy ---------------------------------
+
+
+async def test_parallel_guesses_do_not_slip_past_the_limit(server):
+    """The limit was asked before the body was read and the failure noted after: requests whose
+    bodies arrive together had all been let in by the time any of them counted as a failure."""
+
+    async def slow(body: bytes):
+        await asyncio.sleep(0.3)  # the server has the headers, and is waiting, for every one of them
+        yield body
+
+    async def guess(n: int) -> int:
+        body = json.dumps({"emailOrPhone": EMAIL, "password": f"guess-{n}"}).encode()
+        resp = await server.post("/client/auth/login", data=slow(body), headers={"Content-Type": "application/json"})
+        return resp.status
+
+    statuses = await asyncio.gather(*(guess(n) for n in range(40)))
+    assert statuses.count(401) == api_module.LOGIN_MAX_FAILURES
+    assert statuses.count(429) == 40 - api_module.LOGIN_MAX_FAILURES
+
+
+def test_ipv6_clients_are_counted_by_their_prefix():
+    key = LoginThrottle.key
+    assert key("2001:db8:1:2::1") == key("2001:db8:1:2:ffff:ffff:ffff:ffff") == "2001:db8:1:2::/64"
+    assert key("2001:db8:1:3::1") != key("2001:db8:1:2::1")
+    assert key("fe80::1%eth0") == "fe80::/64"
+    assert key("::ffff:192.0.2.7") == key("192.0.2.7") == "192.0.2.7"
+    assert key("not an address") == "not an address"
+    throttle = LoginThrottle(max_failures=3, window=100)
+    for n in range(3):
+        throttle.failed(f"2001:db8:1:2::{n + 1}", now=n)  # three addresses, one machine
+    assert throttle.retry_after("2001:db8:1:2::99", now=5) > 0
+    assert throttle.retry_after("2001:db8:1:3::99", now=5) == 0
+
+
+def test_a_flood_from_many_addresses_closes_sign_in_except_for_known_clients():
+    throttle = LoginThrottle(max_failures=10, window=100, max_total=50)
+    throttle.succeeded("192.168.1.10")  # the owner has signed in from here before
+    for n in range(50):
+        throttle.failed(f"203.0.{n}.1", now=n / 10)  # fifty addresses, one guess each
+    assert throttle.retry_after("198.51.100.5", now=6) > 0  # a newcomer has to wait
+    assert throttle.retry_after("192.168.1.10", now=6) == 0  # the owner does not
+    assert throttle.retry_after("198.51.100.5", now=200) == 0  # and it passes
+
+
+def test_a_crowd_of_addresses_does_not_reset_a_locked_out_client():
+    throttle = LoginThrottle(max_failures=2, window=1000, max_total=10**6)
+    throttle.MAX_CLIENTS = 5
+    throttle.failed("10.0.0.1", now=0)
+    throttle.failed("10.0.0.1", now=1)  # locked out
+    for n in range(50):
+        throttle.failed(f"10.1.0.{n}", now=2 + n)
+    assert throttle.retry_after("10.0.0.1", now=60) > 0
+    assert len(throttle._failures) == 5
+
+
+class _FakeRequest:
+    def __init__(self, remote, forwarded=None, proxies=""):
+        self.remote, self.transport = remote, None
+        self.headers = {"X-Forwarded-For": forwarded} if forwarded is not None else {}
+        self.app = {"settings": Settings(trusted_proxies=proxies)}
+
+
+def test_forwarded_addresses_are_believed_only_from_trusted_proxies():
+    from grizzle_local.tls import client_ip
+
+    # Not configured: the header is ignored, since anyone can send it.
+    assert client_ip(_FakeRequest("172.18.0.2", "203.0.113.9")) == "172.18.0.2"
+    # From the proxy: the right-most address that is not itself a proxy.
+    proxies = "172.18.0.0/16, 10.0.0.1"
+    assert client_ip(_FakeRequest("172.18.0.2", "203.0.113.9", proxies)) == "203.0.113.9"
+    assert client_ip(_FakeRequest("172.18.0.2", "1.1.1.1, 203.0.113.9, 10.0.0.1", proxies)) == "203.0.113.9"
+    assert client_ip(_FakeRequest("172.18.0.2", "6.6.6.6, 203.0.113.9:4711", proxies)) == "203.0.113.9"
+    assert client_ip(_FakeRequest("172.18.0.2", "[2001:db8::7]:443", proxies)) == "2001:db8::7"
+    # From anyone else the header means nothing, whatever it claims.
+    assert client_ip(_FakeRequest("192.168.1.66", "127.0.0.1", proxies)) == "192.168.1.66"
+    # Junk in the header stops it being believed from there on.
+    assert client_ip(_FakeRequest("172.18.0.2", "203.0.113.9, junk", proxies)) == "172.18.0.2"
+    assert client_ip(_FakeRequest("172.18.0.2", "", proxies)) == "172.18.0.2"
+    assert client_ip(_FakeRequest("172.18.0.2", None, proxies)) == "172.18.0.2"
+    with pytest.raises(ValueError):
+        Settings(trusted_proxies="the proxy")
+
+
+async def test_behind_a_trusted_proxy_one_client_cannot_lock_the_others_out(tmp_path):
+    async with TestServer(make_app(tmp_path, trusted_proxies="127.0.0.1")) as ts, TestClient(ts) as client:
+        for _ in range(api_module.LOGIN_MAX_FAILURES + 2):
+            resp = await client.post("/client/auth/login", json={"emailOrPhone": EMAIL, "password": "guess"},
+                                     headers={"X-Forwarded-For": "203.0.113.50"})
+        assert resp.status == 429
+        resp = await client.post("/client/auth/login", json={"emailOrPhone": EMAIL, "password": PASSWORD},
+                                 headers={"X-Forwarded-For": "198.51.100.7"})
+        assert resp.status == 200
+
+
+# --- host names, once more ---------------------------------------------------------------------------
+
+
+def test_allowed_host_entries_may_be_pasted_from_the_address_bar():
+    pasted = "https://Grizzle.Example.com:8443/, nas.fritz.box:9000 [2001:db8::5]:9000 .ts.net."
+    hosts = Settings(allowed_hosts=pasted).allowed_hosts
+    assert hosts == ("grizzle.example.com", "nas.fritz.box", "2001:db8::5", ".ts.net")
+    assert api_module.origin_allowed("http://nas.fritz.box:9000", "nas.fritz.box:9000", hosts)
+    assert not api_module.origin_allowed("http://nas.fritz.box:9000", "nas.fritz.box:9000", ())
+
+
+def test_the_names_the_charger_uses_are_accepted():
+    """The certificate is for these, and only the owner's own DNS override makes them lead here."""
+    for name in ("ocpp.unitedchargers.com", "connect-api.unitedchargers.com"):
+        assert api_module.origin_allowed(f"https://{name}", name, ())
+    assert not api_module.origin_allowed("https://evil.unitedchargers.com.example", "x", ())
+
+
+async def test_the_refusal_says_exactly_what_to_set(server):
+    body = {"emailOrPhone": EMAIL, "password": PASSWORD}
+    resp = await server.post("/client/auth/login", json=body, headers={"Origin": "http://nas.fritz.box:9000"})
+    assert resp.status == 403
+    assert "GRIZZLE_ALLOWED_HOSTS=nas.fritz.box" in (await resp.json())["message"]
+
+
+@pytest.mark.parametrize("encoding", ["deflate", "gzip", "br", "nonsense"])
+async def test_a_body_that_does_not_match_its_content_encoding_is_not_an_error_of_ours(tmp_path, encoding, caplog):
+    """aiohttp used to decompress request bodies itself: a body that only claimed to be gzip dropped
+    the connection and logged a traceback, on the public sign-in path, for anyone who asked."""
+    from grizzle_local.main import RUNNER_OPTIONS
+
+    caplog.set_level(logging.ERROR)
+    test_server = TestServer(make_app(tmp_path))
+    await test_server.start_server(**RUNNER_OPTIONS)  # as the real server is started
+    async with TestClient(test_server) as client:
+        headers = {"Content-Type": "application/json", "Content-Encoding": encoding}
+        for path in ("/client/auth/login", "/client/auth/refresh-token"):
+            resp = await client.post(path, data=b"\x1f\x8b not really compressed", headers=headers)
+            assert resp.status == 400, (path, resp.status)
+            resp = await client.post(path, data=b'{"emailOrPhone": "x"}', headers=headers)
+            assert resp.status == 401, (path, resp.status)  # plain JSON is read as plain JSON
+    assert not caplog.records

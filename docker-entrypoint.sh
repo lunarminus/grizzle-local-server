@@ -8,7 +8,8 @@
 #
 # Dropping root must never be the reason an existing installation stops starting, so whenever
 # the unprivileged user could not do its job (cannot switch user, data directory not writable,
-# no place to put a readable copy of the TLS key) the script says so and carries on as root.
+# no place to put a readable copy of the TLS key, a port it may not bind) the script says so and
+# carries on as root.
 set -eu
 
 RUN_AS="${GRIZZLE_RUN_AS:-grizzle}"
@@ -21,8 +22,24 @@ if [ "$(id -u)" != "0" ] || [ "$RUN_AS" = "root" ]; then
     exec "$@"
 fi
 
+# A port below the kernel's unprivileged range needs a capability to bind. Inside a container's
+# own network namespace Docker lets every port be bound, so this only matters with host
+# networking (network_mode: host with GRIZZLE_TLS_PORT=443, say). Keep that one capability then,
+# and nothing else.
+CAPS=""
+LOW_PORTS_END="$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || echo 1024)"
+for port in "${GRIZZLE_PORT:-9000}" "${GRIZZLE_TLS_PORT:-8443}"; do
+    case "$port" in
+    '' | *[!0-9]*) continue ;;
+    esac
+    if [ "$port" -gt 0 ] && [ "$port" -lt "$LOW_PORTS_END" ]; then
+        CAPS="--inh-caps=+net_bind_service --ambient-caps=+net_bind_service"
+    fi
+done
+
 as_user() {
-    setpriv --reuid="$RUN_AS" --regid="$RUN_AS" --init-groups --no-new-privs "$@"
+    # shellcheck disable=SC2086  # CAPS is two options or none: it has to be split
+    setpriv --reuid="$RUN_AS" --regid="$RUN_AS" --init-groups --no-new-privs $CAPS "$@"
 }
 
 stay_root() {
@@ -32,6 +49,9 @@ stay_root() {
 }
 
 if ! as_user true 2>/dev/null; then
+    if [ -n "$CAPS" ] && CAPS="" as_user true 2>/dev/null; then
+        stay_root "a port below $LOW_PORTS_END is configured and '$RUN_AS' cannot be allowed to bind it here" "$@"
+    fi
     stay_root "cannot switch to user '$RUN_AS' (unknown user, or no SETUID/SETGID capability)" "$@"
 fi
 
@@ -58,4 +78,5 @@ if [ -f "$CERT" ] && [ -f "$KEY" ] &&
     fi
 fi
 
-exec setpriv --reuid="$RUN_AS" --regid="$RUN_AS" --init-groups --no-new-privs "$@"
+# shellcheck disable=SC2086
+exec setpriv --reuid="$RUN_AS" --regid="$RUN_AS" --init-groups --no-new-privs $CAPS "$@"

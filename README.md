@@ -89,7 +89,8 @@ Environment variables (all optional):
 | `GRIZZLE_OCPP_PASSWORD` | unset | If set, the charger's HTTP Basic password ("Auth key") must match; this is the strongest option. Without it, each station is pinned to the first Auth key it presents (see below) |
 | `GRIZZLE_MAX_STATIONS` | `16` | How many stations may exist. A serial nobody has seen is added on its first connection, so the number is bounded; further unknown serials are refused (HTTP 503) until you delete a station or raise this |
 | `GRIZZLE_FRAME_ANCESTORS` | `'self'` | Who may show the web page in a frame (CSP `frame-ancestors`). To embed it in Home Assistant, name Home Assistant's origin, e.g. `http://homeassistant.local:8123` |
-| `GRIZZLE_ALLOWED_HOSTS` | unset | Extra host names under which browsers may use the page and API. LAN addresses and names (`192.168.1.5`, `nas`, `nas.local`) always work; a public DNS name, such as a reverse proxy's, must be listed here (comma separated; `.example.com` allows every name under it; `*` allows all) |
+| `GRIZZLE_ALLOWED_HOSTS` | unset | Extra host names under which browsers may use the page and API. IP addresses, names without a dot (`nas`) and names with a LAN-only ending (`.local`, `.lan`, `.home`, `.home.arpa`, `.internal`, `.intranet`, `.corp`, `.localdomain`, `.test`) always work. Any other name with a dot has to be listed, including router and VPN names such as `nas.fritz.box` or `nas.tailnet.ts.net`, and a reverse proxy's public name: to a server they look the same as a hostile site's (comma separated; `.example.com` allows every name under it; `*` allows all). The refusal names the exact value to set |
+| `GRIZZLE_TRUSTED_PROXIES` | unset | Addresses or networks of reverse proxies in front of the server (`172.18.0.2`, `10.0.0.0/8`). Only from these is `X-Forwarded-For` believed, so the sign-in limit counts the real client instead of locking everyone behind the proxy out together |
 | `GRIZZLE_HEARTBEAT_INTERVAL` | `300` | Seconds, pushed to the charger at boot |
 | `GRIZZLE_METER_INTERVAL` | `30` | Seconds between MeterValues while charging |
 | `GRIZZLE_ID_TAG` | `uc_default_auth` | idTag used for RemoteStartTransaction |
@@ -192,7 +193,11 @@ Browse to `http://<server-ip>:9000/` and sign in with `GRIZZLE_API_EMAIL` /
 - **Charging schedules**: windows in which a connector set to *Scheduled* may charge, with
   days, an optional connector and an optional current limit for that window. Days are
   calendar days: "weekdays 20:00-06:00" covers 00:00-06:00 and 20:00-24:00 of each weekday,
-  so it includes Monday's small hours and stops at midnight on Friday.
+  so it includes Monday's small hours and stops at midnight on Friday. A window's current
+  limit applies to the whole charger for as long as the window is in force, whatever mode the
+  connectors are in (the charger takes one limit, not one per connector): with several windows
+  in force the lowest of their limits applies, and when the last one ends the charger goes
+  back to its own limit, or to its full current if it has none.
 - **Electricity rates**: a base price plus time-of-use zones, typed in cents per kWh.
   Session cost is computed from whichever price applies as energy is delivered.
 - **Statutory holidays**: pick a country and region to load its holidays, untick the ones
@@ -233,9 +238,12 @@ switch.
 
 Same paths and bodies as the cloud, Bearer-token auth (`Authorization: Bearer <token>`; a token
 in the query string is not accepted). A token works for 7 days and its refresh token for 30;
-`POST /client/auth/logout` ends the session. Ten failed sign-ins from one address within five
-minutes get `429` with `Retry-After`. Input that doesn't make sense is answered with `400` and a
-`message`, and changes nothing.
+`POST /client/auth/logout` ends the session (named by its token, or by `{"refreshToken"}`; it
+needs no valid token, so a session can still be ended after its token has expired). Ten failed
+sign-ins from one address (one /64 for IPv6) within five minutes get `429` with `Retry-After`; a
+flood of failures from many addresses closes sign-in for a while to every address that has never
+signed in successfully. Input that doesn't make sense is answered with `400` and a `message`,
+and changes nothing.
 
 | Method & path | Body |
 |---|---|
@@ -264,9 +272,9 @@ Local extras (same auth):
 | `POST /local/stations/{serial}/holidays/preview` | the same response for settings you haven't saved |
 | `GET /local/holidays/countries` | supported countries and subdivisions |
 | `GET /local/stations/{serial}/log` | the last 200 OCPP frames in either direction |
-| `GET /local/stations/{serial}/samples?since=ISO&connector=1` | meter history (kept 90 days) |
+| `GET /local/stations/{serial}/samples?since=ISO&connector=1` | meter history (kept 90 days, and at most a million readings per station) |
 | `PUT /local/stations/{serial}/settings` | `{"displayName", "timezone", "currency", "connectorCount", "maxCurrent", "minCurrent", "dipSwitchCurrentLimit"}`; checked as a whole, applied only if all of it is valid |
-| `DELETE /local/stations/{serial}` | forget a station (only while it's disconnected) |
+| `DELETE /local/stations/{serial}` | forget a station (only while it's disconnected), together with its recorded sessions and samples |
 | `DELETE /local/stations/{serial}/auth-key` | forget the Auth key the station is pinned to and drop its connection; the charger's reconnect pins its key again |
 | `GET /health` | no auth: `{"status", "version", "time", "stationCount", "stationsOnline"}`. With a token it also lists `stations` (serial → online); serials are not shown to strangers |
 
@@ -281,8 +289,10 @@ What the server assumes and what it does about it:
 
 - **The REST API and web page are protected by one password.** Sign-in attempts are throttled per
   client address, sessions end on sign-out and when the email or password changes, and a browser
-  page from a public DNS name is refused (that is what both a hostile site posting to your server
-  and a DNS-rebinding attack look like; see `GRIZZLE_ALLOWED_HOSTS`). Whoever is signed in controls
+  page opened under a name that could be a public one is refused (that is what both a hostile site
+  posting to your server and a DNS-rebinding attack look like; see `GRIZZLE_ALLOWED_HOSTS`). The
+  check is on the `Origin` header, which browsers send with every request that changes anything;
+  Home Assistant and other non-browser clients are not affected. Whoever is signed in controls
   the charger completely, including raw OCPP calls, so choose a real password. Plain `http://` on
   port 9000 does not hide it from someone who can sniff your LAN; the TLS port does.
 - **Chargers are untrusted.** Unless `GRIZZLE_OCPP_PASSWORD` is set, anything that can reach the
@@ -311,18 +321,25 @@ Nothing needs to be migrated by hand, but a few things behave differently on pur
   now needs that user or `sudo`.
 - **Saved state is repaired on load.** Values the old version stored as it received them (an
   impossible connector count, a schedule with something other than a time in it) are mended or
-  dropped, with a warning in the log saying what and why. Sessions, schedules, rates, pinned Auth
-  keys and sign-ins are kept.
+  dropped, with a warning in the log saying what and why. Recorded sessions, schedules, rates and
+  pinned Auth keys are kept.
 - **Framing.** Other sites can no longer show the web page in a frame. For a Home Assistant
   *Webpage* card set `GRIZZLE_FRAME_ANCESTORS` to Home Assistant's address.
-- **Public host names.** If you open the page under a public DNS name (through a reverse proxy,
-  for instance), list it in `GRIZZLE_ALLOWED_HOSTS`; until then the page loads but signing in
-  answers 403. Addresses and LAN-only names need nothing.
+- **Host names.** Opening the page by IP address, by a name without a dot or by a name ending in
+  `.local`, `.lan` and the like needs nothing. Under any other name (`nas.fritz.box`, a Tailscale
+  name, a reverse proxy's public name) the page loads but signing in answers 403 until the name
+  is in `GRIZZLE_ALLOWED_HOSTS`; the message and the log say exactly what to set. Behind a reverse
+  proxy also set `GRIZZLE_TRUSTED_PROXIES`.
+- **Everyone signs in again, once.** Sessions saved by 0.6.0 are ended on the first start (nothing
+  recorded which password they belonged to). Home Assistant signs in again by itself.
 - **API details.** `/health` lists serials only for a signed-in caller; `?token=` in the URL no
   longer authenticates; a refresh token expires after 30 days; changing the password signs
   everyone out; requests that used to be accepted and then misbehave (a connector that doesn't
-  exist, a schedule with `"days": [7]`, a price of `NaN`) now get a `400`.
+  exist, a schedule with `"days": [7]`, a price of `NaN`) now get a `400`. Deleting a station
+  deletes its history too.
 - **Stations.** At most 16 can exist unless `GRIZZLE_MAX_STATIONS` says otherwise.
+- **Host networking.** With `network_mode: host` and a port below 1024 the server keeps the one
+  capability it needs to bind it; nothing to change.
 
 ## Development
 

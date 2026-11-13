@@ -40,13 +40,17 @@ CP_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
 
 # OCPP frames are a few hundred bytes; the largest, a GetConfiguration reply, a few KiB.
 MAX_FRAME_BYTES = 256 * 1024
-# A frame bigger than this is noted in the debug log but not kept, so 200 logged frames can't
-# pin hundreds of megabytes.
+# A frame bigger than this is noted in the debug log but not kept, and what is kept is kept as
+# text: parsed, a few kilobytes of tiny JSON containers take a hundred times their size in memory,
+# and 200 logged frames per connection would pin tens of megabytes.
 LOG_FRAME_BYTES = 8 * 1024
 # A charger sends a frame every few seconds. Past the burst, reading slows to this rate, which
 # pushes back on a peer that floods us (every frame may cost a database write).
 RATE_BURST = 120
 RATE_PER_SECOND = 10.0
+# OCPP messages nest five or six levels. Anything much deeper is not OCPP, and structures nested
+# hundreds deep are exactly what makes a later json.dumps (of the frame log, say) hit the recursion limit.
+MAX_FRAME_DEPTH = 32
 
 # Control characters, the Unicode line separators, and lone surrogates (which a UTF-8 log can't encode).
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]")
@@ -91,6 +95,21 @@ def repair_json(text: str) -> str:
     return text
 
 
+def _too_deep(value: Any, limit: int = MAX_FRAME_DEPTH) -> bool:
+    """Is this JSON value nested more than ``limit`` levels? (Iterative: it must not itself recurse.)"""
+    level = [value]
+    for _ in range(limit):
+        level = [
+            child
+            for item in level
+            if isinstance(item, (list, dict))
+            for child in (item.values() if isinstance(item, dict) else item)
+        ]
+        if not level:
+            return False
+    return any(isinstance(item, (list, dict)) for item in level)
+
+
 def parse_frame(text: str) -> list[Any] | None:
     """Parse an OCPP-J frame, repairing it if needed. Returns None if hopeless."""
     for candidate in (text, repair_json(text)):
@@ -99,7 +118,7 @@ def parse_frame(text: str) -> list[Any] | None:
         except (ValueError, RecursionError):  # RecursionError: thousands of nested brackets
             continue
         if isinstance(frame, list) and len(frame) >= 3 and frame[0] in (CALL, CALLRESULT, CALLERROR):
-            return frame
+            return None if _too_deep(frame) else frame
     return None
 
 
@@ -173,7 +192,7 @@ class ChargePointConnection:
 
     async def _send(self, frame: list[Any], label: str) -> None:
         text = json.dumps(frame, separators=(",", ":"))
-        self._record("out", label, frame, len(text))
+        self._record("out", label, text)
         async with self._send_lock:
             await self.ws.send_str(text)
 
@@ -217,7 +236,7 @@ class ChargePointConnection:
     async def _handle_text(self, text: str) -> None:
         frame = parse_frame(text)
         if frame is None:
-            self._record("in", "unparseable", text[:500])
+            self._record("in", "unparseable", text[:500], parsed=False)
             _LOGGER.warning("%s: dropping unparseable frame: %s", self.id, printable(text, 200))
             peek = peek_frame(text)
             if peek and peek[0] in (CALLRESULT, CALLERROR):
@@ -233,19 +252,19 @@ class ChargePointConnection:
                 _LOGGER.warning("%s: malformed Call %s", self.id, printable(text, 200))
                 return
             action, payload = frame[2], frame[3] if isinstance(frame[3], dict) else {}
-            self._record("in", f"<- {action[:64]}", frame, len(text))
+            self._record("in", f"<- {action[:64]}", text)
             await self._dispatch(uid, action, payload)
             return
         # Replies carry an id we made up ourselves, always a string; anything else matches nothing.
         fut = self._pending.get(uid) if isinstance(uid, str) else None
         if kind == CALLRESULT:
-            self._record("in", "<- result", frame, len(text))
+            self._record("in", "<- result", text)
             if fut and not fut.done():
                 fut.set_result(frame[2] if isinstance(frame[2], dict) else {})
             else:
                 _LOGGER.debug("%s: result for unknown call %s", self.id, printable(uid, 64))
         elif kind == CALLERROR:
-            self._record("in", "<- error", frame, len(text))
+            self._record("in", "<- error", text)
             if fut and not fut.done():
                 code = frame[2] if len(frame) > 2 else "GenericError"
                 desc = frame[3] if len(frame) > 3 else ""
@@ -269,10 +288,24 @@ class ChargePointConnection:
             return
         await self._send([CALLRESULT, uid, result if result is not None else {}], f"-> result {name}")
 
-    def _record(self, direction: str, label: str, data: Any, size: int = 0) -> None:
-        if size > LOG_FRAME_BYTES:
-            data = {"omitted": "frame too large to keep in the log", "bytes": size}
-        self.log.append({"at": now_iso(), "dir": direction, "label": label, "data": data})
+    def _record(self, direction: str, label: str, text: str, parsed: bool = True) -> None:
+        """Note a frame in the debug log, as text. ``parsed``: it is JSON, to be decoded when the log is read."""
+        if len(text) > LOG_FRAME_BYTES:
+            text, parsed = json.dumps({"omitted": "frame too large to keep in the log", "bytes": len(text)}), True
+        self.log.append({"at": now_iso(), "dir": direction, "label": label, "text": text, "json": parsed})
+
+    def frames(self) -> list[dict[str, Any]]:
+        """The debug log for the API: each entry with its frame decoded (or as text, if it never was JSON)."""
+        entries = []
+        for entry in list(self.log):
+            data: Any = entry["text"]
+            if entry["json"]:
+                try:
+                    data = parse_frame(data) or json.loads(data)
+                except (ValueError, RecursionError):
+                    pass
+            entries.append({"at": entry["at"], "dir": entry["dir"], "label": entry["label"], "data": data})
+        return entries
 
     async def close(self) -> None:
         if not self.ws.closed:

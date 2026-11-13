@@ -341,6 +341,8 @@ class Controller:
             station["limitInForce"] = station["appliedLimit"] is not None
         if not isinstance(station.get("idTag"), str) or len(station["idTag"]) > 64:
             station.pop("idTag", None)
+        if "ocppAuthKey" in station and not (isinstance(station["ocppAuthKey"], str) and station["ocppAuthKey"]):
+            del station["ocppAuthKey"]  # not a key anyone could present: better unpinned than unusable
         boot = station.get("boot") if isinstance(station.get("boot"), dict) else {}
         station["boot"] = self._boot_fields(boot, _text(boot.get("timestamp"), 40))
         model = station.get("model") if isinstance(station.get("model"), dict) else {}
@@ -371,12 +373,26 @@ class Controller:
             if connector.get("mode") not in MODES:
                 connector["mode"] = "Active"
             status = connector.get("status")
-            connector["status"] = status[:32] if isinstance(status, str) else None
+            connector["status"] = _text(status, 32) if isinstance(status, str) else None
             tx = connector.get("transaction")
             if not isinstance(tx, dict) or _small_int(tx.get("id"), 1, 2**62) is None:
                 connector["transaction"] = None
+            else:
+                tx["id"] = _small_int(tx["id"], 1, 2**62)
+                for field in ("energy", "power", "priceTotal", "lastSessionEnergy"):
+                    tx[field] = _reading(tx.get(field)) or 0
+                tx["meterStart"] = _reading(tx.get("meterStart"))
+                tx["priceKW"] = _to_float(tx.get("priceKW"))
+                tx["startAt"] = _text(tx.get("startAt"), 40) if isinstance(tx.get("startAt"), str) else None
+                tx["idTag"] = _text(tx.get("idTag"), 64)
+                if not isinstance(tx.get("meter"), dict):
+                    tx["meter"] = {}
+                if not isinstance(tx.get("sessionRelativeRegister"), bool):
+                    tx.pop("sessionRelativeRegister", None)
             if not isinstance(connector.get("lastMeter"), dict):
                 connector["lastMeter"] = {}
+            connector["totalEnergyWh"] = _reading(connector.get("totalEnergyWh"))
+            connector["power"] = _reading(connector.get("power")) or 0
             kept[key] = connector
         stored = station.get("connectorCount")
         station["connectors"] = kept
@@ -561,12 +577,12 @@ class Controller:
         station["lastSeen"] = now_iso()
         if handshake is not None:
             station["ocppHandshake"] = handshake
+        self._dirty = True
         if self._record_auth_key(station, auth_key) and _time.monotonic() - self._last_pin_save > 1.0:
             # Don't leave a fresh pin waiting for the next tick (a crash would lose it). At most
             # once a second, so a flood of new serials can't force a full save per handshake.
             self._last_pin_save = _time.monotonic()
-            self.store.save()
-        self._dirty = True
+            self.save()  # logs a failure instead of raising: a full disk must not refuse the charger
         _LOGGER.info("%s connected", conn.id)
         if old is not None and old is not conn:
             # A reconnecting charger doesn't close its old socket first.
@@ -610,7 +626,8 @@ class Controller:
             return
         station.pop("ocppAuthKey", None)
         station.pop("ocppKeyless", None)
-        self.store.save()
+        self._dirty = True
+        self.save()
         _LOGGER.warning("%s: pinned OCPP Auth key cleared; the next connection will pin a new one", station_id)
         conn = self.connections.get(station_id)
         if conn is not None:
@@ -704,7 +721,7 @@ class Controller:
         status = payload.get("status")
         if not isinstance(status, str) or not status:
             raise CallRejected("TypeConstraintViolation", "status must be a string")
-        status = status[:32]
+        status = _text(status, 32)
         error_code = _text(payload.get("errorCode"), 50) or "NoError"
         if cid == 0:
             station["status"] = status
@@ -760,10 +777,14 @@ class Controller:
         tid = self.store.next_transaction_id()
         local_now = datetime.now(self.tz(station))
         price = self.price_at(station, local_now)
+        charger_clock = _parse_iso(payload.get("timestamp"))
         connector["transaction"] = {
             "id": tid,
             "idTag": id_tag,
             "startAt": started,
+            # What the charger's own clock said, however wrong the date: the length of a session
+            # is the difference between two readings of that clock.
+            "clockStart": _iso(charger_clock) if charger_clock and charger_clock.year >= 1970 else None,
             "meterStart": meter_start,
             "energy": 0,
             "power": 0,
@@ -802,6 +823,7 @@ class Controller:
             _reading(payload.get("meterStop")),
             _text(payload.get("reason"), 50),
             _timestamp(payload.get("timestamp")),
+            clock_stop=_parse_iso(payload.get("timestamp")),
         )
         # transactionData may carry final meter values. They are taken after the session is closed
         # on purpose: its begin/end readings can be the lifetime register even where MeterValues
@@ -815,7 +837,13 @@ class Controller:
         return {"idTagInfo": {"status": "Accepted"}}
 
     def _finish_transaction(
-        self, station: dict[str, Any], connector: dict[str, Any], meter_stop: Any, reason: str | None, stopped_at: str
+        self,
+        station: dict[str, Any],
+        connector: dict[str, Any],
+        meter_stop: Any,
+        reason: str | None,
+        stopped_at: str,
+        clock_stop: datetime | None = None,
     ) -> None:
         tx = connector.get("transaction") or {}
         connector["transaction"] = None
@@ -838,6 +866,12 @@ class Controller:
             connector["totalEnergyWh"] = float(meter_start) + energy
         start, stop = _parse_iso(tx.get("startAt")), _parse_iso(stopped_at)
         duration = max(0, int((stop - start).total_seconds())) if start and stop else None
+        clock_start = _parse_iso(tx.get("clockStart"))
+        if clock_start and clock_stop and clock_stop >= clock_start:
+            # Both ends as the charger's clock read them. For a charger whose clock was never set
+            # (1970) and which reports a session after the fact, our own timestamps for the two
+            # messages are milliseconds apart; its clock still measured the session correctly.
+            duration = int((clock_stop - clock_start).total_seconds())
         cost = float(_reading(tx.get("priceTotal")) or 0)
         # Cost builds up with each MeterValues reading. What was delivered after the last one (all
         # of it, if none arrived) is in the final energy but was never priced: do that now, the
@@ -849,6 +883,7 @@ class Controller:
             moment = (stop if metered else start) or stop or start
             price = self.price_at(station, moment.astimezone(self.tz(station))) if moment else None
             cost += unpriced / 1000 * (price or 0)
+        delivered = float(_reading(energy) or 0)
         self.store.finish_session(
             int(tx["id"]),
             stopped_at,
@@ -857,6 +892,7 @@ class Controller:
             duration,
             cost,
             reason,
+            cost / (delivered / 1000) if delivered > 0 else None,  # the average price, as recalculating records it
         )
         connector["lastSession"] = {
             **tx,
@@ -932,7 +968,11 @@ class Controller:
                 # session's energy would drop back to nearly nothing.
                 session_relative = tx.get("sessionRelativeRegister")
                 if not isinstance(session_relative, bool):
-                    session_relative = register < meter_start
+                    # A reading just under meterStart is the lifetime register reported more
+                    # coarsely than meterStart was (kWh with a decimal or two), not a session
+                    # that happens to have delivered almost exactly the charger's lifetime total.
+                    shortfall = meter_start - register
+                    session_relative = shortfall > min(1000.0, abs(meter_start) * 0.01)
                 session_energy = register if session_relative else register - meter_start
                 previous = tx.get("lastSessionEnergy")
                 tx["sessionRelativeRegister"] = session_relative
@@ -1039,7 +1079,7 @@ class Controller:
         for item in _dicts(items, MAX_CONFIG_KEYS):
             key = item.get("key")
             if isinstance(key, str) and key and len(key) <= 100:
-                config[key] = _text(item.get("value"), 500)
+                config[_text(key, 100)] = _text(item.get("value"), 500)
         return config
 
     def _learn_from_config(self, station: dict[str, Any], config: dict[str, Any]) -> None:
@@ -1415,7 +1455,9 @@ class Controller:
         return station
 
     def delete_station(self, station_id: str) -> None:
+        """Forget a station: its settings, and its recorded sessions and samples with it."""
         self.stations.pop(station_id, None)
+        self.store.delete_history(station_id)
         for tasks in (self._boot_tasks, self._station_ticks):
             task = tasks.pop(station_id, None)
             if task is not None and not task.done():

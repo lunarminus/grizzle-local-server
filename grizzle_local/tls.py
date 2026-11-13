@@ -14,6 +14,7 @@ which of its own sockets carries which peer; :func:`client_ip` looks it up.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import ssl
 from typing import Any
@@ -31,8 +32,26 @@ def make_context(cert: str, key: str) -> ssl.SSLContext:
     return ctx
 
 
+def _address(text: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """An IP address from ``1.2.3.4``, ``1.2.3.4:5678``, ``[::1]:5678`` or ``::1``; None for anything else."""
+    text = text.strip()
+    if text.startswith("["):
+        text = text[1:].split("]", 1)[0]
+    elif text.count(":") == 1:
+        text = text.split(":", 1)[0]
+    try:
+        return ipaddress.ip_address(text.split("%", 1)[0])
+    except ValueError:
+        return None
+
+
 def client_ip(request: Any) -> str:
-    """The address of whoever sent this request, seeing through our own TLS frontend."""
+    """The address of whoever sent this request.
+
+    Seen through our own TLS frontend, and through a reverse proxy named in
+    GRIZZLE_TRUSTED_PROXIES: only then is X-Forwarded-For believed, read from the right, and only
+    as far as the first address that is not itself one of those proxies.
+    """
     remote = request.remote or "?"
     peers = request.app.get(PEERS_KEY)
     transport = request.transport
@@ -41,7 +60,17 @@ def client_ip(request: Any) -> str:
         if peername:
             # The key is the address and port of a socket this process opened itself, so nobody
             # else's connection can match it.
-            return peers.get(tuple(peername[:2]), remote)
+            remote = peers.get(tuple(peername[:2]), remote)
+    proxies = getattr(request.app.get("settings"), "trusted_proxies", ())
+    peer = _address(remote) if proxies else None
+    if peer is not None and any(peer in network for network in proxies):
+        for hop in reversed(request.headers.get("X-Forwarded-For", "").split(",")):
+            address = _address(hop)
+            if address is None:
+                break  # not an address: stop believing the header
+            remote = str(address)
+            if not any(address in network for network in proxies):
+                break
     return remote
 
 
