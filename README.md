@@ -166,10 +166,19 @@ the HTTP Basic user), which must match `[A-Za-z0-9][A-Za-z0-9._:-]{0,63}`.
 
 - With `GRIZZLE_ALLOWED_CHARGERS` set, a connection under any serial that is not listed is refused
   (`rejected connection ... not in GRIZZLE_ALLOWED_CHARGERS` in the log), and no station is created
-  for it. A station that already exists but is not listed stays in the list of stations and can no
-  longer connect. This is a filter, not proof of identity: a serial is printed on the charger and
-  crosses the network unencrypted on the plain `ws://` port, so anything that knows it can present
-  it. What keeps an impostor from being taken for a listed charger is the next two points.
+  for it. A station that already exists but is not listed stays in the list of stations, still
+  counts towards `GRIZZLE_MAX_STATIONS`, and can no longer connect; delete it if it was never yours.
+  The server says at every start which chargers may connect. This is a filter, not proof of
+  identity: a serial is printed on the charger, so anything that knows it can present it. What
+  keeps an impostor from being taken for a listed charger is the next two points, with two limits.
+  The pin belongs to whatever first presented a key under that serial, and there is none at all if
+  something connected under it without a key first: after your charger's first connection look for
+  `<serial>: pinned to the Auth key it presented` in the log, and if it says `not pinning it`
+  instead, call `DELETE /local/stations/{serial}/auth-key` while only the charger can reach the
+  server. And on the plain `ws://` port the Auth key (or `GRIZZLE_OCPP_PASSWORD`) is sent in the same
+  request as the serial, so whoever can read that traffic has both; over `wss://` a passive listener
+  sees neither. A charger that sends no id appears as `unknown-<address>`; you can list that name,
+  but it stands for whatever connects without an id.
 - With `GRIZZLE_OCPP_PASSWORD` set, the Basic password must equal it.
 - Without it, the first Auth key (Basic password) a station presents is pinned and saved at once.
   From then on a connection for that serial with a different key, or none, is refused
@@ -183,9 +192,10 @@ the HTTP Basic user), which must match `[A-Za-z0-9][A-Za-z0-9._:-]{0,63}`.
   (a 5 s probe). Set `GRIZZLE_OCPP_PASSWORD` if your charger sends no key.
 - WebSocket handshakes carrying an `Origin` header (that is, from a browser) are refused; the
   charger's firmware doesn't send one.
-- A serial the server has never seen becomes a new station, and there may be at most
-  `GRIZZLE_MAX_STATIONS` (16) of those. If something on your network fills the list with invented
-  serials, delete them (`DELETE /local/stations/{serial}`) and set `GRIZZLE_OCPP_PASSWORD`.
+- A serial the server has never seen (with `GRIZZLE_ALLOWED_CHARGERS` set: only a listed one)
+  becomes a new station, and there may be at most `GRIZZLE_MAX_STATIONS` (16) of those. If something
+  on your network fills the station list with invented serials, delete them
+  (`DELETE /local/stations/{serial}`) and set `GRIZZLE_ALLOWED_CHARGERS` or `GRIZZLE_OCPP_PASSWORD`.
 
 You can test the whole chain without the real charger: `tools/fake_charger.py` accepts
 `wss://…` URLs with `--insecure`. The plain `ws://` listener on port 9000 also accepts

@@ -511,8 +511,9 @@ class Controller:
         - With GRIZZLE_ALLOWED_CHARGERS set, only the serials listed there are considered at all.
           That keeps other serials out; it is the checks below that keep someone else from being
           taken for a listed one, since a serial is no secret.
-        - With GRIZZLE_OCPP_PASSWORD set, the Basic password must match it, and no key is pinned
-          (so changing the password never collides with a per-station pin).
+        - With GRIZZLE_OCPP_PASSWORD set, the Basic password must match it and no per-station pin
+          is consulted (so changing the password never collides with one). The key presented is
+          still recorded, and is the station's pin if the password is later unset.
         - Otherwise a station is pinned to the first Auth key it presents (trust on first use):
           any other key, or none, is refused. Clear the pin with DELETE /local/stations/{id}/auth-key.
         - A connection that proves nothing (no password, nothing pinned) may create a new station,
@@ -533,8 +534,10 @@ class Controller:
         if password is not None and not _same_secret(auth_key, password):
             return 401, "wrong OCPP password (GRIZZLE_OCPP_PASSWORD)"
         if self.settings.allowed_chargers and cp_id not in self.settings.allowed_chargers:
-            # The same answer as for a wrong key or password, and after the password check: the
-            # reply must not tell a stranger which serials are on the list.
+            # Answered like a wrong key or password (401). That hides the list only from someone
+            # who could not get in anyway: with GRIZZLE_OCPP_PASSWORD set, or for a serial whose key
+            # is pinned, listed and unlisted serials get the same reply. Without either, a listed
+            # serial is let in (or gets 409 or 503), which tells them apart.
             return 401, "its serial is not in GRIZZLE_ALLOWED_CHARGERS; add it there to let this charger connect"
         if password is not None:
             return self._full(cp_id)

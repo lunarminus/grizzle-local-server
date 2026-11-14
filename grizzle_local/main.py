@@ -207,6 +207,8 @@ async def serve(settings: Settings) -> None:
         _LOGGER.info(
             "only these chargers may connect (GRIZZLE_ALLOWED_CHARGERS): %s", ", ".join(settings.allowed_chargers)
         )
+    else:
+        _LOGGER.info("any charger may connect (GRIZZLE_ALLOWED_CHARGERS is not set)")
     # docker stop sends SIGTERM; without a handler the process dies before the shutdown save.
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

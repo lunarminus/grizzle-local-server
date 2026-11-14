@@ -111,8 +111,9 @@ class Settings:
     ocpp_unlock: bool = field(default_factory=lambda: _bool("GRIZZLE_OCPP_UNLOCK", True))
     # The serial numbers of the only chargers that may connect (comma or space separated). Empty:
     # any serial may. It keeps every other serial out. It does not prove that whoever presents a
-    # listed serial is that charger: a serial is no secret. That takes the charger's Auth key,
-    # which the server pins on first use, or GRIZZLE_OCPP_PASSWORD.
+    # listed serial is that charger: a serial is no secret. That takes GRIZZLE_OCPP_PASSWORD, or
+    # the charger's Auth key, which the server pins the first time one is presented under that
+    # serial (unless something connected under it without a key before).
     allowed_chargers: tuple[str, ...] = field(default_factory=lambda: os.environ.get("GRIZZLE_ALLOWED_CHARGERS", ""))
     # How many stations may exist. A charger nobody has seen before is added on its first
     # connection, by anyone who can reach the port, so the number has to be bounded.
@@ -156,7 +157,8 @@ class Settings:
             if not isinstance(serial, str) or not CP_ID_RE.fullmatch(serial):
                 raise ValueError(
                     f"GRIZZLE_ALLOWED_CHARGERS: {serial!r} cannot be a charger's serial number "
-                    "(letters, digits and . _ : - only, at most 64 characters, no quotes)"
+                    "(letters, digits and . _ : - only, at most 64 characters, no quotes); "
+                    "to let any charger connect, leave it unset"
                 )
         self.max_stations = max(1, int(self.max_stations))
 
@@ -178,6 +180,13 @@ class Settings:
             warnings.append(
                 "GRIZZLE_FRAME_ANCESTORS=* lets any web site show the page in a frame (clickjacking); "
                 "name the origin that embeds it instead"
+            )
+        placeholders = [serial for serial in self.allowed_chargers if serial.startswith("unknown-")]
+        if placeholders:
+            warnings.append(
+                f"GRIZZLE_ALLOWED_CHARGERS lists {', '.join(placeholders)}: that is the name given to whatever "
+                "connects without an id, not a serial, and anyone can also write it in the URL. Set a charge point "
+                "id or an Auth key on the charger if it has one, or set GRIZZLE_OCPP_PASSWORD"
             )
         try:
             ZoneInfo(self.timezone)
