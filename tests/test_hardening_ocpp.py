@@ -960,6 +960,51 @@ async def test_history_per_station_is_bounded(tmp_path, monkeypatch):
     assert sessions[0]["stop_at"] is None and sessions[-1]["start_at"] == "2026-11-02T07:00:00.000Z"
 
 
+@pytest.mark.parametrize("counter", [10**30, 2**63, 2**63 - 1, 0, -5, "7", 2.5, True, None, [9]])
+def test_an_impossible_transaction_counter_does_not_stop_sessions(tmp_path, counter):
+    """A counter in state.json beyond what the history database can store (a damaged or hand-edited
+    file) was handed out as it was, and from then on no session could be recorded at all."""
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "state.json").write_text(json.dumps({"next_transaction_id": counter}))
+    store = Store(data)
+    store.start_session(2**63 - 1, SERIAL, 1, "t", "2026-10-31T10:00:00.000Z", 0, 0.1)  # recorded under such an id
+    for expected in (1, 2):
+        tid = store.next_transaction_id()
+        assert tid == expected
+        store.start_session(tid, SERIAL, 1, "t", f"2026-11-0{tid}T10:00:00.000Z", 0, 0.1)
+    assert json.loads(json.dumps(store.state))["next_transaction_id"] == 3
+
+
+@pytest.mark.parametrize(
+    "counter,recorded,rounds",
+    [
+        (2**62, [], 5),
+        (2**62 - 1, [], 5),
+        (None, [2**62 - 1], 5),
+        (None, [2**62], 5),
+        (5, [2**62, 2**62 + 1], 5),
+        (2**63 - 9, [3], 5),
+        (2**63 - 2, [], 2),  # the last counter that can be continued from, and the last id there is
+    ],
+)
+def test_large_transaction_ids_that_can_be_stored_keep_counting(tmp_path, counter, recorded, rounds):
+    """The limit is what the database can hold. Numbering that is merely far along carries on as it
+    always did; cutting it off lower would leave a counter that hands out the same id for ever."""
+    data = tmp_path / "data"
+    store = Store(data)
+    for tid in recorded:
+        store.start_session(tid, SERIAL, 1, "t", "2026-10-31T10:00:00.000Z", 0, 0.1)
+    store.close()
+    (data / "state.json").write_text(json.dumps({"next_transaction_id": counter}))
+    store = Store(data)
+    first = max(counter or 1, max(recorded, default=0) + 1)
+    for expected in range(first, first + rounds):
+        tid = store.next_transaction_id()
+        assert tid == expected
+        store.start_session(tid, SERIAL, 1, "t", "2026-11-01T10:00:00.000Z", 0, 0.1)
+
+
 def test_transaction_ids_follow_the_history_at_every_allocation(tmp_path):
     store = Store(tmp_path / "data")
     assert store.next_transaction_id() == 1

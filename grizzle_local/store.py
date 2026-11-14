@@ -22,6 +22,9 @@ PRIVATE_FILE = 0o600
 # its own oldest rows instead of growing the database without end.
 MAX_SAMPLES_PER_STATION = 1_000_000
 MAX_SESSIONS_PER_STATION = 100_000
+# The largest integer SQLite stores. A transaction counter at or beyond it in state.json (a damaged
+# or hand-edited file) can never be recorded, so numbering does not continue from it.
+LAST_ID = 2**63 - 1
 
 
 def _finite(value: Any) -> Any:
@@ -109,8 +112,9 @@ class Store:
         committed: after a crash in between (or a lost state file) it is behind the history.
         """
         counter = self.state.get("next_transaction_id")
-        counter = counter if isinstance(counter, int) and not isinstance(counter, bool) and counter >= 1 else 1
-        newest = self._db.execute("SELECT MAX(id) FROM sessions").fetchone()[0]
+        if isinstance(counter, bool) or not isinstance(counter, int) or not 1 <= counter < LAST_ID:
+            counter = 1
+        newest = self._db.execute("SELECT MAX(id) FROM sessions WHERE id < ?", (LAST_ID,)).fetchone()[0]
         return max(counter, (newest or 0) + 1)
 
     def next_transaction_id(self) -> int:
