@@ -148,8 +148,6 @@ class ChargePointConnection:
         ws: web.WebSocketResponse,
         handler: Handler,
         *,
-        log_size: int = 200,
-        call_timeout: float = DEFAULT_CALL_TIMEOUT,
         rate_burst: int = RATE_BURST,
         rate_per_second: float = RATE_PER_SECOND,
     ) -> None:
@@ -158,14 +156,11 @@ class ChargePointConnection:
         self._handler = handler
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._send_lock = asyncio.Lock()
-        self._call_timeout = call_timeout
         self._rate_burst = float(rate_burst)
         self._rate = float(rate_per_second)
         self._allowance = self._rate_burst
         self._allowance_at = time.monotonic()
-        self.connected_at = datetime.now(UTC)
-        self.last_message_at = self.connected_at
-        self.log: deque[dict[str, Any]] = deque(maxlen=log_size)  # recent frames, for debugging
+        self.log: deque[dict[str, Any]] = deque(maxlen=200)  # recent frames, for debugging
 
     # --- outbound -----------------------------------------------------------
 
@@ -180,7 +175,7 @@ class ChargePointConnection:
         try:
             # The send is inside the deadline too: a peer that stops reading must not be able to
             # hold a caller (and the send lock) for as long as it likes.
-            async with asyncio.timeout(timeout or self._call_timeout):
+            async with asyncio.timeout(timeout or DEFAULT_CALL_TIMEOUT):
                 await self._send(frame, f"-> {action}")
                 return await fut
         except TimeoutError:
@@ -203,7 +198,6 @@ class ChargePointConnection:
         try:
             async for msg in self.ws:
                 if msg.type == WSMsgType.TEXT:
-                    self.last_message_at = datetime.now(UTC)
                     await self._throttle()
                     try:
                         await self._handle_text(msg.data)
@@ -266,7 +260,7 @@ class ChargePointConnection:
         elif kind == CALLERROR:
             self._record("in", "<- error", text)
             if fut and not fut.done():
-                code = frame[2] if len(frame) > 2 else "GenericError"
+                code = frame[2]
                 desc = frame[3] if len(frame) > 3 else ""
                 details = frame[4] if len(frame) > 4 else None
                 fut.set_exception(OcppError(str(code), str(desc), details))

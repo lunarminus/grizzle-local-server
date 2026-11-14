@@ -24,6 +24,7 @@ from aiohttp import web
 from . import __version__, holiday_calendar
 from .controller import MAX_CONNECTORS, MODES, Controller, _iso, _parse_iso, _same_secret, connector_count
 from .ocpp import CP_ID_RE, OcppError, printable
+from .store import _finite
 from .tls import client_ip
 
 _LOGGER = logging.getLogger(__name__)
@@ -60,10 +61,6 @@ PRIVATE_NAME_SUFFIXES = (
 # DNS override on the owner's own network makes them lead here.
 VENDOR_HOSTS = ("ocpp.unitedchargers.com", "connect-api.unitedchargers.com")
 _INTEGER_RE = re.compile(r"-?[0-9]{1,10}")
-
-
-def _now_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
 def _last_list(value: Any) -> list[Any] | None:
@@ -452,17 +449,6 @@ class Auth:
             del self._tokens[token]
 
 
-def _finite(value: Any) -> Any:
-    """The same structure with NaN/Infinity replaced by None."""
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, dict):
-        return {key: _finite(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_finite(item) for item in value]
-    return value
-
-
 def _dumps(data: Any) -> str:
     """Strict JSON. Python would happily write NaN, which no browser (or Home Assistant) can parse."""
     try:
@@ -579,9 +565,7 @@ def _whole(value: Any, name: str, lo: int, hi: int, default: int | None = None) 
             return default
         raise _bad_request(f"{name} is required")
     number: int | None = None
-    if isinstance(value, bool):
-        pass
-    elif isinstance(value, int):
+    if isinstance(value, int) and not isinstance(value, bool):
         number = value
     elif isinstance(value, float) and value.is_integer():
         number = int(value)
@@ -593,7 +577,7 @@ def _whole(value: Any, name: str, lo: int, hi: int, default: int | None = None) 
 
 
 def _row_limit(request: web.Request, default: int) -> int:
-    """``?limit=``: any whole number, brought into 1..MAX_SESSION_ROWS (as before); anything else is a 400."""
+    """``?limit=``: any whole number, brought into 1..MAX_SESSION_ROWS; anything else is a 400."""
     asked = _whole(request.query.get("limit"), "limit", -(10**9), 10**9, default=default)
     return max(1, min(asked, MAX_SESSION_ROWS))
 
@@ -655,13 +639,12 @@ async def list_stations(request: web.Request) -> web.Response:
     return _json({"stations": stations, "groups": []})
 
 
-async def get_station(request: web.Request) -> web.Response:
-    station = _station_or_404(request)
-    return _json(build_station(_controller(request), station))
-
-
 def _station_response(request: web.Request) -> web.Response:
     return _json(build_station(_controller(request), _station_or_404(request)))
+
+
+async def get_station(request: web.Request) -> web.Response:
+    return _station_response(request)
 
 
 async def set_mode(request: web.Request) -> web.Response:
@@ -935,7 +918,7 @@ async def health(request: web.Request) -> web.Response:
     data: dict[str, Any] = {
         "status": "ok",
         "version": __version__,
-        "time": _now_iso(),
+        "time": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
         "stationCount": len(online),
         "stationsOnline": sum(online.values()),
     }

@@ -489,9 +489,7 @@ async def _capture(args: argparse.Namespace) -> int:
 
 
 class _NotImplementedCall(Exception):
-    def __init__(self, action: str) -> None:
-        super().__init__(action)
-        self.action = action
+    pass
 
 
 class OcppWsClient:

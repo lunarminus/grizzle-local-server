@@ -44,7 +44,7 @@ def _host_name(entry: str) -> str:
     """
     entry = entry.strip().lower()
     if entry == "*" or entry.startswith("."):
-        return entry.rstrip(".") if entry != "." else ""
+        return entry.rstrip(".")
     try:
         host = urlsplit(entry if "://" in entry else f"//{entry}").hostname
     except ValueError:
@@ -66,13 +66,12 @@ def frame_ancestors(value: str | None) -> str:
                 source = f"{parts.scheme}://{parts.netloc}"
             except ValueError:
                 pass
-        sources.append(source)
-    for source in sources:
         if not _CSP_SOURCE_RE.fullmatch(source):
             raise ValueError(
                 f"GRIZZLE_FRAME_ANCESTORS: {source!r} is not a CSP source "
                 "(use 'self', *, or an origin such as http://homeassistant.local:8123)"
             )
+        sources.append(source)
     return " ".join(sources) or "'self'"
 
 

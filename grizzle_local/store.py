@@ -30,7 +30,7 @@ def _finite(value: Any) -> Any:
         return value if math.isfinite(value) else None
     if isinstance(value, dict):
         return {key: _finite(item) for key, item in value.items()}
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [_finite(item) for item in value]
     return value
 
@@ -42,7 +42,6 @@ def _restrict(path: Path) -> None:
 
 class Store:
     def __init__(self, data_dir: Path) -> None:
-        self.data_dir = data_dir
         data_dir.mkdir(parents=True, exist_ok=True)
         self._state_path = data_dir / "state.json"
         self.state: dict[str, Any] = self._load()
@@ -65,14 +64,8 @@ class Store:
         self._db.row_factory = sqlite3.Row
         self._init_db()
         for path in (self._state_path, db_path):
-            if path.exists():
-                _restrict(path)
-        # Never hand out an id history already uses: after a lost or reset state.json the counter
-        # would restart at 1 and the next sessions would overwrite the recorded ones.
-        counter = self.state.get("next_transaction_id")
-        counter = counter if isinstance(counter, int) and not isinstance(counter, bool) and counter >= 1 else 1
-        newest = self._db.execute("SELECT MAX(id) FROM sessions").fetchone()[0]
-        self.state["next_transaction_id"] = max(counter, (newest or 0) + 1)
+            _restrict(path)  # no state.json yet is an OSError too, ignored like the others
+        self.state["next_transaction_id"] = self._unused_id()
 
     # --- JSON state ---------------------------------------------------------
 
@@ -109,7 +102,7 @@ class Store:
                     os.fsync(handle.fileno())
             os.replace(tmp, self._state_path)
 
-    def next_transaction_id(self) -> int:
+    def _unused_id(self) -> int:
         """A transaction id no recorded session has, whatever state.json remembers.
 
         The counter is saved with the rest of the state, a few seconds after the session row is
@@ -118,7 +111,10 @@ class Store:
         counter = self.state.get("next_transaction_id")
         counter = counter if isinstance(counter, int) and not isinstance(counter, bool) and counter >= 1 else 1
         newest = self._db.execute("SELECT MAX(id) FROM sessions").fetchone()[0]
-        tid = max(counter, (newest or 0) + 1)
+        return max(counter, (newest or 0) + 1)
+
+    def next_transaction_id(self) -> int:
+        tid = self._unused_id()
         self.state["next_transaction_id"] = tid + 1
         return tid
 
@@ -199,9 +195,6 @@ class Store:
                 (stop_at, meter_stop, energy_wh, duration_s, cost, reason, price_kwh, tid),
             )
 
-    def add_sample(self, station: str, connector: int, tid: int | None, at: str, values: dict[str, Any]) -> None:
-        self.add_samples([(station, connector, tid, at, values)])
-
     def add_samples(self, rows: list[tuple[str, int, int | None, str, dict[str, Any]]]) -> None:
         """Insert several samples in one transaction (one commit, however many readings a message carries)."""
         if not rows:
@@ -275,9 +268,6 @@ class Store:
             (station, tid),
         ).fetchall()
         return [dict(r) for r in rows]
-
-    def set_session_cost(self, tid: int, cost: float, price_kwh: float | None) -> None:
-        self.set_session_costs([(tid, cost, price_kwh)])
 
     def set_session_costs(self, rows: list[tuple[int, float, float | None]]) -> None:
         """Update many sessions' costs in one transaction: ``(id, cost, price per kWh)`` each."""

