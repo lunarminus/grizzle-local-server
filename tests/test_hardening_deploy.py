@@ -751,19 +751,29 @@ def test_main_installs_the_formatter_that_keeps_log_lines_single():
         root.setLevel(saved_level)
 
 
-async def test_startup_says_so_when_the_password_is_a_well_known_one(tmp_path, caplog):
-    settings = Settings(
-        data_dir=tmp_path / "data", host="127.0.0.1", port=free_port(), tls_port=0, api_password="change-me"
-    )
-    caplog.set_level(logging.WARNING)
+@pytest.mark.parametrize(
+    "configured,level,said",
+    [
+        ({"api_password": "change-me"}, logging.WARNING, "SECURITY: GRIZZLE_API_PASSWORD is a well-known default"),
+        ({"allowed_chargers": "GRD-A1 GRD-B2"}, logging.INFO, "only these chargers may connect"),
+        ({"allowed_chargers": "GRD-A1 GRD-B2"}, logging.INFO, "(GRIZZLE_ALLOWED_CHARGERS): GRD-A1, GRD-B2"),
+        # A misspelt variable name leaves the list off; the log has to say that it is off.
+        ({}, logging.INFO, "any charger may connect (GRIZZLE_ALLOWED_CHARGERS is not set)"),
+    ],
+    ids=["well-known password", "allowed chargers", "which chargers", "no list"],
+)
+async def test_startup_says_what_an_operator_should_know(tmp_path, caplog, configured, level, said):
+    settings = Settings(data_dir=tmp_path / "data", host="127.0.0.1", port=free_port(), tls_port=0, **configured)
+    caplog.set_level(logging.INFO)
     server = asyncio.create_task(serve(settings))
     try:
-        await wait_for(lambda: any("SECURITY:" in r.getMessage() for r in caplog.records), timeout=5)
+        await wait_for(
+            lambda: any(said in r.getMessage() and r.levelno == level for r in caplog.records), timeout=5
+        )
     finally:
         server.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.wait_for(server, 8)
-    assert any("well-known default" in r.getMessage() for r in caplog.records)
 
 
 def test_frame_ancestors_may_be_pasted_from_the_address_bar():

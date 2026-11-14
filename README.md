@@ -90,6 +90,7 @@ Environment variables (all optional):
 | `GRIZZLE_PORT` | `9000` | WebSocket + REST port |
 | `GRIZZLE_API_EMAIL`, `GRIZZLE_API_PASSWORD` | `admin@local`, `grizzle` | Login for the REST API (what Home Assistant uses). **Change the password**: the server warns at every start while it is a well-known default. Changing either signs out all existing sessions. An empty password lets nobody in |
 | `GRIZZLE_OCPP_PASSWORD` | unset | If set, the charger's HTTP Basic password ("Auth key") must match; this is the strongest option. Without it, each station is pinned to the first Auth key it presents (see below) |
+| `GRIZZLE_ALLOWED_CHARGERS` | unset | Serial numbers of the only chargers that may connect, comma separated, exactly as the charger sends them (the web page and the log show them). Unset: any serial may. It keeps every other serial out; it does not by itself stop something else on your network from presenting a listed serial (see "Who may connect as a charger") |
 | `GRIZZLE_MAX_STATIONS` | `16` | How many stations may exist. A serial nobody has seen is added on its first connection, so the number is bounded; further unknown serials are refused (HTTP 503) until you delete a station or raise this |
 | `GRIZZLE_FRAME_ANCESTORS` | `'self'` | Who may show the web page in a frame (CSP `frame-ancestors`). To embed it in Home Assistant, name Home Assistant's origin, e.g. `http://homeassistant.local:8123` |
 | `GRIZZLE_ALLOWED_HOSTS` | unset | Extra host names under which browsers may use the page and API. IP addresses, names without a dot (`nas`) and names with a LAN-only ending (`.local`, `.lan`, `.home`, `.home.arpa`, `.internal`, `.intranet`, `.corp`, `.localdomain`, `.test`) always work. Any other name with a dot has to be listed, including router and VPN names such as `nas.fritz.box` or `nas.tailnet.ts.net`, and a reverse proxy's public name: to a server they look the same as a hostile site's (comma separated; `.example.com` allows every name under it; `*` allows all). The refusal names the exact value to set |
@@ -163,7 +164,22 @@ don't need it.
 **Who may connect as a charger.** A charger is identified by its serial (the last path segment, else
 the HTTP Basic user), which must match `[A-Za-z0-9][A-Za-z0-9._:-]{0,63}`.
 
-- With `GRIZZLE_OCPP_PASSWORD` set, the Basic password must equal it, and that is the only check.
+- With `GRIZZLE_ALLOWED_CHARGERS` set, a connection under any serial that is not listed is refused
+  (`rejected connection ... not in GRIZZLE_ALLOWED_CHARGERS` in the log), and no station is created
+  for it. A station that already exists but is not listed stays in the list of stations, still
+  counts towards `GRIZZLE_MAX_STATIONS`, and can no longer connect; delete it if it was never yours.
+  The server says at every start which chargers may connect. This is a filter, not proof of
+  identity: a serial is printed on the charger, so anything that knows it can present it. What
+  keeps an impostor from being taken for a listed charger is the next two points, with two limits.
+  The pin belongs to whatever first presented a key under that serial, and there is none at all if
+  something connected under it without a key first: after your charger's first connection look for
+  `<serial>: pinned to the Auth key it presented` in the log, and if it says `not pinning it`
+  instead, call `DELETE /local/stations/{serial}/auth-key` while only the charger can reach the
+  server. And on the plain `ws://` port the Auth key (or `GRIZZLE_OCPP_PASSWORD`) is sent in the same
+  request as the serial, so whoever can read that traffic has both; over `wss://` a passive listener
+  sees neither. A charger that sends no id appears as `unknown-<address>`; you can list that name,
+  but it stands for whatever connects without an id.
+- With `GRIZZLE_OCPP_PASSWORD` set, the Basic password must equal it.
 - Without it, the first Auth key (Basic password) a station presents is pinned and saved at once.
   From then on a connection for that serial with a different key, or none, is refused
   (`rejected connection ... Auth key does not match` in the log). If you change the charger's Auth key
@@ -176,9 +192,10 @@ the HTTP Basic user), which must match `[A-Za-z0-9][A-Za-z0-9._:-]{0,63}`.
   (a 5 s probe). Set `GRIZZLE_OCPP_PASSWORD` if your charger sends no key.
 - WebSocket handshakes carrying an `Origin` header (that is, from a browser) are refused; the
   charger's firmware doesn't send one.
-- A serial the server has never seen becomes a new station, and there may be at most
-  `GRIZZLE_MAX_STATIONS` (16) of those. If something on your network fills the list with invented
-  serials, delete them (`DELETE /local/stations/{serial}`) and set `GRIZZLE_OCPP_PASSWORD`.
+- A serial the server has never seen (with `GRIZZLE_ALLOWED_CHARGERS` set: only a listed one)
+  becomes a new station, and there may be at most `GRIZZLE_MAX_STATIONS` (16) of those. If something
+  on your network fills the station list with invented serials, delete them
+  (`DELETE /local/stations/{serial}`) and set `GRIZZLE_ALLOWED_CHARGERS` or `GRIZZLE_OCPP_PASSWORD`.
 
 You can test the whole chain without the real charger: `tools/fake_charger.py` accepts
 `wss://…` URLs with `--insecure`. The plain `ws://` listener on port 9000 also accepts
@@ -303,6 +320,8 @@ What the server assumes and what it does about it:
   type-checked and bounded (connector ids 1-8, 256 KiB frames, at most ~10 frames a second after
   a burst), a misbehaving station can't stall or corrupt the others, and the number of stations is
   capped. It can still fill *its own* station with nonsense; delete it and set the password.
+  `GRIZZLE_ALLOWED_CHARGERS` keeps every serial but the ones you name out altogether. A serial is no
+  secret, though, so that does not replace the password or a pinned Auth key.
 - **A charger's identity is its serial plus its Auth key.** The first key a serial presents is
   pinned. A charger that sends no key can't be authenticated at all (see section 2); `/health`
   therefore doesn't list serials to callers who aren't signed in.

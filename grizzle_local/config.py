@@ -13,6 +13,10 @@ from zoneinfo import ZoneInfo
 # Passwords this project has shipped in its documentation or compose file, plus the obvious ones.
 WELL_KNOWN_PASSWORDS = frozenset({"grizzle", "change-me", "changeme", "password", "admin", "admin@local"})
 
+# Charge point ids become station keys, appear in logs and in the web page: serials such as
+# GRD-L0000XXXX, plus the unknown-<ip> fallback (dots/colons).
+CP_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
+
 # One CSP source expression: 'self', 'none', *, a scheme (https:), a scheme://host[:port], or a host[:port].
 _CSP_SOURCE_RE = re.compile(
     r"'self'|'none'|\*|[A-Za-z][A-Za-z0-9+.-]*:|[A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9.*\[\]:-]+"
@@ -35,6 +39,11 @@ def _bool(name: str, default: bool) -> bool:
     if not value:
         return default
     return value in ("1", "true", "yes", "on")
+
+
+def _words(value: str | tuple | list) -> list:
+    """The entries of a setting that takes several values, separated by commas or spaces."""
+    return value.replace(",", " ").split() if isinstance(value, str) else list(value)
 
 
 def _host_name(entry: str) -> str:
@@ -100,6 +109,12 @@ class Settings:
     # enabled without the vendor's paid unlock. Only reached if connect-api.unitedchargers.com is
     # also DNS-overridden to this server. Set GRIZZLE_OCPP_UNLOCK=0 to disable.
     ocpp_unlock: bool = field(default_factory=lambda: _bool("GRIZZLE_OCPP_UNLOCK", True))
+    # The serial numbers of the only chargers that may connect (comma or space separated). Empty:
+    # any serial may. It keeps every other serial out. It does not prove that whoever presents a
+    # listed serial is that charger: a serial is no secret. That takes GRIZZLE_OCPP_PASSWORD, or
+    # the charger's Auth key, which the server pins the first time one is presented under that
+    # serial (unless something connected under it without a key before).
+    allowed_chargers: tuple[str, ...] = field(default_factory=lambda: os.environ.get("GRIZZLE_ALLOWED_CHARGERS", ""))
     # How many stations may exist. A charger nobody has seen before is added on its first
     # connection, by anyone who can reach the port, so the number has to be bounded.
     max_stations: int = field(default_factory=lambda: _int("GRIZZLE_MAX_STATIONS", 16))
@@ -128,17 +143,23 @@ class Settings:
 
     def __post_init__(self) -> None:
         self.frame_ancestors = frame_ancestors(self.frame_ancestors)
-        hosts = self.allowed_hosts
-        if isinstance(hosts, str):
-            hosts = hosts.replace(",", " ").split()
-        self.allowed_hosts = tuple(name for name in map(_host_name, hosts) if name)
-        proxies = self.trusted_proxies
-        if isinstance(proxies, str):
-            proxies = proxies.replace(",", " ").split()
+        self.allowed_hosts = tuple(name for name in map(_host_name, _words(self.allowed_hosts)) if name)
         try:
-            self.trusted_proxies = tuple(ipaddress.ip_network(str(proxy), strict=False) for proxy in proxies)
+            self.trusted_proxies = tuple(
+                ipaddress.ip_network(str(proxy), strict=False) for proxy in _words(self.trusted_proxies)
+            )
         except ValueError as err:
             raise ValueError(f"GRIZZLE_TRUSTED_PROXIES: {err} (use addresses or networks such as 10.0.0.0/8)") from None
+        self.allowed_chargers = tuple(_words(self.allowed_chargers))
+        for serial in self.allowed_chargers:
+            # An entry that can never be a charger's id would lock every charger out without saying
+            # why: `- GRIZZLE_ALLOWED_CHARGERS="GRD-..."` in a compose list keeps its quotes, for one.
+            if not isinstance(serial, str) or not CP_ID_RE.fullmatch(serial):
+                raise ValueError(
+                    f"GRIZZLE_ALLOWED_CHARGERS: {serial!r} cannot be a charger's serial number "
+                    "(letters, digits and . _ : - only, at most 64 characters, no quotes); "
+                    "to let any charger connect, leave it unset"
+                )
         self.max_stations = max(1, int(self.max_stations))
 
     def security_warnings(self) -> list[str]:
@@ -159,6 +180,13 @@ class Settings:
             warnings.append(
                 "GRIZZLE_FRAME_ANCESTORS=* lets any web site show the page in a frame (clickjacking); "
                 "name the origin that embeds it instead"
+            )
+        placeholders = [serial for serial in self.allowed_chargers if serial.startswith("unknown-")]
+        if placeholders:
+            warnings.append(
+                f"GRIZZLE_ALLOWED_CHARGERS lists {', '.join(placeholders)}: that is the name given to whatever "
+                "connects without an id, not a serial, and anyone can also write it in the URL. Set a charge point "
+                "id or an Auth key on the charger if it has one, or set GRIZZLE_OCPP_PASSWORD"
             )
         try:
             ZoneInfo(self.timezone)

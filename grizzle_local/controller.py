@@ -508,8 +508,12 @@ class Controller:
     async def connection_refusal(self, cp_id: str, auth_key: str | None) -> tuple[int, str] | None:
         """Decide whether a charger may connect as ``cp_id``; (HTTP status, reason) if not.
 
-        - With GRIZZLE_OCPP_PASSWORD set, the Basic password must match it, and nothing else is
-          checked (so changing the password never collides with a per-station pin).
+        - With GRIZZLE_ALLOWED_CHARGERS set, only the serials listed there are considered at all.
+          That keeps other serials out; it is the checks below that keep someone else from being
+          taken for a listed one, since a serial is no secret.
+        - With GRIZZLE_OCPP_PASSWORD set, the Basic password must match it and no per-station pin
+          is consulted (so changing the password never collides with one). The key presented is
+          still recorded, and is the station's pin if the password is later unset.
         - Otherwise a station is pinned to the first Auth key it presents (trust on first use):
           any other key, or none, is refused. Clear the pin with DELETE /local/stations/{id}/auth-key.
         - A connection that proves nothing (no password, nothing pinned) may create a new station,
@@ -526,9 +530,16 @@ class Controller:
         return refusal
 
     async def _refusal(self, cp_id: str, auth_key: str | None) -> tuple[int, str] | None:
-        if self.settings.ocpp_password is not None:
-            if not _same_secret(auth_key, self.settings.ocpp_password):
-                return 401, "wrong OCPP password (GRIZZLE_OCPP_PASSWORD)"
+        password = self.settings.ocpp_password
+        if password is not None and not _same_secret(auth_key, password):
+            return 401, "wrong OCPP password (GRIZZLE_OCPP_PASSWORD)"
+        if self.settings.allowed_chargers and cp_id not in self.settings.allowed_chargers:
+            # Answered like a wrong key or password (401). That hides the list only from someone
+            # who could not get in anyway: with GRIZZLE_OCPP_PASSWORD set, or for a serial whose key
+            # is pinned, listed and unlisted serials get the same reply. Without either, a listed
+            # serial is let in (or gets 409 or 503), which tells them apart.
+            return 401, "its serial is not in GRIZZLE_ALLOWED_CHARGERS; add it there to let this charger connect"
+        if password is not None:
             return self._full(cp_id)
         pinned = (self.station(cp_id) or {}).get("ocppAuthKey")
         if pinned:
