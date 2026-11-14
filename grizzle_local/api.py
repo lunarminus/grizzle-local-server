@@ -22,8 +22,9 @@ from urllib.parse import urlsplit
 from aiohttp import web
 
 from . import __version__, holiday_calendar
+from .config import CP_ID_RE
 from .controller import MAX_CONNECTORS, MODES, Controller, _iso, _parse_iso, _same_secret, connector_count
-from .ocpp import CP_ID_RE, OcppError, printable
+from .ocpp import OcppError, printable
 from .store import _finite
 from .tls import client_ip
 

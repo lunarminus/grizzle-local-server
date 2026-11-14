@@ -12,9 +12,12 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from fake_charger import FakeCharger
 
+from grizzle_local.config import Settings
+
 from .support import login, make_app, wait_for
 
 SERIAL = "GRD-L0000TEST1"
+OTHER = "GRD-L0000TEST2"
 AUTH_KEY = "s3cr3t-auth-key"
 
 
@@ -330,3 +333,71 @@ async def test_concurrent_first_connections_cannot_both_get_in(server, session, 
     finally:
         for _, ws in winners:
             await ws.close()
+
+
+# --- #3: GRIZZLE_ALLOWED_CHARGERS, the serials that may connect at all -------------------------------
+
+
+def test_allowed_chargers_setting(monkeypatch):
+    assert Settings().allowed_chargers == ()
+    monkeypatch.setenv("GRIZZLE_ALLOWED_CHARGERS", f" {SERIAL},{OTHER}  unknown-192.168.1.50 ")
+    assert Settings().allowed_chargers == (SERIAL, OTHER, "unknown-192.168.1.50")
+    monkeypatch.setenv("GRIZZLE_ALLOWED_CHARGERS", " , ")
+    assert Settings().allowed_chargers == ()  # blank: no list, any serial may connect
+    assert Settings(allowed_chargers=[SERIAL]).allowed_chargers == (SERIAL,)
+    # An entry no charger could ever present (quotes kept by a compose list, say) is an error at
+    # startup rather than a charger that is silently never let in.
+    for impossible in (f'"{SERIAL}"', f"{SERIAL};", "*", "-GRD", "x" * 65):
+        with pytest.raises(ValueError, match="GRIZZLE_ALLOWED_CHARGERS"):
+            Settings(allowed_chargers=impossible)
+
+
+async def test_only_listed_serials_may_connect(tmp_path, session, caplog):
+    app = _make_server(tmp_path, allowed_chargers=f"{SERIAL}, {OTHER}")
+    async with TestServer(app) as ts, TestClient(ts) as server:
+        controller = server.app["controller"]
+        assert await _ws_status(server, session, f"/ocpp1.6/{SERIAL}", auth=(SERIAL, AUTH_KEY)) == 101
+        assert await _ws_status(server, session, f"/ocpp1.6/{OTHER}") == 101
+        # Not listed: near misses, another spelling, and the name given to a charger that sends no serial.
+        for stranger in ("GRD-L0000TEST3", SERIAL.lower(), SERIAL[:-1], SERIAL + "1", "unknown-127.0.0.1"):
+            assert await _ws_status(server, session, f"/ocpp1.6/{stranger}") == 401, stranger
+        # However the serial is given: as the HTTP Basic user, or not at all.
+        assert await _ws_status(server, session, "/ocpp1.6", auth=("GRD-L0000TEST3", "key")) == 401
+        assert await _ws_status(server, session, "/ocpp1.6") == 401
+        await wait_for(lambda: not controller.is_online(OTHER))
+        assert await _ws_status(server, session, "/ocpp1.6", auth=(OTHER, "")) == 101
+        assert set(controller.stations) == {SERIAL, OTHER}  # nothing was kept for the others
+    assert "GRD-L0000TEST3: rejected connection" in caplog.text and "GRIZZLE_ALLOWED_CHARGERS" in caplog.text
+
+
+async def test_a_listed_serial_still_needs_its_key(tmp_path, session):
+    """The list keeps other serials out. A serial is printed on the charger and anyone can present
+    it: what keeps someone else from being taken for a listed charger is still its key."""
+    async with TestServer(_make_server(tmp_path, allowed_chargers=SERIAL)) as ts, TestClient(ts) as server:
+        cp, task = await _start_charger(server, session)  # the real one; its key is pinned
+        try:
+            assert await _ws_status(server, session, f"/ocpp1.6/{SERIAL}") == 401
+            assert await _ws_status(server, session, f"/ocpp1.6/{SERIAL}", auth=(SERIAL, "a guess")) == 401
+            assert server.app["controller"].is_online(SERIAL)
+        finally:
+            await _stop_charger(cp, task)
+        await wait_for(lambda: not server.app["controller"].is_online(SERIAL))
+        assert await _ws_status(server, session, f"/ocpp1.6/{SERIAL}", auth=(SERIAL, "a guess")) == 401
+        assert await _ws_status(server, session, f"/ocpp1.6/{SERIAL}", auth=(SERIAL, AUTH_KEY)) == 101
+
+
+async def test_the_list_applies_with_a_shared_ocpp_password_too(tmp_path, session):
+    app = _make_server(tmp_path, allowed_chargers=SERIAL, ocpp_password="shared-pw")
+    async with TestServer(app) as ts, TestClient(ts) as server:
+        assert await _ws_status(server, session, f"/ocpp1.6/{OTHER}", auth=(OTHER, "shared-pw")) == 401
+        assert await _ws_status(server, session, f"/ocpp1.6/{SERIAL}", auth=(SERIAL, "wrong")) == 401
+        assert await _ws_status(server, session, f"/ocpp1.6/{SERIAL}", auth=(SERIAL, "shared-pw")) == 101
+        assert set(server.app["controller"].stations) == {SERIAL}
+
+
+async def test_a_station_left_off_the_list_is_kept_but_cannot_connect(tmp_path, session):
+    async with TestServer(_make_server(tmp_path)) as ts, TestClient(ts) as server:  # no list yet
+        assert await _ws_status(server, session, f"/ocpp1.6/{OTHER}") == 101
+    async with TestServer(_make_server(tmp_path, allowed_chargers=SERIAL)) as ts, TestClient(ts) as server:
+        assert await _ws_status(server, session, f"/ocpp1.6/{OTHER}") == 401
+        assert OTHER in server.app["controller"].stations

@@ -13,9 +13,9 @@ from aiohttp import web
 
 from . import __version__
 from .api import Auth, add_routes, auth_middleware
-from .config import Settings
+from .config import CP_ID_RE, Settings
 from .controller import Controller
-from .ocpp import CP_ID_RE, MAX_FRAME_BYTES, ChargePointConnection, now_iso, printable
+from .ocpp import MAX_FRAME_BYTES, ChargePointConnection, now_iso, printable
 from .store import Store
 from .tls import PEERS_KEY, client_ip, start_tls_frontend
 
@@ -203,6 +203,10 @@ async def serve(settings: Settings) -> None:
     )
     for warning in settings.security_warnings():
         _LOGGER.warning("SECURITY: %s", warning)
+    if settings.allowed_chargers:
+        _LOGGER.info(
+            "only these chargers may connect (GRIZZLE_ALLOWED_CHARGERS): %s", ", ".join(settings.allowed_chargers)
+        )
     # docker stop sends SIGTERM; without a handler the process dies before the shutdown save.
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

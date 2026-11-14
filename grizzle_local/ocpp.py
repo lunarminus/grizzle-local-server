@@ -34,10 +34,6 @@ CALLERROR = 4
 
 DEFAULT_CALL_TIMEOUT = 30
 
-# Charge point ids become station keys, appear in logs and in the web page: serials such as
-# GRD-L0000XXXX, plus the unknown-<ip> fallback (dots/colons).
-CP_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
-
 # OCPP frames are a few hundred bytes; the largest, a GetConfiguration reply, a few KiB.
 MAX_FRAME_BYTES = 256 * 1024
 # A frame bigger than this is noted in the debug log but not kept, and what is kept is kept as

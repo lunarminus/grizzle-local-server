@@ -18,6 +18,7 @@ services:
       # it is a well-known default. Changing it later signs out every existing session.
       GRIZZLE_API_PASSWORD: change-me
       # GRIZZLE_OCPP_PASSWORD: ""       # set to require the charger's OCPP "Auth key"
+      # GRIZZLE_ALLOWED_CHARGERS: GRD-L0000XXXXXX   # only these serials may connect (comma separated); unset: any
       # GRIZZLE_MAX_STATIONS: "16"      # how many chargers may register (unknown serials are added on first contact)
       # GRIZZLE_FRAME_ANCESTORS: http://homeassistant.local:8123   # who may show the page in a frame (default: nobody else)
       # GRIZZLE_ALLOWED_HOSTS: grizzle.example.com                 # a public DNS name you open the page under (reverse proxy)
