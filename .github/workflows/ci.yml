@@ -21,8 +21,8 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.13"
-      # Every package, ruff included, is pinned with hashes in the lock file.
-      - run: pip install --require-hashes -r requirements-dev.txt
+      # Every package, ruff included, is pinned with hashes in the two lock files.
+      - run: pip install --require-hashes -r requirements.txt -r requirements-dev.txt
       - run: ruff check --select F,E9,B,E --line-length 120 grizzle_local tools tests scripts
       - run: pytest -q
       # The entrypoint's tests need root (dropping it is what they test), which this job's user is not.

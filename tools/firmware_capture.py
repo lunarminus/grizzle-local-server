@@ -12,8 +12,8 @@ The cloud's firmware endpoint (reverse engineered from the Grizzl-E Connect app)
           "latestFirmware": {"version": str, "changelog": str},
           "station": {"model": {"displayName": str}}}
 The app starts an update with POST to the same path and body {}; the cloud then
-sends the charger an OCPP UpdateFirmware with the download URL. This tool does not
-POST.
+sends the charger an OCPP UpdateFirmware with the download URL. ``check`` does not
+POST; ``capture`` does, unless --no-trigger is given.
 
 Auth: a bearer token saved by grizzle_connect.py (``~/.config/grizzle_connect/tokens.json``,
 or $GRIZZLE_TOKEN_FILE / --token-file), or an email+password login. The password is

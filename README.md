@@ -33,7 +33,7 @@ Nothing leaves your LAN: the charger talks to this container, and the
 - **REST API shaped like `connect-api.unitedchargers.com`**, so the Home Assistant
   integration only needs a different server URL. Plus a few `/local/...` extras:
   raw OCPP calls, the frame log, meter history.
-- Single process, single port, two dependencies (aiohttp, holidays), state survives restarts.
+- Single process, single port, three dependencies (aiohttp, holidays, tzdata), state survives restarts.
 - **Built for a network you don't fully trust.** Everything a charger or an API client sends is
   validated and bounded; see [Security](#security) for what is and isn't protected.
 
@@ -348,7 +348,7 @@ Nothing needs to be migrated by hand, but a few things behave differently on pur
 
 ```bash
 python3.13 -m venv .venv && . .venv/bin/activate
-pip install -r requirements-dev.txt         # everything pinned with hashes; see requirements*.in
+pip install -r requirements.txt -r requirements-dev.txt   # everything pinned with hashes; see requirements*.in
 pytest                                      # schedules, TLS, end-to-end with the fake charger, hardening
 GRIZZLE_DATA_DIR=./data GRIZZLE_PORT=9000 python -m grizzle_local
 python tools/fake_charger.py ws://localhost:9000/ocpp1.6/GRD-FAKE0001 --plug-in 5
@@ -364,6 +364,7 @@ grizzle_local/
 ├── store.py       # state.json + history.sqlite
 ├── config.py      # env vars
 ├── tls.py         # wss:// front door with handshake logging
+├── healthcheck.py # the container's HEALTHCHECK: asks /health wherever the server listens
 ├── web/index.html # the built-in web page (inline CSS and JS, no build step)
 └── main.py        # aiohttp app: WebSocket upgrade on any path, REST
 tools/fake_charger.py   # simulated Grizzl-E, also used by the tests
@@ -374,7 +375,8 @@ docker-entrypoint.sh    # hands the volumes to the unprivileged user, then drops
 
 Dependencies are locked: `requirements.in` lists what the server needs, `requirements.txt` is
 compiled from it with every package pinned and hashed (`pip-compile --generate-hashes`), and the
-image installs with `--require-hashes`. To update, edit the `.in` file (or let Dependabot propose
+image installs with `--require-hashes`. `requirements-dev.txt` adds the test and lint tools on top
+of it in the same way. To update, edit the `.in` file (or let Dependabot propose
 it) and recompile both lock files with the commands at the top of each `.in`. The lock files are
 for Python 3.13, the version the image and CI use; the code runs on 3.11 and later, and on another
 version install from the `.in` files instead (`pip install -r requirements.in pytest pytest-asyncio ruff`).
