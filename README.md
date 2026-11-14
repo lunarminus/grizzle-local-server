@@ -366,7 +366,7 @@ Nothing needs to be migrated by hand, but a few things behave differently on pur
 ## Development
 
 ```bash
-python3.15 -m venv .venv && . .venv/bin/activate
+python$(scripts/image-python-version.sh) -m venv .venv && . .venv/bin/activate   # the Python the image is built on
 pip install -r requirements.txt -r requirements-dev.txt   # everything pinned with hashes; see requirements*.in
 pytest                                      # schedules, TLS, end-to-end with the fake charger, hardening
 GRIZZLE_DATA_DIR=./data GRIZZLE_PORT=9000 python -m grizzle_local
@@ -389,6 +389,7 @@ grizzle_local/
 tools/fake_charger.py   # simulated Grizzl-E, also used by the tests
 scripts/make-cert.sh    # self-signed certificate for ocpp.unitedchargers.com
 scripts/container-smoke-test.sh   # builds nothing; starts an image and checks it end to end (CI runs it)
+scripts/image-python-version.sh   # prints the Python version the Dockerfile builds on (CI tests on it)
 docker-entrypoint.sh    # hands the volumes to the unprivileged user, then drops root
 ```
 
@@ -397,8 +398,10 @@ compiled from it with every package pinned and hashed (`pip-compile --generate-h
 image installs with `--require-hashes`. `requirements-dev.txt` adds the test and lint tools on top
 of it in the same way. To update, edit the `.in` file (or let Dependabot propose
 it) and recompile both lock files with the commands at the top of each `.in`. The lock files are
-for Python 3.15, the version the image and CI use; the code runs on 3.11 and later, and on another
-version install from the `.in` files instead (`pip install -r requirements.in pytest pytest-asyncio ruff`).
+for the Python the image is built on, the one in the `FROM` line of the `Dockerfile`. CI reads the
+version from there and runs the tests on it, so when the base image is updated the tests run on
+the Python that update brings. The code runs on 3.11 and later; on another version install from
+the `.in` files instead (`pip install -r requirements.in pytest pytest-asyncio ruff`).
 
 ## Status
 

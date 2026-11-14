@@ -18,9 +18,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The tests run on the Python the image is built on. Its version is read from the Dockerfile, not
+      # written here, so an update of the base image is tested on the Python that update brings.
+      - id: python
+        run: |
+          version=$(scripts/image-python-version.sh)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.15" # the Python the image is built on (see Dockerfile)
+          python-version: ${{ steps.python.outputs.version }}
       # Every package, ruff included, is pinned with hashes in the two lock files.
       - run: pip install --require-hashes -r requirements.txt -r requirements-dev.txt
       - run: ruff check --select F,E9,B,E --line-length 120 grizzle_local tools tests scripts

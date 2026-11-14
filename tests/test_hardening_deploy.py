@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import pwd
+import re
 import shutil
 import signal
 import socket
@@ -35,6 +36,7 @@ from .support import EMAIL, PASSWORD, RawCharger, free_port, make_app, wait_for
 
 ROOT = Path(__file__).resolve().parents[1]
 ENTRYPOINT = ROOT / "docker-entrypoint.sh"
+IMAGE_PYTHON = ROOT / "scripts" / "image-python-version.sh"
 SERIAL = "GRD-L0000HARD3"
 
 
@@ -342,6 +344,94 @@ def test_entrypoint_and_dockerfile_agree():
         if line and not line.startswith((" ", "#")):
             assert "==" in line and line.rstrip().endswith("\\"), line
     assert locked.count("--hash=sha256:") > 50
+
+
+# --- scripts/image-python-version.sh: which Python CI runs the tests on -----------------------------
+
+
+def _image_python(dockerfile: Path | None = None, cwd: Path = ROOT) -> subprocess.CompletedProcess:
+    command = ["sh", str(IMAGE_PYTHON), *([str(dockerfile)] if dockerfile else [])]
+    return subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=30)
+
+
+@pytest.mark.parametrize(
+    ("dockerfile", "version"),
+    [
+        ("FROM python:3.15-slim\n", "3.15"),
+        ("FROM python:3.16-slim\nRUN pip install x\n", "3.16"),  # the next update of the base image
+        ("FROM python:3.9", "3.9"),  # nothing after the version, not even a newline
+        ("# FROM python:3.8-slim\nfrom python:3.15.2-slim-bookworm as base\n", "3.15"),
+        ("FROM --platform=$BUILDPLATFORM python:3.15-slim AS build\nFROM python:3.15-slim\n", "3.15"),
+        ("FROM python:3.15-slim@sha256:" + "ab" * 32 + "\n", "3.15"),
+        ("FROM node:22-slim AS web\r\n\tFROM  python:3.10-alpine\r\n", "3.10"),
+    ],
+)
+def test_image_python_version_is_the_one_in_the_from_line(tmp_path, dockerfile, version):
+    (tmp_path / "Dockerfile").write_bytes(dockerfile.encode())
+    result = _image_python(tmp_path / "Dockerfile")
+    assert (result.returncode, result.stdout, result.stderr) == (0, version + "\n", "")
+
+
+@pytest.mark.parametrize(
+    ("dockerfile", "reason"),
+    [
+        ("", "no FROM line names the python image"),
+        ("FROM debian:13-slim\nRUN apt-get install -y python3\n", "no FROM line names the python image"),
+        ("# FROM python:3.15-slim\nRUN echo FROM python:3.15-slim\n", "no FROM line names the python image"),
+        ("FROM pythonista/python:3.15\n", "no FROM line names the python image"),
+        ("FROM python\n", 'no Python version (python:X.Y...) in "FROM python"'),  # whatever is latest
+        ("FROM python:slim\n", 'in "FROM python:slim"'),
+        ("FROM python:3-slim\n", 'in "FROM python:3-slim"'),  # any 3.x
+        ("FROM python:3.16.0rc1-slim\n", 'in "FROM python:3.16.0rc1-slim"'),  # not a release
+        ("FROM python@sha256:" + "ab" * 32 + "\n", 'in "FROM python@sha256:'),
+        ("ARG PYTHON=3.15\nFROM python:${PYTHON}-slim\n", 'in "FROM python:${PYTHON}-slim"'),
+        ("FROM python:3.15-slim AS build\nFROM python:3.16-slim\n", "different Python versions: 3.15 and 3.16"),
+        ("FROM python:3.15-slim\nFROM python:slim\n", 'in "FROM python:slim"'),
+    ],
+)
+def test_image_python_version_is_never_a_guess(tmp_path, dockerfile, reason):
+    (tmp_path / "Dockerfile").write_text(dockerfile)
+    result = _image_python(tmp_path / "Dockerfile")
+    assert result.returncode != 0 and result.stdout == ""
+    assert reason in result.stderr and f"cannot tell which Python {tmp_path / 'Dockerfile'}" in result.stderr
+
+
+def test_image_python_version_needs_a_dockerfile_it_can_read(tmp_path):
+    for unreadable in (tmp_path / "nowhere", tmp_path):
+        result = _image_python(unreadable)
+        assert result.returncode != 0 and result.stdout == "" and f"cannot read {unreadable}" in result.stderr
+
+
+def _ci_python_step(checkout: Path, tmp_path: Path) -> tuple[int, str]:
+    """Run the CI step that tells setup-python which version to install, the way the runner runs it."""
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    step = re.search(r"^      - id: python\n        run: \|\n((?:          .*\n)+)", ci, re.M)
+    script, output = tmp_path / "step.sh", tmp_path / "github-output"
+    script.write_text(step[1])
+    output.write_text("")
+    env = {**os.environ, "GITHUB_OUTPUT": str(output)}
+    result = subprocess.run(["bash", "-e", str(script)], cwd=checkout, env=env, capture_output=True, timeout=30)
+    return result.returncode, output.read_text()
+
+
+def test_ci_runs_the_tests_on_the_python_the_image_is_built_on(tmp_path):
+    assert os.access(IMAGE_PYTHON, os.X_OK)  # CI and the README call it by its path
+    assert subprocess.run(["sh", "-n", str(IMAGE_PYTHON)]).returncode == 0  # parses as POSIX sh
+    # Called from anywhere, it reads this repository's Dockerfile.
+    built_on = re.search(r"^FROM python:(\d+\.\d+)", (ROOT / "Dockerfile").read_text(), re.M)[1]
+    result = _image_python(cwd=tmp_path)
+    assert (result.returncode, result.stdout) == (0, built_on + "\n"), result.stderr
+    # CI installs the version the script prints, and no version is written into the workflow.
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    assert re.findall(r"python-version:.*", ci) == ["python-version: ${{ steps.python.outputs.version }}"]
+    assert _ci_python_step(ROOT, tmp_path) == (0, f"version={built_on}\n")
+    # A Dockerfile the version cannot be read from fails the step. Left with an empty version,
+    # setup-python would use whatever Python the runner happens to have, and say nothing.
+    checkout = tmp_path / "checkout"
+    shutil.copytree(ROOT / "scripts", checkout / "scripts")
+    (checkout / "Dockerfile").write_text("FROM python:slim\n")
+    code, written = _ci_python_step(checkout, tmp_path)
+    assert code != 0 and written == ""
 
 
 # --- tools/firmware_capture.py --------------------------------------------------------------------
