@@ -366,7 +366,7 @@ Nothing needs to be migrated by hand, but a few things behave differently on pur
 ## Development
 
 ```bash
-python3.13 -m venv .venv && . .venv/bin/activate
+python3.15 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt -r requirements-dev.txt   # everything pinned with hashes; see requirements*.in
 pytest                                      # schedules, TLS, end-to-end with the fake charger, hardening
 GRIZZLE_DATA_DIR=./data GRIZZLE_PORT=9000 python -m grizzle_local
@@ -397,7 +397,7 @@ compiled from it with every package pinned and hashed (`pip-compile --generate-h
 image installs with `--require-hashes`. `requirements-dev.txt` adds the test and lint tools on top
 of it in the same way. To update, edit the `.in` file (or let Dependabot propose
 it) and recompile both lock files with the commands at the top of each `.in`. The lock files are
-for Python 3.13, the version the image and CI use; the code runs on 3.11 and later, and on another
+for Python 3.15, the version the image and CI use; the code runs on 3.11 and later, and on another
 version install from the `.in` files instead (`pip install -r requirements.in pytest pytest-asyncio ruff`).
 
 ## Status
