@@ -22,35 +22,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import aiohttp
+import firmware_capture as fc
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-import firmware_capture as fc  # noqa: E402
-from fake_charger import FakeCharger  # noqa: E402
+from fake_charger import FakeCharger
 
 from grizzle_local.config import Settings
 from grizzle_local.main import serve
 from grizzle_local.tls import PEERS_KEY, client_ip, start_tls_frontend, upstream_host
 
-from .support import EMAIL, PASSWORD, RawCharger, make_app, wait_for
+from .support import EMAIL, PASSWORD, RawCharger, free_port, make_app, wait_for
 
 ROOT = Path(__file__).resolve().parents[1]
 ENTRYPOINT = ROOT / "docker-entrypoint.sh"
 SERIAL = "GRD-L0000HARD3"
-
-
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-@pytest.fixture(scope="module")
-def certs(tmp_path_factory):
-    out = tmp_path_factory.mktemp("certs")
-    subprocess.run([str(ROOT / "scripts/make-cert.sh"), str(out)], check=True, capture_output=True)
-    return out / "fullchain.pem", out / "privkey.pem"
 
 
 # --- shutting down ------------------------------------------------------------------------------
@@ -216,12 +201,9 @@ async def test_sign_in_throttle_counts_the_real_client_not_the_frontend(tmp_path
 
 async def test_placeholder_charger_id_uses_the_real_address(tmp_path):
     async with TestServer(make_app(tmp_path)) as ts, TestClient(ts) as client, aiohttp.ClientSession() as session:
-        cp = await RawCharger.connect(client, session, "ignored", path="/ocpp1.6")  # no serial anywhere
-        try:
+        async with await RawCharger.connect(client, session, "ignored", path="/ocpp1.6"):  # no serial anywhere
             await wait_for(lambda: client.app["controller"].stations)
             assert list(client.app["controller"].stations) == ["unknown-127.0.0.1"]
-        finally:
-            await cp.close()
 
 
 # --- the container entrypoint -------------------------------------------------------------------------
@@ -434,9 +416,7 @@ def firmware_host():
     server.shutdown()
 
 
-def test_download_stops_at_the_size_limit(tmp_path, firmware_host, monkeypatch):
-    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
-    monkeypatch.setenv("no_proxy", "127.0.0.1")
+def test_download_stops_at_the_size_limit(tmp_path, firmware_host):
     info = fc.download_image(f"{firmware_host}/image.bin", tmp_path / "image.bin")
     assert info["size"] == 5001 and (tmp_path / "image.bin").read_bytes() == _Firmware.body
 
@@ -591,8 +571,6 @@ def test_n1_poc_only_counts_a_success_as_confirmation(monkeypatch, capsys, statu
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        monkeypatch.setenv("NO_PROXY", "127.0.0.1")
-        monkeypatch.setenv("no_proxy", "127.0.0.1")
         monkeypatch.setattr(sys, "argv", ["poc", "--host", "127.0.0.1", "--port", str(server.server_address[1])])
         assert poc.main() == expected_exit
     finally:
@@ -675,7 +653,11 @@ async def test_health_check_asks_where_the_server_listens(tmp_path, monkeypatch)
     async with TestServer(make_app(tmp_path)) as server:
         monkeypatch.setenv("GRIZZLE_HOST", "127.0.0.1")
         monkeypatch.setenv("GRIZZLE_PORT", str(server.port))
-        monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")  # a proxy setting must not come between us and ourselves
+        # A proxy setting must not come between us and ourselves. (Without the suite-wide NO_PROXY, which
+        # would keep any client away from the proxy and prove nothing about this one.)
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("no_proxy", raising=False)
+        monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
         assert await asyncio.to_thread(healthcheck.main) == 0
         monkeypatch.setenv("GRIZZLE_PORT", str(free_port()))
         assert await asyncio.to_thread(healthcheck.main) == 1

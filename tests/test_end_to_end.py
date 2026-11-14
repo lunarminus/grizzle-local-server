@@ -3,45 +3,25 @@
 from __future__ import annotations
 
 import asyncio
-import sys
-from pathlib import Path
 from typing import Any
 
 import aiohttp
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from fake_charger import FakeCharger  # noqa: E402
+from fake_charger import FakeCharger
 
 from grizzle_local.config import Settings
 from grizzle_local.main import create_app
 from grizzle_local.store import Store
 
+from .support import make_app, make_controller, wait_for
+
 SERIAL = "GRD-L0000TEST1"
-
-
-async def wait_for(predicate, timeout=10.0, step=0.05):
-    deadline = asyncio.get_running_loop().time() + timeout
-    while asyncio.get_running_loop().time() < deadline:
-        result = predicate()
-        if result:
-            return result
-        await asyncio.sleep(step)
-    raise AssertionError("condition not met in time")
 
 
 @pytest.fixture
 async def server(tmp_path):
-    settings = Settings(
-        data_dir=tmp_path / "data",
-        timezone="America/Denver",
-        api_email="ha@local",
-        api_password="pw",
-        tick_seconds=1,
-        meter_interval=1,
-    )
-    app = create_app(settings, Store(settings.data_dir))
+    app = make_app(tmp_path, timezone="America/Denver", api_password="pw", meter_interval=1)
     async with TestServer(app) as test_server, TestClient(test_server) as client:
         yield client
 
@@ -118,10 +98,7 @@ async def test_plug_in_starts_transaction_and_meter_values_flow(server, charger)
     await wait_for(lambda: 1 in charger.transactions)
     assert any(a == "RemoteStartTransaction" and p["connectorId"] == 1 for a, p in charger.received)
 
-    def charging():
-        return (c := charger.status.get(1)) == "Charging" and c
-
-    await wait_for(charging)
+    await wait_for(lambda: charger.status.get(1) == "Charging")
     await asyncio.sleep(1.5)  # a couple of MeterValues
     station = await api.station()
     connector = station["connectors"][0]
@@ -306,10 +283,7 @@ async def test_state_survives_restart(tmp_path):
 
 async def test_session_relative_energy_register(tmp_path):
     """Real Duo firmware: StartTransaction.meterStart is lifetime Wh, MeterValues restart at 0."""
-    from grizzle_local.controller import Controller
-
-    settings = Settings(data_dir=tmp_path / "data")
-    controller = Controller(settings, Store(settings.data_dir))
+    controller = make_controller(tmp_path)
     station = controller._ensure_station(SERIAL)
     await controller._on_StartTransaction(
         station,
@@ -350,10 +324,7 @@ async def test_session_relative_energy_register(tmp_path):
 
 
 async def test_config_keys_teach_dip_switch_and_connectors(tmp_path):
-    from grizzle_local.controller import Controller
-
-    settings = Settings(data_dir=tmp_path / "data")
-    controller = Controller(settings, Store(settings.data_dir))
+    controller = make_controller(tmp_path)
     station = controller._ensure_station(SERIAL)
     controller._learn_from_config(
         station, {"DipSwitchCurrentLimit": "32", "NumberOfConnectors": "2", "AuthTag": "uc_default_auth"}
@@ -404,10 +375,7 @@ async def test_session_history_with_live_and_finished_sessions(server, charger):
 
 async def test_recalculate_reprices_past_and_running_sessions(tmp_path):
     """Sessions recorded before any price existed get repriced from their stored meter samples."""
-    from grizzle_local.controller import Controller
-
-    settings = Settings(data_dir=tmp_path / "data", timezone="America/Denver")
-    controller = Controller(settings, Store(settings.data_dir))
+    controller = make_controller(tmp_path, timezone="America/Denver")
     station = controller._ensure_station(SERIAL)
 
     def sample(tid: int, stamp: str, wh: float) -> dict:

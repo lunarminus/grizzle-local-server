@@ -6,39 +6,20 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import sys
-from pathlib import Path
 
 import aiohttp
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
+from fake_charger import FakeCharger
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from fake_charger import FakeCharger  # noqa: E402
-
-from grizzle_local.config import Settings
-from grizzle_local.main import create_app
-from grizzle_local.store import Store
+from .support import login, make_app, wait_for
 
 SERIAL = "GRD-L0000TEST1"
 AUTH_KEY = "s3cr3t-auth-key"
 
 
-async def wait_for(predicate, timeout=10.0, step=0.05):
-    deadline = asyncio.get_running_loop().time() + timeout
-    while asyncio.get_running_loop().time() < deadline:
-        result = predicate()
-        if result:
-            return result
-        await asyncio.sleep(step)
-    raise AssertionError("condition not met in time")
-
-
 def _make_server(tmp_path, **overrides):
-    settings = Settings(
-        data_dir=tmp_path / "data", api_email="ha@local", api_password="pw", tick_seconds=1, **overrides
-    )
-    return create_app(settings, Store(settings.data_dir))
+    return make_app(tmp_path, api_password="pw", **overrides)
 
 
 @pytest.fixture
@@ -47,15 +28,9 @@ async def server(tmp_path):
         yield client
 
 
-@pytest.fixture
-async def session():
-    async with aiohttp.ClientSession() as s:
-        yield s
-
-
-async def _start_charger(server, session, serial=SERIAL, auth_key=AUTH_KEY, path=None):
-    url = f"ws://{server.host}:{server.port}{path or f'/ocpp1.6/{serial}'}"
-    cp = FakeCharger(url, serial, connectors=2, meter_interval=0.5, auth_key=auth_key)
+async def _start_charger(server, session, auth_key=AUTH_KEY):
+    url = f"ws://{server.host}:{server.port}/ocpp1.6/{SERIAL}"
+    cp = FakeCharger(url, SERIAL, connectors=2, meter_interval=0.5, auth_key=auth_key)
     await cp.connect(session)
     task = asyncio.create_task(cp.run())
     await asyncio.wait_for(cp.booted.wait(), 10)
@@ -78,12 +53,6 @@ async def _ws_status(server, session, path, headers=None, auth=None) -> int:
         return err.status
     await ws.close()
     return 101
-
-
-async def _token(server):
-    resp = await server.post("/client/auth/login", json={"emailOrPhone": "ha@local", "password": "pw"})
-    assert resp.status == 200
-    return (await resp.json())["token"]
 
 
 # --- #1: the Upgrade header must not skip REST authentication -------------------------------
@@ -125,14 +94,6 @@ async def test_upgrade_header_does_not_mint_tokens(server):
     for _ in range(5):
         await server.get("/client/auth/profile", headers={"Upgrade": "websocket"})
     assert len(tokens) == before
-
-
-async def test_charger_websocket_still_needs_no_api_token(server, session):
-    cp, task = await _start_charger(server, session)
-    try:
-        assert server.app["controller"].is_online(SERIAL)
-    finally:
-        await _stop_charger(cp, task)
 
 
 # --- #2: charger identity takeover -----------------------------------------------------------
@@ -306,7 +267,7 @@ async def test_clear_pinned_key_requires_auth_and_allows_new_key(server, session
     assert resp.status == 401
     assert controller.station(SERIAL)["ocppAuthKey"] == AUTH_KEY
 
-    token = await _token(server)
+    token = (await login(server, password="pw"))["token"]
     resp = await server.delete(f"/local/stations/{SERIAL}/auth-key", headers={"Authorization": f"Bearer {token}"})
     assert resp.status == 200
     assert not controller.station(SERIAL).get("ocppAuthKey")
@@ -322,7 +283,7 @@ async def test_clear_pinned_key_drops_live_connection_so_charger_repins(server, 
     controller = server.app["controller"]
     cp, task = await _start_charger(server, session)
     try:
-        token = await _token(server)
+        token = (await login(server, password="pw"))["token"]
         resp = await server.delete(f"/local/stations/{SERIAL}/auth-key", headers={"Authorization": f"Bearer {token}"})
         assert resp.status == 200
         await wait_for(lambda: cp.ws.closed)

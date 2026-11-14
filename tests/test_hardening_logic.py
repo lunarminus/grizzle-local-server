@@ -8,20 +8,14 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from grizzle_local import holiday_calendar as hc
-from grizzle_local.config import Settings
-from grizzle_local.controller import Controller
 from grizzle_local.schedules import charging_allowed, next_change, price_now, zone_active
-from grizzle_local.store import Store
+
+from .support import make_controller
 
 SERIAL = "GRD-L0000HARD4"
 DENVER = ZoneInfo("America/Denver")
 SPRING_FORWARD = date(2027, 3, 14)  # 02:00 -> 03:00 in America/Denver
 FALL_BACK = date(2027, 11, 7)  # 02:00 -> 01:00
-
-
-def _controller(tmp_path, **overrides) -> Controller:
-    settings = Settings(data_dir=tmp_path / "data", **overrides)
-    return Controller(settings, Store(settings.data_dir))
 
 
 def window(start: str, end: str, **extra) -> dict:
@@ -186,7 +180,7 @@ def test_next_change_looks_far_enough_ahead_for_holiday_rules():
 def test_the_lowest_window_limit_in_force_is_the_one_applied(tmp_path):
     """One profile goes to the whole station. With connector 1 in a 16 A window and connector 2 in
     a 32 A one, whichever connector came last won: 32 A for both."""
-    controller = _controller(tmp_path)
+    controller = make_controller(tmp_path)
     station = controller._ensure_station(SERIAL)
     station["connectorCount"] = 2
     all_day = {"allDay": True, "days": [], "isSchedule": True, "scheduleEnabled": True}
@@ -208,16 +202,16 @@ def test_the_lowest_window_limit_in_force_is_the_one_applied(tmp_path):
 # --- what a session costs ------------------------------------------------------------------------------
 
 
-def _reading(wh: float, tid: int = 1) -> dict:
+def _reading(wh: float) -> dict:
     sampled = [{"value": str(wh), "measurand": "Energy.Active.Import.Register", "unit": "Wh"}]
-    return {"connectorId": 1, "transactionId": tid, "meterValue": [{"sampledValue": sampled}]}
+    return {"connectorId": 1, "transactionId": 1, "meterValue": [{"sampledValue": sampled}]}
 
 
 async def test_energy_after_the_last_reading_is_paid_for(tmp_path):
     """Cost only built up with each MeterValues reading. The last stretch of every session, and the
     whole of a session without readings, was recorded with its energy and without its cost; pressing
     "Recalculate" then changed totals although no price had changed."""
-    controller = _controller(tmp_path)
+    controller = make_controller(tmp_path)
     station = controller._ensure_station(SERIAL)
     await controller.set_base_rate(SERIAL, 0.10)
 
@@ -244,7 +238,7 @@ async def test_final_readings_in_stop_transaction_belong_to_the_session(tmp_path
     """transactionData was stored without the session's id, so repricing never saw it. It is still
     kept out of the live total: its begin/end readings may be lifetime values even where the
     session's own readings count from zero."""
-    controller = _controller(tmp_path)
+    controller = make_controller(tmp_path)
     station = controller._ensure_station(SERIAL)
     await controller.set_base_rate(SERIAL, 0.10)
     await controller._on_StartTransaction(station, {"connectorId": 1, "idTag": "t", "meterStart": 819_392})
