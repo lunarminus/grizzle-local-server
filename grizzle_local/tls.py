@@ -102,10 +102,9 @@ async def start_tls_frontend(
     key: str,
     target_port: int,
     peers: dict[tuple[str, int], str] | None = None,
-    target_host: str | None = None,
 ) -> asyncio.Server:
     ctx = make_context(cert, key)
-    target_host = target_host or upstream_host(host)
+    target_host = upstream_host(host)
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
@@ -149,5 +148,4 @@ async def start_tls_frontend(
                 peers.pop(local, None)
         _LOGGER.info("TLS: %s disconnected", peer_str)
 
-    server = await asyncio.start_server(handle, host, port)
-    return server
+    return await asyncio.start_server(handle, host, port)

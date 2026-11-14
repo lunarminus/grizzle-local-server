@@ -20,8 +20,6 @@ from typing import Any
 
 import holidays as _holidays
 
-from .schedules import HOLIDAY_MODES  # noqa: F401 - the modes live with the zones; re-exported here
-
 DEFAULTS: dict[str, Any] = {
     "enabled": False,
     "country": None,

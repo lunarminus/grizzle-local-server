@@ -32,17 +32,11 @@ async def client(tmp_path):
 
 async def test_unlock_returns_firmware_expected_md5(client):
     resp = await client.get(f"/commercial/ext-ocpp-check/{SERIAL}")
-    assert resp.status == 200
+    assert resp.status == 200  # public: the charger sends no Authorization header, so this must not be a 401
     body = await resp.text()
     # exactly the 32-char lowercase hex, no trailing newline (firmware does a strcmp)
     assert body == expected(SERIAL)
     assert len(body) == 32 and body == body.lower() and "\n" not in body
-
-
-async def test_unlock_is_public_no_auth(client):
-    # no Authorization header, must not 401 (charger sends none)
-    resp = await client.get(f"/commercial/ext-ocpp-check/{SERIAL}")
-    assert resp.status == 200
 
 
 async def test_unlock_per_serial(client):

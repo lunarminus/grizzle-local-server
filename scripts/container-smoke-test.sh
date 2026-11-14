@@ -42,7 +42,6 @@ wait_until() { # wait_until <description> <command...>
 
 echo "== volumes as an older image left them: root-owned state, a root-only key mounted read-only"
 "$HERE/make-cert.sh" "$CERTS" >/dev/null 2>&1
-chmod 600 "$CERTS/privkey.pem"
 docker volume create "$VOLUME" >/dev/null
 docker run --rm --entrypoint sh -v "$VOLUME:/data" "$IMAGE" -c \
     'echo "{}" > /data/state.json && chown 0:0 /data /data/state.json && chmod 644 /data/state.json'

@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo
 from . import holiday_calendar
 from .config import Settings
 from .ocpp import CallRejected, ChargePointConnection, OcppError, now_iso, printable
-from .schedules import charging_allowed, next_change, normalize_zone, price_now
+from .schedules import MAX_NAME_LENGTH, charging_allowed, next_change, normalize_zone, price_now
 from .schedules import zone_id as parse_zone_id
 from .store import Store
 
@@ -43,11 +43,11 @@ REMOTE_RETRY_SECONDS = 60
 MAX_CONNECTORS = 8  # a Duo has 2; nothing in the family has more
 MAX_CURRENT = 100  # amps; the largest Grizzl-E is 80 A
 MAX_ZONES = 100  # schedules + rate zones per station
+ZONE_LIMITS = {"max_connector": MAX_CONNECTORS, "max_current": MAX_CURRENT}  # for normalize_zone
 MAX_CONFIG_KEYS = 256  # GetConfiguration entries kept (a Duo reports 34)
 MAX_METER_VALUES = 16  # meterValue entries handled per message (a charger sends one)
 MAX_SAMPLED_VALUES = 64
 MAX_READING = 1e12  # no meter reads beyond this, whatever the unit
-MAX_NAME_LENGTH = 100
 BOOT_FIELDS = (
     "chargePointVendor",
     "chargePointModel",
@@ -408,14 +408,13 @@ class Controller:
                 )
 
         zones = []
-        limits = {"max_connector": MAX_CONNECTORS, "max_current": MAX_CURRENT}
         for zone in station.get("pricesByZone") if isinstance(station.get("pricesByZone"), list) else []:
             try:
                 try:
-                    clean = normalize_zone(zone, **limits)
+                    clean = normalize_zone(zone, **ZONE_LIMITS)
                 except ValueError:
                     # Refused as it stands; mend what the old code merely tolerated before giving up.
-                    clean = normalize_zone(self._mended_zone(zone), **limits)
+                    clean = normalize_zone(self._mended_zone(zone), **ZONE_LIMITS)
                 clean["_id"] = parse_zone_id(zone.get("_id"))
             except ValueError as err:
                 _LOGGER.warning("%s: dropping an unusable schedule/rate zone from the saved state: %s", station_id, err)
@@ -814,14 +813,8 @@ class Controller:
 
     async def _on_StopTransaction(self, station: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
         tid = _small_int(payload.get("transactionId"), 1, 2**62)
-        connector = next(
-            (
-                c
-                for c in station["connectors"].values()
-                if tid is not None and (c.get("transaction") or {}).get("id") == tid
-            ),
-            None,
-        )
+        connectors = station["connectors"].values() if tid is not None else ()
+        connector = next((c for c in connectors if (c.get("transaction") or {}).get("id") == tid), None)
         if connector is None:
             _LOGGER.warning(
                 "%s: StopTransaction for unknown transaction %s",
@@ -841,11 +834,7 @@ class Controller:
         # on purpose: its begin/end readings can be the lifetime register even where MeterValues
         # count from zero, and must not be mistaken for the session's energy. Filed under the
         # session's id they are still there for repricing, which copes with either convention.
-        rows = [
-            self._apply_meter_values(station, connector, mv, tid)
-            for mv in _dicts(payload.get("transactionData"), MAX_METER_VALUES)
-        ]
-        self.store.add_samples([row for row in rows if row is not None])
+        self._take_meter_values(station, connector, payload.get("transactionData"), tid)
         return {"idTagInfo": {"status": "Accepted"}}
 
     def _finish_transaction(
@@ -927,12 +916,15 @@ class Controller:
         cid = self._connector_id(payload, 1) or 1
         connector = self._ensure_connector(station, cid)
         tid = _small_int(payload.get("transactionId"), 1, 2**62)
-        rows = [
-            self._apply_meter_values(station, connector, mv, tid)
-            for mv in _dicts(payload.get("meterValue"), MAX_METER_VALUES)
-        ]
-        self.store.add_samples([row for row in rows if row is not None])
+        self._take_meter_values(station, connector, payload.get("meterValue"), tid)
         return {}
+
+    def _take_meter_values(
+        self, station: dict[str, Any], connector: dict[str, Any], items: Any, tid: int | None
+    ) -> None:
+        """Apply a message's meterValue list (bounded) and store its samples in one transaction."""
+        rows = [self._apply_meter_values(station, connector, mv, tid) for mv in _dicts(items, MAX_METER_VALUES)]
+        self.store.add_samples([row for row in rows if row is not None])
 
     def _apply_meter_values(
         self, station: dict[str, Any], connector: dict[str, Any], mv: dict[str, Any], tid: int | None
@@ -947,10 +939,7 @@ class Controller:
             if key is None or value is None:
                 continue
             value = float(value)
-            unit = sv.get("unit") or ("Wh" if key == "energy_wh" else None)
-            if key == "energy_wh" and unit == "kWh":
-                value *= 1000
-            elif key == "power_w" and unit == "kW":
+            if (key, sv.get("unit")) in (("energy_wh", "kWh"), ("power_w", "kW")):
                 value *= 1000
             if sv.get("phase") and key in values:
                 values[key] = max(values[key], value)  # keep the hottest phase; Grizzl-E is single phase anyway
@@ -1119,8 +1108,7 @@ class Controller:
         """Station current limit, overridden by an active window's own limit.
 
         The limit goes to the charger as one profile for the whole station, so when the connectors
-        are in windows with different limits it has to be the lowest of them: taking whichever
-        connector happened to come last let one connector's 32 A replace another's 16 A.
+        are in windows with different limits it has to be the lowest of them.
         """
         limit = station.get("currentLimit")
         local_now = datetime.now(self.tz(station))
@@ -1150,7 +1138,7 @@ class Controller:
         else:
             limit = max(lo, min(wanted, hi))
         # Compare what would be sent, not what was asked for: a limit outside the charger's range
-        # is clamped, and comparing the unclamped number re-sent the same profile on every tick.
+        # is clamped, and the unclamped number would never match, so every tick would send it again.
         if not force and station.get("appliedLimit") == limit:
             return
         profile = {
@@ -1199,34 +1187,20 @@ class Controller:
         tx = connector.get("transaction")
         now = _time.monotonic()
         if allowed and tx is None and status in WANTS_START:
-            if _recent(connector.get("lastRemoteStart"), now):
-                return
-            connector["lastRemoteStart"] = now
-            try:
-                result = await self.call(
-                    station_id,
-                    "RemoteStartTransaction",
-                    {"connectorId": cid, "idTag": station.get("idTag") or self.settings.id_tag},
-                )
-                _LOGGER.info(
-                    "%s connector %s: RemoteStartTransaction -> %s",
-                    station_id,
-                    cid,
-                    printable(result.get("status"), 32),
-                )
-            except OcppError as err:
-                _LOGGER.warning("%s connector %s: RemoteStartTransaction failed: %s", station_id, cid, err)
+            action, stamp = "RemoteStartTransaction", "lastRemoteStart"
+            payload = {"connectorId": cid, "idTag": station.get("idTag") or self.settings.id_tag}
         elif not allowed and tx is not None:
-            if _recent(connector.get("lastRemoteStop"), now):
-                return
-            connector["lastRemoteStop"] = now
-            try:
-                result = await self.call(station_id, "RemoteStopTransaction", {"transactionId": tx["id"]})
-                _LOGGER.info(
-                    "%s connector %s: RemoteStopTransaction -> %s", station_id, cid, printable(result.get("status"), 32)
-                )
-            except OcppError as err:
-                _LOGGER.warning("%s connector %s: RemoteStopTransaction failed: %s", station_id, cid, err)
+            action, stamp, payload = "RemoteStopTransaction", "lastRemoteStop", {"transactionId": tx["id"]}
+        else:
+            return
+        if _recent(connector.get(stamp), now):
+            return
+        connector[stamp] = now
+        try:
+            result = await self.call(station_id, action, payload)
+            _LOGGER.info("%s connector %s: %s -> %s", station_id, cid, action, printable(result.get("status"), 32))
+        except OcppError as err:
+            _LOGGER.warning("%s connector %s: %s failed: %s", station_id, cid, action, err)
 
     # --- commands (from the REST API) -----------------------------------------
 
@@ -1285,16 +1259,15 @@ class Controller:
             raise ValueError("price object required")
         given_id = parse_zone_id(price["_id"]) if price.get("_id") not in (None, "") else None
         existing = next((z for z in zones if z.get("_id") == given_id), None) if given_id else None
-        limits = {"max_connector": MAX_CONNECTORS, "max_current": MAX_CURRENT}
         if existing is None:
             if len(zones) >= MAX_ZONES:
                 raise ValueError(f"a station can have at most {MAX_ZONES} schedules and rate zones")
-            zone = normalize_zone(price, **limits)
+            zone = normalize_zone(price, **ZONE_LIMITS)
             zone["_id"] = given_id or secrets.token_hex(12)
             zone.setdefault("scheduleEnabled", bool(zone.get("isSchedule")))
             zones.append(zone)
         else:
-            zone = normalize_zone({**existing, **price}, **limits)
+            zone = normalize_zone({**existing, **price}, **ZONE_LIMITS)
             zone["_id"] = existing["_id"]
             existing.clear()
             existing.update(zone)
@@ -1338,7 +1311,7 @@ class Controller:
         self,
         station: dict[str, Any],
         meter_start: Any,
-        total_wh: float | None,
+        total_wh: float,
         samples: list[dict[str, Any]],
         start_at: str | None,
         end_at: str | None,
@@ -1360,14 +1333,12 @@ class Controller:
         cost, counted = 0.0, 0.0
         for row in samples:
             reading = float(row["energy_wh"])
-            so_far = reading - base if base is not None and reading >= base else reading
-            if total_wh is not None:
-                so_far = min(so_far, float(total_wh))
+            so_far = min(reading - base if base is not None and reading >= base else reading, total_wh)
             if so_far > counted:
                 cost += (so_far - counted) / 1000 * price_at(row["at"])
                 counted = so_far
-        if total_wh is not None and total_wh > counted:
-            cost += (float(total_wh) - counted) / 1000 * price_at((end_at or start_at) if samples else start_at)
+        if total_wh > counted:
+            cost += (total_wh - counted) / 1000 * price_at((end_at or start_at) if samples else start_at)
         return cost
 
     async def recalculate_costs(self, station_id: str) -> dict[str, Any]:
@@ -1401,8 +1372,8 @@ class Controller:
             before += old
             after += cost
             count += 1
-        # One transaction for all of them: a commit per session kept the event loop (and with it
-        # every charger) waiting on the disk for as long as the history is deep.
+        # One transaction for all of them: a commit per session would keep the event loop (and with
+        # it every charger) waiting on the disk for as long as the history is deep.
         self.store.set_session_costs(repriced)
         self._dirty = True
         _LOGGER.info("%s: repriced %d sessions, %.2f -> %.2f", station_id, count, before, after)
@@ -1487,9 +1458,7 @@ class Controller:
         station = self.station(station_id)
         if station is None:
             return
-        for cid in range(1, connector_count(station) + 1):
-            await self._enforce(station_id, cid)
-        await self._apply_limit(station_id)
+        await self._refresh_all(station_id)
         for connector in station["connectors"].values():
             tx = connector.get("transaction")
             if tx and connector.get("status") in PLUGGED_IN:

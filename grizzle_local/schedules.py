@@ -16,6 +16,7 @@ days plus every holiday) or ``"only"`` (holidays only; ``days`` is ignored).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import re
@@ -58,9 +59,7 @@ def _whole(key: str, value: Any, lo: int, hi: int) -> int:
     if value is None:
         return 0
     number: int | None = None
-    if isinstance(value, bool):
-        pass
-    elif isinstance(value, int):
+    if isinstance(value, int) and not isinstance(value, bool):
         number = value
     elif isinstance(value, float) and value.is_integer():
         number = int(value)
@@ -75,16 +74,10 @@ def _amount(key: str, value: Any) -> float | int | None:
     """A finite number (numeric text is accepted), or None. Raises ValueError otherwise."""
     if value is None or value == "":
         return None
-    if isinstance(value, bool):
-        raise ValueError(f"{key} must be a number")
-    if isinstance(value, str):
-        if len(value) > 32:
-            raise ValueError(f"{key} must be a number")
-        try:
+    if isinstance(value, str) and len(value) <= 32:
+        with contextlib.suppress(ValueError):
             value = float(value)
-        except ValueError:
-            raise ValueError(f"{key} must be a number") from None
-    if not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):  # text that isn't a number included
         raise ValueError(f"{key} must be a number")
     try:
         finite = math.isfinite(value)
@@ -97,8 +90,6 @@ def _amount(key: str, value: Any) -> float | int | None:
 
 def _passthrough(value: Any) -> bool:
     """Is this small enough, and plain enough, to store as a field we don't interpret?"""
-    if value is None or isinstance(value, bool):
-        return True
     if isinstance(value, str):
         return len(value) <= 200
     try:
@@ -281,12 +272,10 @@ def price_now(
 
 def _boundaries(zone: dict[str, Any], day: datetime) -> list[datetime]:
     """Instants on ``day`` (a local midnight) where this zone may switch state."""
-    tz = day.tzinfo
-    midnight = datetime.combine(day.date(), time(0), tz)
-    out = [midnight]  # a new calendar day can change whether the zone applies at all
+    out = [day]  # a new calendar day can change whether the zone applies at all
     for start, end in _ranges(zone):
-        out.append(midnight + timedelta(minutes=start))
-        out.append(midnight + timedelta(minutes=end))
+        out.append(day + timedelta(minutes=start))
+        out.append(day + timedelta(minutes=end))
     return out
 
 

@@ -4,15 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 
+import firmware_capture as fc
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-import firmware_capture as fc  # noqa: E402
 
 SERIAL = "GRD-L0000430161"
 STATION_ID = "abc123"

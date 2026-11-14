@@ -25,27 +25,18 @@ from grizzle_local.main import SingleLineFormatter
 from grizzle_local.ocpp import ChargePointConnection, OcppError, printable
 from grizzle_local.store import Store
 
-from .support import RawCharger, bearer, make_app, strict_json, wait_for
+from .support import RawCharger, bearer, make_app, make_controller, strict_json, wait_for
 
 SERIAL = "GRD-L0000HARD1"
 OK_STATUS = {"connectorId": 1, "status": "Available", "errorCode": "NoError"}
 
 
 @pytest.fixture
-async def server(tmp_path):
-    async with TestServer(make_app(tmp_path)) as test_server, TestClient(test_server) as client:
-        yield client
-
-
-@pytest.fixture
-async def session():
-    async with aiohttp.ClientSession() as s:
-        yield s
-
-
-def _controller(tmp_path, **overrides) -> Controller:
-    settings = Settings(data_dir=tmp_path / "data", **overrides)
-    return Controller(settings, Store(settings.data_dir))
+async def cp(server, session):
+    """A charger connected as SERIAL, presenting no credentials at all; closed when the test is over."""
+    charger = await RawCharger.connect(server, session, SERIAL)
+    yield charger
+    await charger.close()
 
 
 def _no_failures(caplog) -> None:
@@ -68,37 +59,29 @@ def _no_failures(caplog) -> None:
         ("StartTransaction", {"connectorId": 10**30, "idTag": "x", "meterStart": 0}),
     ],
 )
-async def test_out_of_range_connector_is_refused_and_changes_nothing(server, session, action, payload):
+async def test_out_of_range_connector_is_refused_and_changes_nothing(server, cp, action, payload):
     """One frame with a huge connectorId used to set the station's connector count, and every
     later frame and tick then looped (and allocated) that many times."""
     controller = server.app["controller"]
-    cp = await RawCharger.connect(server, session, SERIAL)  # no credentials at all
-    try:
-        reply = await cp.call(action, payload)
-        assert reply[0] == 4 and reply[2] == "PropertyConstraintViolation", reply
-        station = controller.station(SERIAL)
-        assert station["connectorCount"] == 1
-        assert set(station["connectors"]) == {"1"}
-        assert (await cp.call("Heartbeat", {}))[0] == 3  # and the server is still answering
-    finally:
-        await cp.close()
+    reply = await cp.call(action, payload)
+    assert reply[0] == 4 and reply[2] == "PropertyConstraintViolation", reply
+    station = controller.station(SERIAL)
+    assert station["connectorCount"] == 1
+    assert set(station["connectors"]) == {"1"}
+    assert (await cp.call("Heartbeat", {}))[0] == 3  # and the server is still answering
 
 
-async def test_connector_ids_up_to_the_limit_still_work(server, session):
+async def test_connector_ids_up_to_the_limit_still_work(server, cp):
     controller = server.app["controller"]
-    cp = await RawCharger.connect(server, session, SERIAL)
-    try:
-        reply = await cp.call("StatusNotification", {**OK_STATUS, "connectorId": MAX_CONNECTORS})
-        assert reply[0] == 3
-        assert controller.station(SERIAL)["connectorCount"] == MAX_CONNECTORS
-        assert (await cp.call("StatusNotification", {**OK_STATUS, "connectorId": 0}))[0] == 3  # the station itself
-    finally:
-        await cp.close()
+    reply = await cp.call("StatusNotification", {**OK_STATUS, "connectorId": MAX_CONNECTORS})
+    assert reply[0] == 3
+    assert controller.station(SERIAL)["connectorCount"] == MAX_CONNECTORS
+    assert (await cp.call("StatusNotification", {**OK_STATUS, "connectorId": 0}))[0] == 3  # the station itself
 
 
 @pytest.mark.parametrize("claimed", ["999999999", "9" * 5000, "0", "-3", "two", 10**12, None, ["2"]])
 def test_number_of_connectors_from_configuration_is_bounded(tmp_path, claimed):
-    controller = _controller(tmp_path)
+    controller = make_controller(tmp_path)
     station = controller._ensure_station(SERIAL)
     controller._learn_from_config(station, {"NumberOfConnectors": claimed, "DipSwitchCurrentLimit": claimed})
     assert station["connectorCount"] == 1 and set(station["connectors"]) == {"1"}
@@ -108,7 +91,7 @@ def test_number_of_connectors_from_configuration_is_bounded(tmp_path, claimed):
 
 
 def test_ensure_connector_is_a_backstop(tmp_path):
-    controller = _controller(tmp_path)
+    controller = make_controller(tmp_path)
     station = controller._ensure_station(SERIAL)
     for cid in (0, -1, MAX_CONNECTORS + 1, 10**9, True, "2", 1.0):
         with pytest.raises(ValueError):
@@ -265,49 +248,41 @@ def test_max_stations_setting(monkeypatch):
 # --- numbers that are not numbers ------------------------------------------------------------
 
 
-async def test_non_finite_meter_values_never_reach_the_api(server, session):
+async def test_non_finite_meter_values_never_reach_the_api(server, cp):
     """float("NaN") is a number to Python and a syntax error to every JSON parser but Python's.
     One such reading used to make /client/stations unparseable for the web page and Home Assistant."""
-    cp = await RawCharger.connect(server, session, SERIAL)
-    try:
-        assert (await cp.call("StartTransaction", {"connectorId": 1, "idTag": "t", "meterStart": float("nan")}))[0] == 3
-        for value in ["NaN", "nan", "Infinity", "-inf", "1e999", float("inf"), float("nan"), 1e300, "1" * 400, True]:
-            sampled = [
-                {"value": value, "measurand": "Power.Active.Import", "unit": "W"},
-                {"value": value, "measurand": "Energy.Active.Import.Register", "unit": "kWh"},
-                {"value": value, "measurand": "Voltage"},
-                {"value": "7", "measurand": "Current.Import"},
-            ]
-            reply = await cp.call("MeterValues", {"connectorId": 1, "meterValue": [{"sampledValue": sampled}]})
-            assert reply[0] == 3, reply
-        assert (await cp.call("StopTransaction", {"transactionId": 1, "meterStop": float("inf")}))[0] == 3
+    assert (await cp.call("StartTransaction", {"connectorId": 1, "idTag": "t", "meterStart": float("nan")}))[0] == 3
+    for value in ["NaN", "nan", "Infinity", "-inf", "1e999", float("inf"), float("nan"), 1e300, "1" * 400, True]:
+        sampled = [
+            {"value": value, "measurand": "Power.Active.Import", "unit": "W"},
+            {"value": value, "measurand": "Energy.Active.Import.Register", "unit": "kWh"},
+            {"value": value, "measurand": "Voltage"},
+            {"value": "7", "measurand": "Current.Import"},
+        ]
+        reply = await cp.call("MeterValues", {"connectorId": 1, "meterValue": [{"sampledValue": sampled}]})
+        assert reply[0] == 3, reply
+    assert (await cp.call("StopTransaction", {"transactionId": 1, "meterStop": float("inf")}))[0] == 3
 
-        headers = await bearer(server)
-        for path in ("/client/stations", f"/local/stations/{SERIAL}/sessions", f"/local/stations/{SERIAL}/samples"):
-            resp = await server.get(path, headers=headers)
-            assert resp.status == 200
-            strict_json(await resp.text())
-        station = strict_json(await (await server.get("/client/stations", headers=headers)).text())["stations"][0]
-        meter = station["connectors"][0]["lastMeter"]
-        assert meter["currentImport"] == 7 and meter["voltage"] is None
-        assert station["connectors"][0]["power"] == 0
-    finally:
-        await cp.close()
+    headers = await bearer(server)
+    for path in ("/client/stations", f"/local/stations/{SERIAL}/sessions", f"/local/stations/{SERIAL}/samples"):
+        resp = await server.get(path, headers=headers)
+        assert resp.status == 200
+        strict_json(await resp.text())
+    station = strict_json(await (await server.get("/client/stations", headers=headers)).text())["stations"][0]
+    meter = station["connectors"][0]["lastMeter"]
+    assert meter["currentImport"] == 7 and meter["voltage"] is None
+    assert station["connectors"][0]["power"] == 0
 
 
-async def test_api_output_is_strict_json_even_if_state_holds_nan(server, session):
+async def test_api_output_is_strict_json_even_if_state_holds_nan(server, cp):
     """Belt and braces: whatever gets into memory, a response is always parseable."""
-    cp = await RawCharger.connect(server, session, SERIAL)
-    try:
-        assert (await cp.call("StatusNotification", OK_STATUS))[0] == 3
-        station = server.app["controller"].station(SERIAL)
-        station["priceKW"] = float("nan")
-        station["connectors"]["1"]["power"] = float("inf")
-        resp = await server.get("/client/stations", headers=await bearer(server))
-        data = strict_json(await resp.text())["stations"][0]
-        assert data["connectors"][0]["power"] is None
-    finally:
-        await cp.close()
+    assert (await cp.call("StatusNotification", OK_STATUS))[0] == 3
+    station = server.app["controller"].station(SERIAL)
+    station["priceKW"] = float("nan")
+    station["connectors"]["1"]["power"] = float("inf")
+    resp = await server.get("/client/stations", headers=await bearer(server))
+    data = strict_json(await resp.text())["stations"][0]
+    assert data["connectors"][0]["power"] is None
 
 
 def test_state_file_non_finite_numbers_are_dropped_on_load(tmp_path):
@@ -327,8 +302,7 @@ async def test_wrong_typed_messages_do_not_break_the_controller(server, session,
     for every station, which also skipped the periodic save."""
     controller = server.app["controller"]
     caplog.set_level(logging.ERROR)
-    cp = await RawCharger.connect(server, session, SERIAL)
-    try:
+    async with await RawCharger.connect(server, session, SERIAL) as cp:
         for status in ([], {}, 5, None, ""):
             reply = await cp.call("StatusNotification", {"connectorId": 1, "status": status})
             assert reply[0] == 4 and reply[2] == "TypeConstraintViolation", (status, reply)
@@ -372,8 +346,6 @@ async def test_wrong_typed_messages_do_not_break_the_controller(server, session,
         strict_json(await resp.text())
         resp = await server.get(f"/local/stations/{SERIAL}/sessions", headers=await bearer(server))
         assert resp.status == 200
-    finally:
-        await cp.close()
     _no_failures(caplog)
 
 
@@ -429,7 +401,7 @@ async def test_an_unresponsive_charger_does_not_stall_the_controller(server, ses
     monkeypatch.setattr(controller_module, "REMOTE_RETRY_SECONDS", 0.01)  # so every tick calls the silent one again
     silent = await RawCharger.connect(server, session, "GRD-SILENT01")
     silent.answer = False
-    try:
+    async with silent:
         await silent.call("StatusNotification", {**OK_STATUS, "status": "Preparing"})
         await wait_for(lambda: len(silent.calls("RemoteStartTransaction")) >= 1)
         await asyncio.sleep(1.5)  # by now a tick is waiting on it
@@ -443,24 +415,18 @@ async def test_an_unresponsive_charger_does_not_stall_the_controller(server, ses
         other = controller.station("GRD-OTHER001")
         other["connectors"]["1"]["isActiveBySchedule"] = None
         await wait_for(lambda: other["connectors"]["1"]["isActiveBySchedule"] is False, 4)
-    finally:
-        await silent.close()
 
 
-async def test_boot_notification_spam_keeps_one_after_boot_task(server, session):
+async def test_boot_notification_spam_keeps_one_after_boot_task(server, cp):
     controller = server.app["controller"]
-    cp = await RawCharger.connect(server, session, SERIAL)
-    try:
-        for _ in range(40):
-            assert (await cp.call("BootNotification", {"chargePointModel": "GRD 40A"}))[0] == 3
-        await asyncio.sleep(0.1)
-        boot_tasks = [t for t in controller._tasks if "_after_boot" in repr(t.get_coro()) and not t.done()]
-        assert len(boot_tasks) == 1
-        # ...and that one still does its job.
-        await wait_for(lambda: cp.calls("GetConfiguration"), timeout=6)
-        assert len(cp.calls("GetConfiguration")) == 1
-    finally:
-        await cp.close()
+    for _ in range(40):
+        assert (await cp.call("BootNotification", {"chargePointModel": "GRD 40A"}))[0] == 3
+    await asyncio.sleep(0.1)
+    boot_tasks = [t for t in controller._tasks if "_after_boot" in repr(t.get_coro()) and not t.done()]
+    assert len(boot_tasks) == 1
+    # ...and that one still does its job.
+    await wait_for(lambda: cp.calls("GetConfiguration"), timeout=6)
+    assert len(cp.calls("GetConfiguration")) == 1
 
 
 async def test_call_gives_up_when_the_peer_stops_reading():
@@ -496,65 +462,49 @@ async def test_call_reports_a_dead_socket_as_disconnected():
 # --- bounded memory per connection --------------------------------------------------------------
 
 
-async def test_oversized_frame_is_refused(server, session):
-    cp = await RawCharger.connect(server, session, SERIAL)
-    try:
-        await cp.send_text(json.dumps([2, "big", "DataTransfer", {"data": "x" * (ocpp.MAX_FRAME_BYTES + 1)}]))
-        await wait_for(lambda: cp.close_code is not None, timeout=5)
-        assert cp.close_code == aiohttp.WSCloseCode.MESSAGE_TOO_BIG
-    finally:
-        await cp.close()
+async def test_oversized_frame_is_refused(cp):
+    await cp.send_text(json.dumps([2, "big", "DataTransfer", {"data": "x" * (ocpp.MAX_FRAME_BYTES + 1)}]))
+    await wait_for(lambda: cp.close_code is not None, timeout=5)
+    assert cp.close_code == aiohttp.WSCloseCode.MESSAGE_TOO_BIG
 
 
-async def test_large_frames_are_not_kept_in_the_frame_log(server, session):
+async def test_large_frames_are_not_kept_in_the_frame_log(server, cp):
     controller = server.app["controller"]
-    cp = await RawCharger.connect(server, session, SERIAL)
-    try:
-        for _ in range(5):
-            assert (await cp.call("DataTransfer", {"vendorId": "v", "data": "x" * 100_000}))[0] == 3
-        conn = controller.connections[SERIAL]
-        assert sum(len(entry["text"]) for entry in conn.log) < 5_000  # what is actually held in memory
-        frames = conn.frames()
-        assert any(entry["data"].get("bytes", 0) > 100_000 for entry in frames if isinstance(entry["data"], dict))
-        assert any(entry["label"] == "-> result DataTransfer" and entry["data"][0] == 3 for entry in frames)
-        stored = controller.station(SERIAL)["dataTransfers"]
-        assert len(stored) == 5 and all(len(item["data"]) == 1000 for item in stored)
-    finally:
-        await cp.close()
+    for _ in range(5):
+        assert (await cp.call("DataTransfer", {"vendorId": "v", "data": "x" * 100_000}))[0] == 3
+    conn = controller.connections[SERIAL]
+    assert sum(len(entry["text"]) for entry in conn.log) < 5_000  # what is actually held in memory
+    frames = conn.frames()
+    assert any(entry["data"].get("bytes", 0) > 100_000 for entry in frames if isinstance(entry["data"], dict))
+    assert any(entry["label"] == "-> result DataTransfer" and entry["data"][0] == 3 for entry in frames)
+    stored = controller.station(SERIAL)["dataTransfers"]
+    assert len(stored) == 5 and all(len(item["data"]) == 1000 for item in stored)
 
 
-async def test_boot_and_configuration_payloads_are_stored_bounded(server, session):
+async def test_boot_and_configuration_payloads_are_stored_bounded(server, cp):
     controller = server.app["controller"]
-    cp = await RawCharger.connect(server, session, SERIAL)
     cp.replies["GetConfiguration"] = {  # about 150 KiB: under the frame limit, far more than we keep
         "configurationKey": [{"key": ["bad"], "value": "x"}, "junk", {"key": "Long", "value": "v" * 5000}]
         + [{"key": f"K{i}", "value": "v" * 40} for i in range(2000)]
     }
-    try:
-        boot = {"chargePointModel": "GRD " + "M" * 5000, "firmwareVersion": "1.0", "junk": "j" * 100_000}
-        boot["deep"] = {"a": 1}
-        assert (await cp.call("BootNotification", boot))[0] == 3
-        station = controller.station(SERIAL)
-        assert set(station["boot"]) == {"chargePointModel", "firmwareVersion", "timestamp"}
-        assert len(station["boot"]["chargePointModel"]) == 100 and len(station["model"]["code"]) == 100
-        await wait_for(lambda: station["config"], timeout=6)
-        assert len(station["config"]) < controller_module.MAX_CONFIG_KEYS
-        assert len(station["config"]["Long"]) == 500
-        assert all(isinstance(k, str) and len(v) <= 500 for k, v in station["config"].items())
-    finally:
-        await cp.close()
+    boot = {"chargePointModel": "GRD " + "M" * 5000, "firmwareVersion": "1.0", "junk": "j" * 100_000}
+    boot["deep"] = {"a": 1}
+    assert (await cp.call("BootNotification", boot))[0] == 3
+    station = controller.station(SERIAL)
+    assert set(station["boot"]) == {"chargePointModel", "firmwareVersion", "timestamp"}
+    assert len(station["boot"]["chargePointModel"]) == 100 and len(station["model"]["code"]) == 100
+    await wait_for(lambda: station["config"], timeout=6)
+    assert len(station["config"]) < controller_module.MAX_CONFIG_KEYS
+    assert len(station["config"]["Long"]) == 500
+    assert all(isinstance(k, str) and len(v) <= 500 for k, v in station["config"].items())
 
 
-async def test_many_meter_values_in_one_message_are_capped(server, session):
+async def test_many_meter_values_in_one_message_are_capped(server, cp):
     controller = server.app["controller"]
-    cp = await RawCharger.connect(server, session, SERIAL)
-    try:
-        one = {"sampledValue": [{"value": "230", "measurand": "Voltage"}]}
-        assert (await cp.call("MeterValues", {"connectorId": 1, "meterValue": [one] * 500}))[0] == 3
-        rows = controller.store._db.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
-        assert rows == controller_module.MAX_METER_VALUES
-    finally:
-        await cp.close()
+    one = {"sampledValue": [{"value": "230", "measurand": "Voltage"}]}
+    assert (await cp.call("MeterValues", {"connectorId": 1, "meterValue": [one] * 500}))[0] == 3
+    rows = controller.store._db.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+    assert rows == controller_module.MAX_METER_VALUES
 
 
 async def test_read_rate_is_limited_after_the_burst(monkeypatch):
@@ -586,16 +536,13 @@ async def test_read_rate_is_limited_after_the_burst(monkeypatch):
 
 async def test_unhashable_unique_ids_do_not_kill_the_connection(server, session, caplog):
     caplog.set_level(logging.ERROR)
-    cp = await RawCharger.connect(server, session, SERIAL)
-    try:
+    async with await RawCharger.connect(server, session, SERIAL) as cp:
         odd = ([3, ["list"], {}], [3, {"a": 1}, {}], [4, [], "GenericError", "x", {}], [2, [1], "Heartbeat", {}])
         for frame in odd:
             await cp.send_text(json.dumps(frame))
         await cp.send_text("[" * 50_000)  # deeper than the parser's recursion limit
         assert (await cp.call("Heartbeat", {}))[0] == 3
         assert (await cp.call("Heartbeat", {}, uid=7))[:2] == [3, 7]  # a numeric id is echoed back
-    finally:
-        await cp.close()
     _no_failures(caplog)
 
 
@@ -637,12 +584,9 @@ async def test_remote_start_works_after_a_host_reboot(tmp_path, session):
     (data / "state.json").write_text(json.dumps({"stations": {SERIAL: station}}))
     async with TestServer(make_app(tmp_path)) as ts, TestClient(ts) as server:
         # The charger reconnects; one that kept running sends no BootNotification (which would reset the limiter).
-        cp = await RawCharger.connect(server, session, SERIAL)
-        try:
+        async with await RawCharger.connect(server, session, SERIAL) as cp:
             await cp.call("StatusNotification", {**OK_STATUS, "status": "Preparing"})
             await wait_for(lambda: cp.calls("RemoteStartTransaction"), timeout=4)
-        finally:
-            await cp.close()
 
 
 # --- history survives a lost state file -----------------------------------------------------------
@@ -701,8 +645,7 @@ def test_log_formatter_escapes_whatever_reaches_it():
 async def test_charger_controlled_text_is_logged_on_one_line(server, session, caplog):
     caplog.set_level(logging.DEBUG)
     evil = "X\n2026-11-13 00:00:00,000 INFO grizzle_local: GRD-REAL0001 connected"
-    cp = await RawCharger.connect(server, session, SERIAL)
-    try:
+    async with await RawCharger.connect(server, session, SERIAL) as cp:
         assert (await cp.call(evil, {"k": evil}))[0] == 4  # an action nobody implements
         assert (await cp.call("StatusNotification", {**OK_STATUS, "status": evil, "errorCode": evil}))[0] == 3
         assert (await cp.call("BootNotification", {"chargePointModel": evil, "firmwareVersion": evil}))[0] == 3
@@ -713,8 +656,6 @@ async def test_charger_controlled_text_is_logged_on_one_line(server, session, ca
         cp.replies["ChangeConfiguration"] = {"status": evil}
         await wait_for(lambda: cp.calls("ChangeConfiguration"), timeout=6)
         await asyncio.sleep(0.3)
-    finally:
-        await cp.close()
     ours = [r for r in caplog.records if r.name.startswith("grizzle_local")]
     assert len(ours) > 5
     for record in ours:
@@ -729,35 +670,31 @@ def test_call_errors_from_the_charger_are_sanitised():
 # --- sessions: retransmissions, and a register that outgrows its starting point --------------------
 
 
-async def test_retransmitted_start_transaction_gets_the_same_transaction(server, session):
+async def test_retransmitted_start_transaction_gets_the_same_transaction(server, cp):
     """OCPP tells a charger to repeat a request whose answer it never saw. Each repeat used to open
     another session and leave the previous one open in the history for ever."""
     controller = server.app["controller"]
-    cp = await RawCharger.connect(server, session, SERIAL)
-    try:
-        start = {"connectorId": 1, "idTag": "tag", "meterStart": 1000, "timestamp": "2026-11-08T16:12:17Z"}
-        first = (await cp.call("StartTransaction", start))[2]["transactionId"]
-        again = (await cp.call("StartTransaction", start))[2]["transactionId"]
-        assert again == first
-        assert len(controller.store.sessions(SERIAL)) == 1
+    start = {"connectorId": 1, "idTag": "tag", "meterStart": 1000, "timestamp": "2026-11-08T16:12:17Z"}
+    first = (await cp.call("StartTransaction", start))[2]["transactionId"]
+    again = (await cp.call("StartTransaction", start))[2]["transactionId"]
+    assert again == first
+    assert len(controller.store.sessions(SERIAL)) == 1
 
-        # A different session on the same connector: the open one is closed, not orphaned.
-        other = {**start, "meterStart": 1500, "timestamp": "2026-11-08T17:00:00Z"}
-        second = (await cp.call("StartTransaction", other))[2]["transactionId"]
-        assert second != first
-        sessions = {s["id"]: s for s in controller.store.sessions(SERIAL)}
-        assert sessions[first]["stop_at"] == "2026-11-08T17:00:00.000Z" and sessions[first]["reason"] == "Superseded"
-        assert sessions[second]["stop_at"] is None
-        assert controller.station(SERIAL)["connectors"]["1"]["transaction"]["id"] == second
-    finally:
-        await cp.close()
+    # A different session on the same connector: the open one is closed, not orphaned.
+    other = {**start, "meterStart": 1500, "timestamp": "2026-11-08T17:00:00Z"}
+    second = (await cp.call("StartTransaction", other))[2]["transactionId"]
+    assert second != first
+    sessions = {s["id"]: s for s in controller.store.sessions(SERIAL)}
+    assert sessions[first]["stop_at"] == "2026-11-08T17:00:00.000Z" and sessions[first]["reason"] == "Superseded"
+    assert sessions[second]["stop_at"] is None
+    assert controller.station(SERIAL)["connectors"]["1"]["transaction"]["id"] == second
 
 
 async def test_session_relative_register_may_outgrow_meter_start(tmp_path):
     """A nearly new charger: 5 kWh on the lifetime register, then a 20 kWh session. The firmware's
     MeterValues count from 0; once they passed 5000 they were suddenly taken for lifetime readings
     and the session's energy fell back to almost nothing (and its cost with it)."""
-    controller = _controller(tmp_path)
+    controller = make_controller(tmp_path)
     station = controller._ensure_station(SERIAL)
     await controller.set_base_rate(SERIAL, 0.10)
     await controller._on_StartTransaction(station, {"connectorId": 1, "idTag": "t", "meterStart": 5000})
@@ -791,7 +728,7 @@ async def test_session_relative_register_may_outgrow_meter_start(tmp_path):
     ],
 )
 async def test_meter_stop_is_read_in_whichever_convention_fits(tmp_path, meter_start, readings, meter_stop, expected):
-    controller = _controller(tmp_path)
+    controller = make_controller(tmp_path)
     station = controller._ensure_station(SERIAL)
     await controller._on_StartTransaction(station, {"connectorId": 1, "idTag": "t", "meterStart": meter_start})
     for wh in readings:
@@ -811,48 +748,40 @@ def _limits_sent(cp: RawCharger) -> list[int]:
     ]
 
 
-async def test_a_windows_current_limit_is_lifted_when_the_window_ends(server, session):
+async def test_a_windows_current_limit_is_lifted_when_the_window_ends(server, cp):
     """A window with its own limit throttled the charger, and when the window ended (or was switched
     off, or deleted) nothing ever gave the current back: the charger stayed at 16 A for good."""
     controller = server.app["controller"]
-    cp = await RawCharger.connect(server, session, SERIAL)
-    try:
-        assert (await cp.call("StatusNotification", OK_STATUS))[0] == 3
-        zone = await controller.upsert_zone(
-            SERIAL, {"name": "Night", "isSchedule": True, "allDay": True, "days": [], "currentLimit": 16}
-        )
-        station = controller.station(SERIAL)
-        assert _limits_sent(cp) == [16] and station["appliedLimit"] == 16 and station["limitInForce"] is True
+    assert (await cp.call("StatusNotification", OK_STATUS))[0] == 3
+    zone = await controller.upsert_zone(
+        SERIAL, {"name": "Night", "isSchedule": True, "allDay": True, "days": [], "currentLimit": 16}
+    )
+    station = controller.station(SERIAL)
+    assert _limits_sent(cp) == [16] and station["appliedLimit"] == 16 and station["limitInForce"] is True
 
-        await controller.set_zone_enabled(SERIAL, zone["_id"], False)  # the window is over
-        assert _limits_sent(cp) == [16, 40]  # back to the station's full current
-        assert station["appliedLimit"] == 40 and station["limitInForce"] is False
-        for _ in range(3):
-            await controller._tick_station(SERIAL)
-        assert _limits_sent(cp) == [16, 40]  # once; and a charger we never limited is left alone
+    await controller.set_zone_enabled(SERIAL, zone["_id"], False)  # the window is over
+    assert _limits_sent(cp) == [16, 40]  # back to the station's full current
+    assert station["appliedLimit"] == 40 and station["limitInForce"] is False
+    for _ in range(3):
+        await controller._tick_station(SERIAL)
+    assert _limits_sent(cp) == [16, 40]  # once; and a charger we never limited is left alone
 
-        # With a station-wide limit, the end of the window falls back to that instead.
-        await controller.set_current_limit(SERIAL, 24)
-        await controller.set_zone_enabled(SERIAL, zone["_id"], True)
-        await controller.set_zone_enabled(SERIAL, zone["_id"], False)
-        assert _limits_sent(cp) == [16, 40, 24, 16, 24]
-    finally:
-        await cp.close()
+    # With a station-wide limit, the end of the window falls back to that instead.
+    await controller.set_current_limit(SERIAL, 24)
+    await controller.set_zone_enabled(SERIAL, zone["_id"], True)
+    await controller.set_zone_enabled(SERIAL, zone["_id"], False)
+    assert _limits_sent(cp) == [16, 40, 24, 16, 24]
 
 
-async def test_a_limit_outside_the_chargers_range_is_sent_once(server, session):
+async def test_a_limit_outside_the_chargers_range_is_sent_once(server, cp):
     controller = server.app["controller"]
-    cp = await RawCharger.connect(server, session, SERIAL)
-    try:
-        assert (await cp.call("StatusNotification", OK_STATUS))[0] == 3
-        await controller.upsert_zone(
-            SERIAL, {"name": "Trickle", "isSchedule": True, "allDay": True, "days": [], "currentLimit": 3}
-        )
-        for _ in range(4):
-            await controller._tick_station(SERIAL)
-        assert _limits_sent(cp) == [6]  # clamped to the minimum, and not repeated on every tick
-    finally:
-        await cp.close()
+    assert (await cp.call("StatusNotification", OK_STATUS))[0] == 3
+    await controller.upsert_zone(
+        SERIAL, {"name": "Trickle", "isSchedule": True, "allDay": True, "days": [], "currentLimit": 3}
+    )
+    for _ in range(4):
+        await controller._tick_station(SERIAL)
+    assert _limits_sent(cp) == [6]  # clamped to the minimum, and not repeated on every tick
 
 
 async def test_a_limit_left_in_force_by_an_older_version_is_lifted(tmp_path, session):
@@ -863,21 +792,17 @@ async def test_a_limit_left_in_force_by_an_older_version_is_lifted(tmp_path, ses
     station["appliedLimit"] = 16  # applied for a window that has since ended; never lifted
     (data / "state.json").write_text(json.dumps({"stations": {SERIAL: station}}))
     async with TestServer(make_app(tmp_path)) as ts, TestClient(ts) as server:
-        cp = await RawCharger.connect(server, session, SERIAL)
-        try:
+        async with await RawCharger.connect(server, session, SERIAL) as cp:
             await wait_for(lambda: _limits_sent(cp) == [40], timeout=4)
-        finally:
-            await cp.close()
 
 
 # --- saving must survive whatever a charger reports --------------------------------------------------
 
 
-async def test_non_string_configuration_keys_do_not_break_saving(server, session):
+async def test_non_string_configuration_keys_do_not_break_saving(server, cp):
     """An integer key next to string keys made json.dumps(sort_keys=True) raise on every save from
     then on: nothing was persisted any more, while the server looked perfectly healthy."""
     controller = server.app["controller"]
-    cp = await RawCharger.connect(server, session, SERIAL)
     cp.replies["GetConfiguration"] = {
         "configurationKey": [
             {"key": 1, "value": "x"},
@@ -887,14 +812,11 @@ async def test_non_string_configuration_keys_do_not_break_saving(server, session
             {"key": "HeartbeatInterval", "value": 300},
         ]
     }
-    try:
-        assert (await cp.call("BootNotification", {"chargePointModel": "GRD 40A"}))[0] == 3
-        await wait_for(lambda: controller.station(SERIAL)["config"], timeout=6)
-        assert controller.station(SERIAL)["config"] == {"HeartbeatInterval": "300"}
-        controller.store.save()
-        assert SERIAL in json.loads(controller.store._state_path.read_text())["stations"]
-    finally:
-        await cp.close()
+    assert (await cp.call("BootNotification", {"chargePointModel": "GRD 40A"}))[0] == 3
+    await wait_for(lambda: controller.station(SERIAL)["config"], timeout=6)
+    assert controller.station(SERIAL)["config"] == {"HeartbeatInterval": "300"}
+    controller.store.save()
+    assert SERIAL in json.loads(controller.store._state_path.read_text())["stations"]
 
 
 # --- repricing a deep history ---------------------------------------------------------------------------
@@ -903,16 +825,16 @@ async def test_non_string_configuration_keys_do_not_break_saving(server, session
 async def test_recalculating_costs_uses_one_transaction_and_the_index(tmp_path):
     """Each session cost one full scan of the station's samples and one commit, all on the event
     loop: with a real history, every charger waited seconds for a button press."""
-    controller = _controller(tmp_path)
-    station = controller._ensure_station(SERIAL)
+    controller = make_controller(tmp_path)
+    controller._ensure_station(SERIAL)
     await controller.set_base_rate(SERIAL, 0.20)
     store = controller.store
-    for tid in range(1, 201):
+    for _ in range(200):
         tid = store.next_transaction_id()
-        store.start_session(tid, SERIAL, 1, "t", f"2026-10-{1 + tid % 28:02d}T10:00:00.000Z", 0, 0.0)
         day = f"2026-10-{1 + tid % 28:02d}"
+        store.start_session(tid, SERIAL, 1, "t", f"{day}T10:00:00.000Z", 0, 0.0)
         store.add_samples([(SERIAL, 1, tid, f"{day}T10:{m:02d}:00.000Z", {"energy_wh": m * 100.0}) for m in range(30)])
-        store.finish_session(tid, f"2026-10-{1 + tid % 28:02d}T11:00:00.000Z", 3000, 3000.0, 3600, 0.0, "Local")
+        store.finish_session(tid, f"{day}T11:00:00.000Z", 3000, 3000.0, 3600, 0.0, "Local")
 
     plan = store._db.execute(
         "EXPLAIN QUERY PLAN SELECT at, energy_wh FROM samples WHERE station=? AND transaction_id=?"
@@ -928,16 +850,15 @@ async def test_recalculating_costs_uses_one_transaction_and_the_index(tmp_path):
     assert result["sessions"] == 200 and result["cost_after"] == pytest.approx(200 * 3.0 * 0.20)
     assert len(commits) == 1
     assert all(s["cost"] == pytest.approx(0.6) for s in store.sessions(SERIAL, 1000))
-    assert station["id"] == SERIAL
 
 
-# --- found reviewing the fixes above ---------------------------------------------------------------
+# --- further cases for the areas above -------------------------------------------------------------
 
 
 async def test_a_lifetime_reading_rounded_just_below_meter_start_is_still_lifetime(tmp_path):
     """Deciding the register convention once must not hinge on rounding: a charger that reports the
     lifetime register in kWh with one decimal starts a hair below the exact meterStart."""
-    controller = _controller(tmp_path)
+    controller = make_controller(tmp_path)
     station = controller._ensure_station(SERIAL)
     await controller._on_StartTransaction(station, {"connectorId": 1, "idTag": "t", "meterStart": 819_392})
 
@@ -953,7 +874,7 @@ async def test_a_lifetime_reading_rounded_just_below_meter_start_is_still_lifeti
 
     # A register that really counts from zero is still recognised, next to a small lifetime total too.
     for meter_start, first in ((819_392, "0"), (5000, "0.01"), (300, "0")):
-        controller = _controller(tmp_path / str(meter_start))
+        controller = make_controller(tmp_path / str(meter_start))
         station = controller._ensure_station(SERIAL)
         await controller._on_StartTransaction(station, {"connectorId": 1, "idTag": "t", "meterStart": meter_start})
         await controller._on_MeterValues(station, reading(first))
@@ -964,7 +885,7 @@ async def test_a_session_reported_by_an_unset_clock_keeps_its_length(tmp_path):
     """A charger whose clock was never set (1970) reports a session after the fact. Both ends are
     stamped with the time we heard of them, milliseconds apart; the charger's clock, wrong date and
     all, still measured how long the session was."""
-    controller = _controller(tmp_path)
+    controller = make_controller(tmp_path)
     station = controller._ensure_station(SERIAL)
     start = {"connectorId": 1, "idTag": "t", "meterStart": 1000, "timestamp": "1970-01-01T00:10:00Z"}
     await controller._on_StartTransaction(station, start)
@@ -991,15 +912,12 @@ async def test_forgetting_a_station_removes_its_history(server, session):
     controller = server.app["controller"]
     cp = await RawCharger.connect(server, session, SERIAL)
     keep = await RawCharger.connect(server, session, "GRD-KEEP0001")
-    try:
+    async with keep, cp:
         for charger in (cp, keep):
             tid = (await charger.call("StartTransaction", {"connectorId": 1, "idTag": "t", "meterStart": 0}))[2]
             sampled = [{"value": "230", "measurand": "Voltage"}]
             await charger.call("MeterValues", {"connectorId": 1, "meterValue": [{"sampledValue": sampled}]})
             await charger.call("StopTransaction", {"transactionId": tid["transactionId"], "meterStop": 10})
-    finally:
-        await cp.close()
-        await keep.close()
     await wait_for(lambda: not controller.is_online(SERIAL))
     assert (await server.delete(f"/local/stations/{SERIAL}", headers=await bearer(server))).status == 200
     db = controller.store._db
@@ -1015,7 +933,7 @@ async def test_history_per_station_is_bounded(tmp_path, monkeypatch):
 
     monkeypatch.setattr(store_module, "MAX_SAMPLES_PER_STATION", 100)
     monkeypatch.setattr(store_module, "MAX_SESSIONS_PER_STATION", 5)
-    controller = _controller(tmp_path)
+    controller = make_controller(tmp_path)
     station = controller._ensure_station(SERIAL)
     other = controller._ensure_station("GRD-OTHER001")
     sampled = [{"value": "230", "measurand": "Voltage"}]
@@ -1042,6 +960,51 @@ async def test_history_per_station_is_bounded(tmp_path, monkeypatch):
     assert sessions[0]["stop_at"] is None and sessions[-1]["start_at"] == "2026-11-02T07:00:00.000Z"
 
 
+@pytest.mark.parametrize("counter", [10**30, 2**63, 2**63 - 1, 0, -5, "7", 2.5, True, None, [9]])
+def test_an_impossible_transaction_counter_does_not_stop_sessions(tmp_path, counter):
+    """A counter in state.json beyond what the history database can store (a damaged or hand-edited
+    file) was handed out as it was, and from then on no session could be recorded at all."""
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "state.json").write_text(json.dumps({"next_transaction_id": counter}))
+    store = Store(data)
+    store.start_session(2**63 - 1, SERIAL, 1, "t", "2026-10-31T10:00:00.000Z", 0, 0.1)  # recorded under such an id
+    for expected in (1, 2):
+        tid = store.next_transaction_id()
+        assert tid == expected
+        store.start_session(tid, SERIAL, 1, "t", f"2026-11-0{tid}T10:00:00.000Z", 0, 0.1)
+    assert json.loads(json.dumps(store.state))["next_transaction_id"] == 3
+
+
+@pytest.mark.parametrize(
+    "counter,recorded,rounds",
+    [
+        (2**62, [], 5),
+        (2**62 - 1, [], 5),
+        (None, [2**62 - 1], 5),
+        (None, [2**62], 5),
+        (5, [2**62, 2**62 + 1], 5),
+        (2**63 - 9, [3], 5),
+        (2**63 - 2, [], 2),  # the last counter that can be continued from, and the last id there is
+    ],
+)
+def test_large_transaction_ids_that_can_be_stored_keep_counting(tmp_path, counter, recorded, rounds):
+    """The limit is what the database can hold. Numbering that is merely far along carries on as it
+    always did; cutting it off lower would leave a counter that hands out the same id for ever."""
+    data = tmp_path / "data"
+    store = Store(data)
+    for tid in recorded:
+        store.start_session(tid, SERIAL, 1, "t", "2026-10-31T10:00:00.000Z", 0, 0.1)
+    store.close()
+    (data / "state.json").write_text(json.dumps({"next_transaction_id": counter}))
+    store = Store(data)
+    first = max(counter or 1, max(recorded, default=0) + 1)
+    for expected in range(first, first + rounds):
+        tid = store.next_transaction_id()
+        assert tid == expected
+        store.start_session(tid, SERIAL, 1, "t", "2026-11-01T10:00:00.000Z", 0, 0.1)
+
+
 def test_transaction_ids_follow_the_history_at_every_allocation(tmp_path):
     store = Store(tmp_path / "data")
     assert store.next_transaction_id() == 1
@@ -1064,12 +1027,9 @@ async def test_saving_survives_odd_keys_and_a_failed_save_does_not_refuse_a_char
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(controller.store, "save", full_disk)
-    cp = await RawCharger.connect(server, session, "GRD-NEWPIN01", auth=("GRD-NEWPIN01", "its-key"))
-    try:
+    async with await RawCharger.connect(server, session, "GRD-NEWPIN01", auth=("GRD-NEWPIN01", "its-key")) as cp:
         assert (await cp.call("Heartbeat", {}))[0] == 3  # connected, although the pin could not be saved yet
         assert controller.station("GRD-NEWPIN01")["ocppAuthKey"] == "its-key"
-    finally:
-        await cp.close()
 
 
 async def test_frames_nested_absurdly_deep_are_dropped(server, session, caplog):
@@ -1084,32 +1044,25 @@ async def test_frames_nested_absurdly_deep_are_dropped(server, session, caplog):
     assert ocpp.parse_frame(json.dumps([2, "u", "SetChargingProfile", profile])) is not None
 
     caplog.set_level(logging.ERROR)
-    cp = await RawCharger.connect(server, session, SERIAL)
-    try:
+    async with await RawCharger.connect(server, session, SERIAL) as cp:
         await cp.send_text(json.dumps([3, "u", {"a": nested}]))
         await cp.send_text(json.dumps([2, "v", "DataTransfer", {"vendorId": "x", "data": nested}]))
         assert (await cp.call("Heartbeat", {}))[0] == 3
         resp = await server.get(f"/local/stations/{SERIAL}/log", headers=await bearer(server))
         assert resp.status == 200
         strict_json(await resp.text())
-    finally:
-        await cp.close()
     _no_failures(caplog)
 
 
-async def test_status_text_is_cleaned_like_every_other_field(server, session):
+async def test_status_text_is_cleaned_like_every_other_field(server, cp):
     controller = server.app["controller"]
-    cp = await RawCharger.connect(server, session, SERIAL)
     cp.replies["GetConfiguration"] = {"configurationKey": [{"key": "Odd\udcffKey", "value": "v"}]}
-    try:
-        assert (await cp.call("StatusNotification", {**OK_STATUS, "status": "Odd\udcff"}))[0] == 3
-        assert (await cp.call("StatusNotification", {"connectorId": 0, "status": "Odd\ud800"}))[0] == 3
-        assert (await cp.call("BootNotification", {"chargePointModel": "GRD 40A"}))[0] == 3
-        station = controller.station(SERIAL)
-        await wait_for(lambda: station["config"], timeout=6)
-        json.dumps(station, ensure_ascii=False).encode("utf-8")  # nothing left that UTF-8 cannot carry
-    finally:
-        await cp.close()
+    assert (await cp.call("StatusNotification", {**OK_STATUS, "status": "Odd\udcff"}))[0] == 3
+    assert (await cp.call("StatusNotification", {"connectorId": 0, "status": "Odd\ud800"}))[0] == 3
+    assert (await cp.call("BootNotification", {"chargePointModel": "GRD 40A"}))[0] == 3
+    station = controller.station(SERIAL)
+    await wait_for(lambda: station["config"], timeout=6)
+    json.dumps(station, ensure_ascii=False).encode("utf-8")  # nothing left that UTF-8 cannot carry
 
 
 def test_a_charger_without_an_id_keeps_the_station_it_had(tmp_path):
@@ -1133,32 +1086,20 @@ def test_a_charger_without_an_id_keeps_the_station_it_had(tmp_path):
     assert _charge_point_id(Request()) == "unknown-192.168.1.50"
 
 
-# --- gaps a reviewer found by reverting fixes and watching the suite stay green ---------------------
-
-
 async def test_the_read_loop_applies_the_rate_limit():
-    """The limiter was only ever tested on its own. Nothing noticed if run() stopped calling it."""
-    from aiohttp import WSMsgType
+    """run() has to call the limiter: the test of _throttle() above passes without that."""
 
     class Message:
-        type, data = WSMsgType.TEXT, json.dumps([3, "nobody-asked", {}])
+        type, data = aiohttp.WSMsgType.TEXT, json.dumps([3, "nobody-asked", {}])
 
     class Socket:
         closed = False
 
-        def __init__(self, frames):
-            self.frames = frames
+        async def __aiter__(self):
+            for _ in range(60):
+                yield Message()
 
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            if not self.frames:
-                raise StopAsyncIteration
-            self.frames -= 1
-            return Message()
-
-    conn = ChargePointConnection("GRD-FLOOD002", Socket(60), handler=None, rate_burst=10, rate_per_second=1000)
+    conn = ChargePointConnection("GRD-FLOOD002", Socket(), handler=None, rate_burst=10, rate_per_second=1000)
     started = time.monotonic()
     await conn.run()
     assert time.monotonic() - started >= 0.045  # 50 frames beyond the burst, at 1000 a second
@@ -1215,8 +1156,7 @@ def test_the_first_save_after_a_crash_is_private_too(tmp_path):
 async def test_long_fields_and_many_sampled_values_are_cut_to_size(server, session):
     controller = server.app["controller"]
     long = "L" * 5000
-    cp = await RawCharger.connect(server, session, SERIAL, path=f"/ocpp1.6/{SERIAL}?{'q' * 3000}")
-    try:
+    async with await RawCharger.connect(server, session, SERIAL, path=f"/ocpp1.6/{SERIAL}?{'q' * 3000}") as cp:
         status = {"connectorId": 1, "status": long, "errorCode": long, "vendorErrorCode": long, "info": long}
         assert (await cp.call("StatusNotification", status))[0] == 3
         assert (await cp.call("StartTransaction", {"connectorId": 1, "idTag": long, "meterStart": 0}))[0] == 3
@@ -1230,12 +1170,10 @@ async def test_long_fields_and_many_sampled_values_are_cut_to_size(server, sessi
         # Only the first MAX_SAMPLED_VALUES readings of a meter value are looked at.
         assert connector["lastMeter"]["voltage_v"] == controller_module.MAX_SAMPLED_VALUES - 1
         assert len(station["ocppHandshake"]["query"]) == 200 and len(json.dumps(station["ocppHandshake"])) < 1000
-    finally:
-        await cp.close()
 
 
 async def test_a_charger_with_an_unset_clock_repeating_itself_is_still_recognised(tmp_path):
-    controller = _controller(tmp_path)
+    controller = make_controller(tmp_path)
     station = controller._ensure_station(SERIAL)
     start = {"connectorId": 1, "idTag": "t", "meterStart": 1000, "timestamp": "1970-01-01T00:10:00Z"}
     first = (await controller._on_StartTransaction(station, start))["transactionId"]

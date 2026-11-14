@@ -49,7 +49,7 @@ class FakeCharger:
         self.malformed_config = malformed_config
         self.auth_key = auth_key
         self.status = {cid: "Available" for cid in range(1, connectors + 1)}
-        self.transactions: dict[int, dict[str, Any]] = {}  # connector -> {id, meter}
+        self.transactions: dict[int, dict[str, Any]] = {}  # connector -> {id, idTag}
         self.energy = {cid: 500_000 + cid * 1000 for cid in range(1, connectors + 1)}  # Wh register
         self.limit_a: int | None = None
         self.config = {"HeartbeatInterval": "3600", "MeterValueSampleInterval": "60"}

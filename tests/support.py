@@ -1,6 +1,6 @@
-"""Shared helpers for the hardening tests.
+"""Shared test helpers.
 
-``FakeCharger`` behaves like a real Grizzl-E. These tests need the opposite: a peer that sends
+``FakeCharger`` behaves like a real Grizzl-E. The hardening tests need the opposite: a peer that sends
 exactly what a test tells it to, however wrong, and reports what came back.
 """
 
@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 from typing import Any
 
 import aiohttp
 from aiohttp.test_utils import TestClient
 
 from grizzle_local.config import Settings
+from grizzle_local.controller import Controller
 from grizzle_local.main import create_app
 from grizzle_local.store import Store
 
@@ -28,8 +30,20 @@ def make_app(tmp_path, **overrides):
     return create_app(settings, Store(settings.data_dir))
 
 
-async def login(client: TestClient, email: str = EMAIL, password: str = PASSWORD) -> dict[str, Any]:
-    resp = await client.post("/client/auth/login", json={"emailOrPhone": email, "password": password})
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def make_controller(tmp_path, **overrides) -> Controller:
+    """A controller on its own, with nothing listening: for tests that call its handlers directly."""
+    settings = Settings(data_dir=tmp_path / "data", **overrides)
+    return Controller(settings, Store(settings.data_dir))
+
+
+async def login(client: TestClient, password: str = PASSWORD) -> dict[str, Any]:
+    resp = await client.post("/client/auth/login", json={"emailOrPhone": EMAIL, "password": password})
     assert resp.status == 200, await resp.text()
     return await resp.json()
 
@@ -99,14 +113,14 @@ class RawCharger:
                     waiter.set_result(frame)
         self.close_code = self.ws.close_code
 
-    async def call(self, action: Any, payload: Any, timeout: float = 5.0, uid: Any = None) -> list[Any]:
+    async def call(self, action: Any, payload: Any, uid: Any = None) -> list[Any]:
         """Send a Call; returns the whole reply frame, ``[3, uid, payload]`` or ``[4, uid, code, description, {}]``."""
         self._count += 1
         uid = f"t{self._count}" if uid is None else uid
         waiter: asyncio.Future[list[Any]] = asyncio.get_running_loop().create_future()
         self._pending[uid] = waiter
         await self.ws.send_str(json.dumps([2, uid, action, payload]))
-        return await asyncio.wait_for(waiter, timeout)
+        return await asyncio.wait_for(waiter, 5.0)
 
     async def send_text(self, text: str) -> None:
         await self.ws.send_str(text)
@@ -117,3 +131,9 @@ class RawCharger:
     async def close(self) -> None:
         self._reader.cancel()
         await self.ws.close()
+
+    async def __aenter__(self) -> RawCharger:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.close()

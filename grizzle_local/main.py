@@ -7,7 +7,6 @@ import base64
 import contextlib
 import logging
 import signal
-import sys
 from pathlib import Path
 
 from aiohttp import web
@@ -68,14 +67,9 @@ def _charge_point_id(request: web.Request, known: dict | None = None) -> str:
     tail = request.path.rstrip("/").rsplit("/", 1)[-1]
     if tail and tail not in ("ocpp1.6", "ocpp", "ocpp16"):
         return tail
-    header = request.headers.get("Authorization", "")
-    if header.lower().startswith("basic "):
-        try:
-            user = base64.b64decode(header[6:]).decode(errors="replace").split(":", 1)[0]
-            if user:
-                return user
-        except ValueError:
-            pass
+    user = _basic_credentials(request)[0]
+    if user:
+        return user
     placeholder, earlier = f"unknown-{client_ip(request)}", f"unknown-{request.remote}"
     if known is not None and placeholder not in known and earlier in known:
         return earlier
@@ -93,10 +87,6 @@ def _basic_credentials(request: web.Request) -> tuple[str | None, str | None]:
         return None, None
     user, sep, password = decoded.partition(":")
     return user, (password if sep else None)
-
-
-def _basic_password(request: web.Request) -> str | None:
-    return _basic_credentials(request)[1]
 
 
 def _clip(value: str | None, limit: int = 200) -> str | None:
@@ -178,9 +168,9 @@ def create_app(settings: Settings, store: Store | None = None) -> web.Applicatio
 
     async def close_connections(app: web.Application) -> None:
         # on_shutdown, not on_cleanup: aiohttp waits for open connections to finish *between* the
-        # two, and a charger's WebSocket never finishes by itself. Closing them only in on_cleanup
-        # meant waiting out that timeout first, by which time Docker had killed the process and
-        # the final save below had never run.
+        # two, and a charger's WebSocket never finishes by itself. Closed only in on_cleanup, they
+        # would make exit wait out that timeout first, and Docker kills the process before the
+        # final save below has run.
         await controller.stop()
 
     async def stop_background(app: web.Application) -> None:
@@ -248,7 +238,7 @@ def configure_logging(level: str) -> logging.Handler:
     return handler
 
 
-def main(argv: list[str] | None = None) -> None:
+def main() -> None:
     settings = Settings()
     configure_logging(settings.log_level)
     try:
@@ -258,4 +248,4 @@ def main(argv: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    main()

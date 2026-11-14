@@ -8,7 +8,6 @@ import logging
 import stat
 import time
 
-import aiohttp
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -21,18 +20,6 @@ from grizzle_local.schedules import normalize_zone, zone_id
 from .support import EMAIL, PASSWORD, RawCharger, bearer, login, make_app, strict_json
 
 SERIAL = "GRD-L0000HARD2"
-
-
-@pytest.fixture
-async def server(tmp_path):
-    async with TestServer(make_app(tmp_path)) as test_server, TestClient(test_server) as client:
-        yield client
-
-
-@pytest.fixture
-async def session():
-    async with aiohttp.ClientSession() as s:
-        yield s
 
 
 @pytest.fixture
@@ -260,8 +247,7 @@ def test_a_damaged_credentials_mark_does_not_stop_the_server(tmp_path):
 
 
 async def test_health_does_not_list_serials_to_strangers(server, session):
-    cp = await RawCharger.connect(server, session, SERIAL)
-    try:
+    async with await RawCharger.connect(server, session, SERIAL):
         resp = await server.get("/health")
         assert resp.status == 200
         text = await resp.text()
@@ -270,8 +256,6 @@ async def test_health_does_not_list_serials_to_strangers(server, session):
         assert data["status"] == "ok" and data["stationCount"] == 1 and data["stationsOnline"] == 1
         signed_in = await (await server.get("/health", headers=await bearer(server))).json()
         assert signed_in["stations"] == {SERIAL: True}
-    finally:
-        await cp.close()
 
 
 @pytest.mark.parametrize("serial", ["GRD%0AINFO%20forged", "a%20b", "-dash", "x" * 65, "%00", "..", "é"])
@@ -654,6 +638,10 @@ async def test_changing_the_password_signs_out_existing_sessions(tmp_path):
         ("http://8.8.8.8:9000", "192.168.1.5:9000", False),  # ...and here it is someone else's
         ("http://attacker.example:9000", "attacker.example:9000", False),  # DNS rebinding: same origin, public name
         ("https://evil.example", "192.168.1.5:9000", False),  # another site posting to us
+        # The names the charger uses: the certificate is for them, and only the owner's DNS override leads here.
+        ("https://ocpp.unitedchargers.com", "ocpp.unitedchargers.com", True),
+        ("https://connect-api.unitedchargers.com", "connect-api.unitedchargers.com", True),
+        ("https://evil.unitedchargers.com.example", "x", False),
         ("http://ocpp.unitedchargers.com.evil.example", "192.168.1.5:9000", False),
         ("http://local", "x", True),
         ("http://notlocal.com", "notlocal.com", False),
@@ -855,13 +843,6 @@ def test_allowed_host_entries_may_be_pasted_from_the_address_bar():
     assert hosts == ("grizzle.example.com", "nas.fritz.box", "2001:db8::5", ".ts.net")
     assert api_module.origin_allowed("http://nas.fritz.box:9000", "nas.fritz.box:9000", hosts)
     assert not api_module.origin_allowed("http://nas.fritz.box:9000", "nas.fritz.box:9000", ())
-
-
-def test_the_names_the_charger_uses_are_accepted():
-    """The certificate is for these, and only the owner's own DNS override makes them lead here."""
-    for name in ("ocpp.unitedchargers.com", "connect-api.unitedchargers.com"):
-        assert api_module.origin_allowed(f"https://{name}", name, ())
-    assert not api_module.origin_allowed("https://evil.unitedchargers.com.example", "x", ())
 
 
 async def test_the_refusal_says_exactly_what_to_set(server):

@@ -6,44 +6,22 @@ import asyncio
 import logging
 import socket
 import ssl
-import subprocess
-import sys
-from pathlib import Path
 
 import aiohttp
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
+from fake_charger import FakeCharger
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from fake_charger import FakeCharger  # noqa: E402
-
-from grizzle_local.config import Settings
-from grizzle_local.main import create_app
-from grizzle_local.store import Store
 from grizzle_local.tls import start_tls_frontend
 
+from .support import bearer, free_port, make_app
+
 SERIAL = "GRD-L0000TLS01"
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-@pytest.fixture(scope="module")
-def certs(tmp_path_factory):
-    out = tmp_path_factory.mktemp("certs")
-    subprocess.run([str(ROOT / "scripts/make-cert.sh"), str(out)], check=True, capture_output=True)
-    return out / "fullchain.pem", out / "privkey.pem"
 
 
 @pytest.fixture
 async def stack(tmp_path, certs):
-    settings = Settings(data_dir=tmp_path / "data", api_email="a@b", api_password="x", tick_seconds=1)
-    app = create_app(settings, Store(settings.data_dir))
-    async with TestServer(app) as server, TestClient(server) as client:
+    async with TestServer(make_app(tmp_path)) as server, TestClient(server) as client:
         tls_port = free_port()
         frontend = await start_tls_frontend("127.0.0.1", tls_port, str(certs[0]), str(certs[1]), server.port)
         try:
@@ -61,9 +39,7 @@ async def test_charger_over_wss_reaches_the_server(stack, caplog):
         await cp.connect(session)
         runner = asyncio.create_task(cp.run())
         await asyncio.wait_for(cp.booted.wait(), 10)
-        resp = await client.post("/client/auth/login", json={"emailOrPhone": "a@b", "password": "x"})
-        token = (await resp.json())["token"]
-        resp = await client.get("/client/stations", headers={"Authorization": f"Bearer {token}"})
+        resp = await client.get("/client/stations", headers=await bearer(client))
         station = (await resp.json())["stations"][0]
         assert station["serialNumber"] == SERIAL and station["online"] is True
         runner.cancel()
