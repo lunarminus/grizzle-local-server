@@ -94,8 +94,8 @@ if [ -f "$CERT" ] && [ -f "$KEY" ] &&
     fi
 fi
 
-# HOME still says /root, which the unprivileged user cannot enter: tools that keep something
-# under ~ (the firmware tool's token file) get the data directory instead.
+# HOME still says /root, which the unprivileged user cannot enter: whatever looks for ~ gets the
+# data directory instead.
 export HOME="$DATA"
 # shellcheck disable=SC2086
 exec setpriv --reuid="$RUN_AS" --regid="$RUN_AS" --init-groups --no-new-privs $CAPS "$@"

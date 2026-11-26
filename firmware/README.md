@@ -19,9 +19,10 @@ capture` impersonates **your** station to the cloud (serial + the OCPP Auth key 
 ```
 
 `data/state.json` is readable only by the user the server runs as (it holds that Auth key and the
-API sessions); since 0.7.0 that is uid 10001 in the container. Run the capture as that user or with
-`sudo`, or inside the container: `docker exec grizzle-local python tools/firmware_capture.py capture
---out /data/firmware`. Only `ftp`, `http` and `https` locations are downloaded, up to `--max-size`.
+API sessions); since 0.7.0 that is uid 10001 in the container. Run the capture on the host as that
+user or with `sudo`. (Since 0.9 the image holds the server alone and no Python, so the tool can no
+longer be run with `docker exec`; it needs Python 3.11 or later and `pip install -r requirements.txt`.)
+Only `ftp`, `http` and `https` locations are downloaded, up to `--max-size`.
 
 ## What the Duo image is (UDGRW070L-04.03.2)
 

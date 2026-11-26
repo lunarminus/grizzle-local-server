@@ -6,7 +6,9 @@
 #
 #   scripts/container-smoke-test.sh [image] [extra `docker run` arguments...]
 #
-# Everything is probed from inside the container, so no ports are published.
+# The image holds the server and nothing else (no shell tools worth the name, no Python), so the
+# two ports are published on loopback and everything is probed from here: it needs curl, and
+# python3 with aiohttp for tools/fake_charger.py (pip install -r requirements.txt).
 set -euo pipefail
 
 IMAGE="${1:-grizzle-local:ci}"
@@ -15,8 +17,13 @@ NAME="grizzle-smoke-$$"
 VOLUME="grizzle-smoke-data-$$"
 CERTS="$(mktemp -d)"
 HERE="$(cd "$(dirname "$0")" && pwd)"
+PYTHON="${PYTHON:-python3}"
+CHARGERS=()
 
 cleanup() {
+    for pid in "${CHARGERS[@]:-}"; do
+        [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
+    done
     docker rm -f "$NAME" >/dev/null 2>&1 || true
     docker volume rm "$VOLUME" >/dev/null 2>&1 || true
     rm -rf "$CERTS"
@@ -28,8 +35,8 @@ fail() {
     docker logs "$NAME" 2>&1 | tail -40 >&2 || true
     exit 1
 }
-py() { docker exec "$NAME" python -c "$1"; }
-health() { py "import json,urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=3))['$1'])"; }
+host_port() { docker port "$NAME" "$1/tcp" | head -1 | sed 's/.*://'; }
+health() { curl -fsS --max-time 3 "http://127.0.0.1:$PORT/health" | "$PYTHON" -c "import json,sys; print(json.load(sys.stdin)['$1'])"; }
 wait_until() { # wait_until <description> <command...>
     local what="$1"
     shift
@@ -47,7 +54,12 @@ docker run --rm --entrypoint sh -v "$VOLUME:/data" "$IMAGE" -c \
     'echo "{}" > /data/state.json && chown 0:0 /data /data/state.json && chmod 644 /data/state.json'
 
 docker run -d --name "$NAME" -e GRIZZLE_API_PASSWORD="smoke test password" \
+    -p 127.0.0.1::9000 -p 127.0.0.1::8443 \
     -v "$VOLUME:/data" -v "$CERTS:/certs:ro" "$@" "$IMAGE" >/dev/null
+# The image's own health check is the first probe: it works without anything published.
+wait_until "the server to answer its health check" docker exec "$NAME" grizzle-local healthcheck
+PORT="$(host_port 9000)"
+TLS_PORT="$(host_port 8443)"
 wait_until "the server to answer /health" health status
 
 echo "== the server is unprivileged"
@@ -62,13 +74,16 @@ owner="$(docker exec "$NAME" stat -c '%u %a' /data/state.json)"
 [ "$owner" = "10001 600" ] || fail "state.json is '$owner', expected '10001 600'"
 
 echo "== TLS works from a key the unprivileged user could not read"
-docker logs "$NAME" 2>&1 | grep -q "and wss:// on 8443" || fail "the TLS listener did not start"
-py "import ssl,urllib.request; urllib.request.urlopen('https://127.0.0.1:8443/health', context=ssl._create_unverified_context(), timeout=4)" ||
-    fail "no answer on the TLS port"
+# Not `docker logs | grep -q`: grep leaving at the first match can fail the pipe (pipefail).
+LOGS="$(docker logs "$NAME" 2>&1)"
+grep -q "and wss:// on 8443" <<<"$LOGS" || fail "the TLS listener did not start"
+curl -fsSk --max-time 4 "https://127.0.0.1:$TLS_PORT/health" >/dev/null || fail "no answer on the TLS port"
 
 echo "== chargers connect (plain and TLS)"
-docker exec -d "$NAME" python tools/fake_charger.py ws://127.0.0.1:9000/ocpp1.6/GRD-SMOKE001
-docker exec -d "$NAME" python tools/fake_charger.py wss://127.0.0.1:8443/ocpp1.6/GRD-SMOKE002 --insecure
+"$PYTHON" "$HERE/../tools/fake_charger.py" "ws://127.0.0.1:$PORT/ocpp1.6/GRD-SMOKE001" >/dev/null 2>&1 &
+CHARGERS+=($!)
+"$PYTHON" "$HERE/../tools/fake_charger.py" "wss://127.0.0.1:$TLS_PORT/ocpp1.6/GRD-SMOKE002" --insecure >/dev/null 2>&1 &
+CHARGERS+=($!)
 online() { [ "$(health stationsOnline)" = "2" ]; }
 wait_until "both chargers to be online" online
 
@@ -81,15 +96,17 @@ code="$(docker inspect -f '{{.State.ExitCode}}' "$NAME")"
 [ "$took" -lt 8 ] || fail "docker stop took ${took}s"
 
 echo "== and what happened was saved"
-docker run --rm --entrypoint python -v "$VOLUME:/data" "$IMAGE" -c "
-import json
-stations = json.load(open('/data/state.json'))['stations']
+docker run --rm --entrypoint cat -v "$VOLUME:/data" "$IMAGE" /data/state.json | "$PYTHON" -c "
+import json, sys
+stations = json.load(sys.stdin)['stations']
 assert {'GRD-SMOKE001', 'GRD-SMOKE002'} <= set(stations), sorted(stations)
 assert stations['GRD-SMOKE001']['boot']['chargePointModel'] == 'GRD 40A 2025'
 " || fail "the stations were not in the saved state"
 
 echo "== it starts again on its own volume"
 docker start "$NAME" >/dev/null
+wait_until "the restarted server to answer its health check" docker exec "$NAME" grizzle-local healthcheck
+PORT="$(host_port 9000)" # a new start may publish on a different port
 wait_until "the restarted server to answer /health" health status
 [ "$(health stationCount)" = "2" ] || fail "the restarted server does not know its stations"
 

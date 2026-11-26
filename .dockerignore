@@ -3,7 +3,9 @@
 .venv
 data
 certs
+target
 tests
+tools
 firmware
 docs
 **/__pycache__

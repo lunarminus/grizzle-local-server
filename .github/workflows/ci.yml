@@ -12,7 +12,21 @@ permissions:
 
 # Third-party actions are pinned to a commit (a tag can be moved); Dependabot keeps them current.
 jobs:
-  test:
+  # The server. The runner image comes with a current stable Rust (cargo, rustfmt, clippy).
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo --version && cargo clippy --version
+      - run: cargo fmt --check
+      # --locked: every crate, direct or not, is pinned with its checksum in Cargo.lock.
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  # The Python tools (tools/) and the shell scripts, tried against the server where they talk to one.
+  tools:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -20,13 +34,20 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.15" # the Python the image is built on (see Dockerfile)
+          python-version: "3.15"
       # Every package, ruff included, is pinned with hashes in the two lock files.
       - run: pip install --require-hashes -r requirements.txt -r requirements-dev.txt
-      - run: ruff check --select F,E9,B,E --line-length 120 grizzle_local tools tests scripts
+      - run: ruff check --select F,E9,B,E --line-length 120 tools scripts
+      - run: cargo build --locked
+      # Includes the check that src/holidays.bin is what tools/gen_holidays.py makes of the pinned
+      # `holidays` package (about a minute).
       - run: pytest -q
+      # And the other half: the server reads out of the table exactly what the package said, for
+      # every country and region, with and without observed days, every year (177,558 calendars).
+      - run: python tools/gen_holidays.py --dump "$RUNNER_TEMP/calendars.jsonl" --output "$RUNNER_TEMP/holidays.bin"
+      - run: HOLIDAYS_DUMP="$RUNNER_TEMP/calendars.jsonl" cargo test --release --locked --lib every_calendar -- --ignored
       # The entrypoint's tests need root (dropping it is what they test), which this job's user is not.
-      - run: sudo env "PATH=$PATH" python -m pytest -q -p no:cacheprovider tests/test_hardening_deploy.py -k entrypoint
+      - run: sudo env "PATH=$PATH" python -m pytest -q -p no:cacheprovider tools/tests/test_deploy.py -k entrypoint
 
   # What unit tests can't see: the real image, started the way an upgraded installation starts it.
   container:
@@ -35,11 +56,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+      # The image has no Python: the smoke test plays the chargers from here (tools/fake_charger.py).
+      - run: pip install --require-hashes -r requirements.txt
       - run: docker build -t grizzle-local:ci .
       - run: scripts/container-smoke-test.sh grizzle-local:ci
 
   image:
-    needs: [test, container]
+    needs: [server, tools, container]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:

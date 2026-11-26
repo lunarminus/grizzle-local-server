@@ -266,12 +266,12 @@ def load_identity(state_path: Path, serial: str | None) -> dict[str, Any]:
     if not state_path.exists():
         raise CloudError(f"no server state at {state_path}; pass --state, or --serial/--auth-key explicitly")
     try:
-        stations = (json.loads(state_path.read_text()) or {}).get("stations") or {}
+        stations = (json.loads(state_path.read_text(encoding="utf-8")) or {}).get("stations") or {}
     except PermissionError:
         raise CloudError(
             f"cannot read {state_path}: it is readable only by the user the server runs as (it holds the charger's "
-            "Auth key). Run this as that user or with sudo, or inside the container: docker exec <container> "
-            "python tools/firmware_capture.py ..."
+            "Auth key). Run this as that user or with sudo. (The server's image has no Python since 0.9, so this "
+            "tool runs on the host.)"
         ) from None
     except (OSError, ValueError) as err:
         raise CloudError(f"cannot read {state_path}: {err}") from None
