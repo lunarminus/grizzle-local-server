@@ -489,8 +489,10 @@ mod tests {
 
     #[test]
     fn the_table_lists_every_country_and_region() {
-        assert_eq!(countries().len(), 250);
-        assert_eq!(countries().iter().map(|c| c.subdivisions.len()).sum::<usize>(), 629);
+        // How many exactly is the `holidays` package's business, and grows with its updates
+        // (tools/gen_holidays.py --check is what ties the table to the package).
+        assert!(countries().len() >= 250);
+        assert!(countries().iter().map(|c| c.subdivisions.len()).sum::<usize>() >= 629);
         assert!(countries().windows(2).all(|pair| pair[0].code < pair[1].code));
         assert!((first_year(), last_year()) == (2000, 2100));
         assert!(!data_version().is_empty());
