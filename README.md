@@ -27,13 +27,15 @@ Nothing leaves your LAN: the charger talks to this container, and the
 - **Built-in web page** at `http://<server>:9000/` for live status, charging modes,
   schedules, electricity rates, statutory holidays, charger settings and session history
   with cost.
-- **Statutory holidays** for 250 countries and their states or provinces, computed
-  offline. Each schedule and rate zone chooses how it treats a holiday, and a flat holiday
-  price can replace the rate zones for the day.
+- **Statutory holidays** for 250 countries and their states or provinces, built into the
+  server (no network needed). Each schedule and rate zone chooses how it treats a holiday,
+  and a flat holiday price can replace the rate zones for the day.
 - **REST API shaped like `connect-api.unitedchargers.com`**, so the Home Assistant
   integration only needs a different server URL. Plus a few `/local/...` extras:
   raw OCPP calls, the frame log, meter history.
-- Single process, single port, three dependencies (aiohttp, holidays, tzdata), state survives restarts.
+- One small binary, one process, one port; state survives restarts. Since 0.9 the server is written
+  in Rust: it starts in a few milliseconds and runs in about 10 MB of memory with a charger
+  connected (the Python versions took about 45 MB). It uses the same data directory.
 - **Built for a network you don't fully trust.** Everything a charger or an API client sends is
   validated and bounded; see [Security](#security) for what is and isn't protected.
 
@@ -197,8 +199,9 @@ the HTTP Basic user), which must match `[A-Za-z0-9][A-Za-z0-9._:-]{0,63}`.
   on your network fills the station list with invented serials, delete them
   (`DELETE /local/stations/{serial}`) and set `GRIZZLE_ALLOWED_CHARGERS` or `GRIZZLE_OCPP_PASSWORD`.
 
-You can test the whole chain without the real charger: `tools/fake_charger.py` accepts
-`wss://…` URLs with `--insecure`. The plain `ws://` listener on port 9000 also accepts
+You can test the whole chain without the real charger: `tools/fake_charger.py` (a Python
+script for your own machine; it needs `pip install aiohttp`) accepts `wss://…` URLs with
+`--insecure`. The plain `ws://` listener on port 9000 also accepts
 chargers, for firmware that does let you set a server URL.
 
 ## 3. Open the web page
@@ -334,6 +337,26 @@ What the server assumes and what it does about it:
 - **Logs** escape control characters in everything that came off the network, so a serial or OCPP
   field can't forge a log line.
 
+### Upgrading from 0.8 (the Python versions)
+
+0.9 is the same server rewritten in Rust. Pull the new image and start it on the data directory you
+have: `state.json` and `history.sqlite` are read and written in the same format, stations, schedules,
+rates, pinned Auth keys and recorded sessions carry on, and whoever is signed in stays signed in.
+Every setting keeps its name and meaning. What is different:
+
+- **The image holds the server and nothing else.** There is no Python in it any more, so
+  `docker exec grizzle-local python tools/...` no longer works: run `tools/fake_charger.py` and
+  `tools/firmware_capture.py` on your own machine (the latter reads a copy of `data/state.json`).
+  If you wrote your own `healthcheck:` in compose, the command is now `grizzle-local healthcheck`.
+- **Statutory holidays come from a table inside the binary**, worked out ahead of time with the
+  same Python `holidays` package the old server used, for the years 2000 to 2100. Every date is the
+  one the old server gave; nothing is computed, and nothing needs installing, when the server runs.
+- **Requests must be proper JSON.** `NaN` and `Infinity` in a request body used to be read and then
+  refused with a message about the field; now the body as a whole is refused (`400`, `invalid JSON`).
+- **Log lines** have the same shape; the name after the level is now a Rust module
+  (`grizzle_local::controller`). `LOG_LEVEL=debug` logs every OCPP frame.
+- **Going back** to a 0.8 image works on the same data directory.
+
 ### Upgrading from 0.6.0
 
 Nothing needs to be migrated by hand, but a few things behave differently on purpose:
@@ -366,39 +389,48 @@ Nothing needs to be migrated by hand, but a few things behave differently on pur
 ## Development
 
 ```bash
-python3.15 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt -r requirements-dev.txt   # everything pinned with hashes; see requirements*.in
-pytest                                      # schedules, TLS, end-to-end with the fake charger, hardening
-GRIZZLE_DATA_DIR=./data GRIZZLE_PORT=9000 python -m grizzle_local
+cargo test                                   # unit tests, and the server end to end against pretend chargers
+GRIZZLE_DATA_DIR=./data GRIZZLE_PORT=9000 cargo run --release
 python tools/fake_charger.py ws://localhost:9000/ocpp1.6/GRD-FAKE0001 --plug-in 5
 ```
 
+Building needs a Rust toolchain (1.85 or later), a C compiler and OpenSSL's headers (`libssl-dev`);
+SQLite is compiled in.
+
 ```
-grizzle_local/
-├── ocpp.py        # OCPP-J framing, call/result matching, malformed-frame repair
-├── controller.py  # station state, message handlers, mode/schedule enforcement, commands
-├── schedules.py   # pricesByZone window evaluation, next change, price lookup
-├── holiday_calendar.py  # statutory holidays per country/region (the `holidays` package)
-├── api.py         # REST facade + station JSON in the cloud's shape
-├── store.py       # state.json + history.sqlite
-├── config.py      # env vars
-├── tls.py         # wss:// front door with handshake logging
-├── healthcheck.py # the container's HEALTHCHECK: asks /health wherever the server listens
+src/
+├── ocpp.rs        # OCPP-J framing, call/result matching, malformed-frame repair
+├── controller.rs  # message handlers, mode/schedule enforcement, commands
+├── state.rs       # what is known about a station; reading and repairing state.json
+├── schedules.rs   # pricesByZone window evaluation, next change, price lookup
+├── holidays.rs    # statutory holidays per country/region, from the built-in table holidays.bin
+├── api.rs         # REST API, sessions and sign-in limits, station JSON in the cloud's shape
+├── store.rs       # state.json + history.sqlite
+├── config.rs      # env vars
+├── server.rs      # the listeners: HTTP, WebSocket upgrade, wss:// with handshake logging
+├── healthcheck.rs # `grizzle-local healthcheck`: asks /health wherever the server listens
 ├── web/index.html # the built-in web page (inline CSS and JS, no build step)
-└── main.py        # aiohttp app: WebSocket upgrade on any path, REST
-tools/fake_charger.py   # simulated Grizzl-E, also used by the tests
+└── main.rs        # the binary
+tests/                  # integration tests: the server on a port of its own, real sockets
+tools/fake_charger.py   # simulated Grizzl-E (Python), for trying the server without a charger
+tools/gen_holidays.py   # writes src/holidays.bin from the Python `holidays` package
 scripts/make-cert.sh    # self-signed certificate for ocpp.unitedchargers.com
 scripts/container-smoke-test.sh   # builds nothing; starts an image and checks it end to end (CI runs it)
 docker-entrypoint.sh    # hands the volumes to the unprivileged user, then drops root
 ```
 
-Dependencies are locked: `requirements.in` lists what the server needs, `requirements.txt` is
-compiled from it with every package pinned and hashed (`pip-compile --generate-hashes`), and the
-image installs with `--require-hashes`. `requirements-dev.txt` adds the test and lint tools on top
-of it in the same way. To update, edit the `.in` file (or let Dependabot propose
-it) and recompile both lock files with the commands at the top of each `.in`. The lock files are
-for Python 3.15, the version the image and CI use; the code runs on 3.11 and later, and on another
-version install from the `.in` files instead (`pip install -r requirements.in pytest pytest-asyncio ruff`).
+Dependencies are locked. `Cargo.lock` pins every crate the server is built from, with its checksum,
+and the image builds with `--locked`. The Python tools have their own lock files:
+`requirements.txt` (compiled from `requirements.in` with every package pinned and hashed) and
+`requirements-dev.txt` for their tests and the linter; install both with
+`pip install --require-hashes -r requirements.txt -r requirements-dev.txt` and run `pytest`.
+
+**The holiday table.** `src/holidays.bin` (about 330 KB) holds every holiday of every country and
+region the Python `holidays` package knows, with and without observed days, for 2000 to 2100.
+`python tools/gen_holidays.py` rewrites it from the version of the package pinned in
+`requirements.txt`; `--check` (which CI runs) fails if the file is not what that version gives, so
+an update of the package, which may correct or add holidays, cannot go unnoticed. A test compares
+every one of the table's 177,558 calendars with the package's own answer.
 
 ## Status
 
