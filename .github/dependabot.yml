@@ -1,8 +1,16 @@
-# Everything is pinned (Python packages with hashes, actions by commit, see ci.yml), so something
-# has to propose the updates: security fixes in a pinned dependency don't arrive by themselves.
+# Everything is pinned (crates in Cargo.lock, Python packages with hashes, actions by commit, see
+# ci.yml), so something has to propose the updates: security fixes in a pinned dependency don't
+# arrive by themselves. Nor do new time zone rules, which the server has a copy of (jiff-tzdb).
 version: 2
 updates:
-  - package-ecosystem: pip # requirements.in / requirements-dev.in and their compiled lock files
+  - package-ecosystem: cargo # the server: Cargo.toml and Cargo.lock
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      rust:
+        patterns: ["*"]
+  - package-ecosystem: pip # the tools: requirements.in / requirements-dev.in and their compiled lock files
     directory: /
     schedule:
       interval: weekly
@@ -16,7 +24,7 @@ updates:
     groups:
       actions:
         patterns: ["*"]
-  - package-ecosystem: docker # the base image in the Dockerfile
+  - package-ecosystem: docker # the base images in the Dockerfile
     directory: /
     schedule:
       interval: weekly

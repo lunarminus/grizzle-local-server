@@ -8,9 +8,19 @@ RUN apt-get update \
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
 # Cargo.lock pins every crate, direct or not, with its checksum; --locked refuses to build otherwise.
-RUN cargo build --release --locked
+# The crates are built first, against an empty program, so that this (long) layer is reused until
+# Cargo.toml or Cargo.lock change; a change to the server then only compiles the server.
+RUN mkdir src \
+    && echo 'fn main() {}' > src/main.rs \
+    && : > src/lib.rs \
+    && cargo build --release --locked \
+    && rm -rf src
+COPY src ./src
+# touch: COPY keeps the files' dates, and cargo would take the empty program above for the newer one.
+RUN touch src/main.rs src/lib.rs \
+    && cargo build --release --locked \
+    && target/release/grizzle-local --version | grep -q grizzle-local
 
 # --- run -------------------------------------------------------------------------------------
 FROM debian:trixie-slim
@@ -18,9 +28,11 @@ FROM debian:trixie-slim
 ENV GRIZZLE_DATA_DIR=/data \
     GRIZZLE_PORT=9000
 
-# The one shared library the binary needs. (setpriv, which the entrypoint uses, is part of the base image.)
+# The one shared library the binary needs, and the time zone rules (the binary has a copy of its own
+# to fall back on; the system's is the one a rebuilt image brings up to date). setpriv, which the
+# entrypoint uses, is part of the base image.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libssl3t64 \
+    && apt-get install -y --no-install-recommends libssl3t64 tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /src/target/release/grizzle-local /usr/local/bin/grizzle-local

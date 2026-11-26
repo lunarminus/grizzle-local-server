@@ -355,7 +355,12 @@ Every setting keeps its name and meaning. What is different:
   refused with a message about the field; now the body as a whole is refused (`400`, `invalid JSON`).
 - **Log lines** have the same shape; the name after the level is now a Rust module
   (`grizzle_local::controller`). `LOG_LEVEL=debug` logs every OCPP frame.
-- **Going back** to a 0.8 image works on the same data directory.
+- **Time zones.** As before, a zone's rules are read from the system's time zone database when it
+  has that zone, and otherwise from a copy the server carries (now inside the binary; it is updated
+  with the server). `TZ` and a station's timezone take the same names as before.
+- **Going back** to a 0.8 image works on the same data directory (tried in both directions: the
+  stations, zones, rates, holiday settings, sessions and sign-ins one version wrote are what the
+  other serves).
 
 ### Upgrading from 0.6.0
 
@@ -404,16 +409,20 @@ src/
 ├── state.rs       # what is known about a station; reading and repairing state.json
 ├── schedules.rs   # pricesByZone window evaluation, next change, price lookup
 ├── holidays.rs    # statutory holidays per country/region, from the built-in table holidays.bin
+├── zone.rs        # time zones by name: the system's rules, or the copy built into the binary
 ├── api.rs         # REST API, sessions and sign-in limits, station JSON in the cloud's shape
 ├── store.rs       # state.json + history.sqlite
 ├── config.rs      # env vars
 ├── server.rs      # the listeners: HTTP, WebSocket upgrade, wss:// with handshake logging
 ├── healthcheck.rs # `grizzle-local healthcheck`: asks /health wherever the server listens
+├── value.rs, timeutil.rs, net.rs, crypto.rs, logging.rs   # small helpers the others share
 ├── web/index.html # the built-in web page (inline CSS and JS, no build step)
 └── main.rs        # the binary
 tests/                  # integration tests: the server on a port of its own, real sockets
 tools/fake_charger.py   # simulated Grizzl-E (Python), for trying the server without a charger
+tools/firmware_capture.py   # fetches the firmware image the cloud offers your charger (see firmware/)
 tools/gen_holidays.py   # writes src/holidays.bin from the Python `holidays` package
+tools/tests/            # tests of the tools and the shell scripts (pytest)
 scripts/make-cert.sh    # self-signed certificate for ocpp.unitedchargers.com
 scripts/container-smoke-test.sh   # builds nothing; starts an image and checks it end to end (CI runs it)
 docker-entrypoint.sh    # hands the volumes to the unprivileged user, then drops root
@@ -429,8 +438,11 @@ and the image builds with `--locked`. The Python tools have their own lock files
 region the Python `holidays` package knows, with and without observed days, for 2000 to 2100.
 `python tools/gen_holidays.py` rewrites it from the version of the package pinned in
 `requirements.txt`; `--check` (which CI runs) fails if the file is not what that version gives, so
-an update of the package, which may correct or add holidays, cannot go unnoticed. A test compares
-every one of the table's 177,558 calendars with the package's own answer.
+an update of the package, which may correct or add holidays, cannot go unnoticed. CI also checks
+the other half, that the server reads out of the table exactly what the package said:
+`python tools/gen_holidays.py --dump calendars.jsonl` writes the package's answers to a file, and
+`HOLIDAYS_DUMP=calendars.jsonl cargo test --release --lib every_calendar -- --ignored` compares all
+177,558 calendars with it (every country and region, with and without observed days, every year).
 
 ## Status
 

@@ -664,8 +664,8 @@ mod tests {
     }
 
     /// Compare every calendar with what the Python package gave, row for row:
-    /// `python tools/gen_holidays.py --dump holidays.jsonl --output /dev/null`, then
-    /// `HOLIDAYS_DUMP=holidays.jsonl cargo test --release every_calendar -- --ignored`.
+    /// `python tools/gen_holidays.py --dump holidays.jsonl`, then
+    /// `HOLIDAYS_DUMP=holidays.jsonl cargo test --release --lib every_calendar -- --ignored`.
     #[test]
     #[ignore = "needs the dump written by tools/gen_holidays.py --dump"]
     fn every_calendar_matches_the_python_package() {
