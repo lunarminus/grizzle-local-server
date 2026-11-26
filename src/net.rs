@@ -11,21 +11,38 @@ pub struct IpNet {
 
 impl IpNet {
     /// `1.2.3.4`, `10.0.0.0/8`, `fd00::/8`. Host bits may be set (`10.1.2.3/8` means `10.0.0.0/8`).
+    ///
+    /// Also what Python's `ipaddress` took and a configuration written for the earlier versions
+    /// may therefore hold: an IPv4 network with its mask spelled out (`10.0.0.0/255.0.0.0`, or
+    /// the inverse `10.0.0.0/0.255.255.255`), and an IPv6 address with a zone (`fe80::1%eth0`;
+    /// the zone plays no part in matching).
     pub fn parse(text: &str) -> Result<IpNet, String> {
+        let unusable = || format!("{text:?} does not appear to be an IPv4 or IPv6 network");
         let (address, prefix) = match text.split_once('/') {
             Some((address, prefix)) => (address, Some(prefix)),
             None => (text, None),
         };
-        let address: IpAddr =
-            address.parse().map_err(|_| format!("{text:?} does not appear to be an IPv4 or IPv6 network"))?;
+        let address: IpAddr = match address.split_once('%') {
+            Some((address, zone)) if !zone.is_empty() => address.parse::<Ipv6Addr>().map(IpAddr::V6).map_err(|_| unusable())?,
+            _ => address.parse().map_err(|_| unusable())?,
+        };
         let bits = if address.is_ipv4() { 32 } else { 128 };
         let prefix = match prefix {
             None => bits,
-            Some(prefix) => prefix
-                .parse::<u8>()
-                .ok()
-                .filter(|p| *p <= bits && prefix.bytes().all(|b| b.is_ascii_digit()))
-                .ok_or_else(|| format!("{text:?} does not appear to be an IPv4 or IPv6 network"))?,
+            Some(prefix) if prefix.bytes().all(|b| b.is_ascii_digit()) => {
+                prefix.parse::<u8>().ok().filter(|p| *p <= bits).ok_or_else(unusable)?
+            }
+            Some(mask) if address.is_ipv4() => {
+                let mask = u32::from(mask.parse::<Ipv4Addr>().map_err(|_| unusable())?);
+                if mask.leading_ones() + mask.trailing_zeros() == 32 {
+                    mask.leading_ones() as u8 // 255.255.0.0
+                } else if mask.leading_zeros() + mask.trailing_ones() == 32 {
+                    mask.leading_zeros() as u8 // 0.0.255.255
+                } else {
+                    return Err(unusable());
+                }
+            }
+            Some(_) => return Err(unusable()),
         };
         Ok(IpNet { address, prefix })
     }
@@ -195,6 +212,23 @@ mod tests {
         assert!(IpNet::parse("172.16.0.0/12").unwrap().contains("172.31.255.255".parse().unwrap()));
         assert!(!IpNet::parse("172.16.0.0/12").unwrap().contains("172.32.0.0".parse().unwrap()));
         for bad in ["proxy", "10.0.0.0/33", "10.0.0.0/x", "", "10.0.0.0/+8"] {
+            assert!(IpNet::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// The spellings Python's `ipaddress` also read, which an existing configuration may use.
+    #[test]
+    fn networks_may_spell_out_their_mask_or_name_a_zone() {
+        let prefix = |text: &str| IpNet::parse(text).map(|net| net.prefix);
+        assert_eq!(prefix("10.0.0.0/255.0.0.0"), Ok(8));
+        assert_eq!(prefix("172.18.0.0/255.255.0.0"), Ok(16));
+        assert_eq!(prefix("10.0.0.0/0.255.255.255"), Ok(8));
+        assert_eq!(prefix("192.168.1.7/255.255.255.255"), Ok(32));
+        assert_eq!(prefix("10.0.0.0/08"), Ok(8));
+        assert!(IpNet::parse("172.18.0.0/255.255.0.0").unwrap().contains("172.18.9.9".parse().unwrap()));
+        assert!(IpNet::parse("fe80::1%eth0").unwrap().contains("fe80::1".parse().unwrap()));
+        assert_eq!(prefix("fe80::%eth0/64"), Ok(64));
+        for bad in ["10.0.0.0/255.0.255.0", "fd00::/ffff::", "10.0.0.0/ 8", "10.0.0.1%eth0", "fe80::1%", "10.0.0.0/255.0.0"] {
             assert!(IpNet::parse(bad).is_err(), "{bad}");
         }
     }

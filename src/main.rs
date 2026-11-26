@@ -37,6 +37,9 @@ fn main() -> ExitCode {
         }
     };
     logging::configure(&settings.log_level);
+    // A bug that panics ends the task it happens in (one request, one station's turn in the
+    // background loop) and nothing else. Say so in the log, in the log's format.
+    std::panic::set_hook(Box::new(|panic| log::error!("a task failed: {panic}")));
     // One thread: a charger or two and a web page are not a workload, and everything the server
     // keeps in memory is behind one lock anyway.
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile the statutory holidays the server knows into ``data/holidays.bin``.
+"""Compile the statutory holidays the server knows into ``src/holidays.bin``.
 
 The server is a single Rust binary and computes nothing about holidays itself: every date it
 knows was worked out here, by the ``holidays`` package (the version pinned in requirements.txt),
@@ -7,7 +7,7 @@ for every country and subdivision the package supports, with and without observe
 years FIRST_YEAR..LAST_YEAR. The table is built into the binary, so the server still needs no
 network and no Python to answer "is this day a holiday".
 
-    python tools/gen_holidays.py            # rewrite data/holidays.bin
+    python tools/gen_holidays.py            # rewrite src/holidays.bin
     python tools/gen_holidays.py --check    # exit 1 if the file is not what this would write
     python tools/gen_holidays.py --dump out.jsonl   # every calendar as JSON lines (to compare decoders)
 
@@ -56,7 +56,7 @@ import holidays
 
 FIRST_YEAR = 2000
 LAST_YEAR = 2100
-OUTPUT = Path(__file__).resolve().parents[1] / "data" / "holidays.bin"
+OUTPUT = Path(__file__).resolve().parents[1] / "src" / "holidays.bin"
 
 
 def countries() -> list[tuple[str, list[tuple[str, str]]]]:

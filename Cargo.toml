@@ -23,15 +23,16 @@ http-body-util = "0.1"
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 serde = "1"
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "unbounded_depth"] }
 indexmap = "2"
 rusqlite = { version = "0.37", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-chrono-tz = "0.10"
+jiff = { version = "1", default-features = false, features = ["std", "tz-fat", "tzdb-zoneinfo", "tzdb-bundle-always"] }
 openssl = "0.10"
 tokio-openssl = "0.6"
 miniz_oxide = "0.8"
 log = { version = "0.4", features = ["std"] }
+socket2 = "0.6"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }

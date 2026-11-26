@@ -21,7 +21,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
-use chrono_tz::Tz;
 use indexmap::IndexMap;
 use serde_json::{json, Value};
 use tokio::sync::OwnedMutexGuard;
@@ -40,13 +39,14 @@ use crate::state::{
 use crate::store::{Sample, Store};
 use crate::timeutil::{iso, iso_seconds, now_iso, parse_iso, parse_iso_value, seconds_between, timestamp};
 use crate::value::{clip, get, objects, reading, round_to, small_int, text, to_float, truthy, Object};
+use crate::zone::Tz;
 
 const PLUGGED_IN: [&str; 5] = ["Preparing", "Charging", "SuspendedEV", "SuspendedEVSE", "Finishing"];
 const WANTS_START: [&str; 2] = ["Preparing", "SuspendedEVSE"];
 const REMOTE_RETRY: Duration = Duration::from_secs(60);
 
 /// meterValue entries handled per message (a charger sends one).
-const MAX_METER_VALUES: usize = 16;
+pub const MAX_METER_VALUES: usize = 16;
 const MAX_SAMPLED_VALUES: usize = 64;
 /// How long samples are kept.
 const SAMPLE_DAYS: i64 = 90;
@@ -489,7 +489,9 @@ impl Inner {
     /// The next transaction id; counts on from the history as well as from the saved counter.
     fn allocate_transaction_id(&mut self) -> i64 {
         let tid = self.store.unused_id(self.next_transaction_id);
-        self.next_transaction_id = tid + 1;
+        // After the last id there is, the counter stays on it: `unused_id` knows that one cannot
+        // be counted on from, and starts again from the history.
+        self.next_transaction_id = tid.saturating_add(1);
         tid
     }
 
@@ -942,6 +944,11 @@ impl Controller {
         let mut admission = Admission { controller: self, id: cp_id.to_string(), guard: None };
         admission.guard = Some(lock.lock_owned().await);
         admission
+    }
+
+    /// How many charge point ids have a handshake in progress (none, once they are all over).
+    pub fn admissions_in_progress(&self) -> usize {
+        self.admissions.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Decide whether a charger may connect as `cp_id`; (HTTP status, reason) if not.
@@ -1724,5 +1731,30 @@ mod tests {
         let inner = controller.lock();
         assert_eq!(inner.stations["GRD-1"].connector_count, 8);
         assert_eq!(inner.stations["GRD-1"].connectors.len(), 8, "every connector up to the highest one exists");
+    }
+
+    /// A bug in what is done for one station (it panics, in the worst place: with the state
+    /// locked) ends that one task. Everybody else can still use the state, the background loop
+    /// still makes its rounds, and what is in memory is still saved.
+    #[tokio::test]
+    async fn a_task_that_fails_stops_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let controller = controller(dir.path(), &[]);
+        let failing = controller.spawn({
+            let controller = controller.clone();
+            async move {
+                let _state = controller.lock();
+                panic!("a bug (this panic is the test's own)");
+            }
+        });
+        assert!(failing.await.unwrap_err().is_panic());
+
+        let heartbeat = controller.handle("GRD-1", "Heartbeat", &Object::new()).unwrap();
+        assert!(heartbeat["currentTime"].is_string());
+        controller.tick(&mut None);
+        let station_tick = controller.lock().station_ticks.remove("GRD-1").expect("the round reached the station");
+        station_tick.await.unwrap();
+        let saved = std::fs::read_to_string(dir.path().join("state.json")).unwrap();
+        assert!(saved.contains("GRD-1"), "{saved}");
     }
 }

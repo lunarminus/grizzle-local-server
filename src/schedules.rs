@@ -16,10 +16,10 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Datelike, Duration, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Timelike, Utc};
-use chrono_tz::Tz;
 use serde_json::Value;
 
 use crate::value::{char_len, get, parse_float, truthy, whole_number, Object};
+use crate::zone::Tz;
 
 pub type Zone = Object;
 /// Is this calendar day a statutory holiday?
@@ -266,8 +266,9 @@ fn wall_offset(tz: Tz, wall: NaiveDateTime, later: bool) -> i32 {
     }
 }
 
-/// The instant a wall-clock reading stands for (see [`wall_offset`]).
-fn wall_instant(tz: Tz, wall: NaiveDateTime, later: bool) -> DateTime<Utc> {
+/// The instant a wall-clock reading stands for: the first, if it happens twice (`later`: the
+/// second); the moment the clocks changed, if they skipped it.
+pub fn wall_instant(tz: Tz, wall: NaiveDateTime, later: bool) -> DateTime<Utc> {
     Utc.from_utc_datetime(&(wall - Duration::seconds(i64::from(wall_offset(tz, wall, later)))))
 }
 

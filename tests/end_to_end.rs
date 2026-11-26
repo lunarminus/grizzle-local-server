@@ -164,7 +164,7 @@ async fn schedule_mode_follows_windows() {
     let charger = FakeCharger::connect(&server, SERIAL).await;
     let token = server.login().await;
     // A window that is not active right now: it starts in two hours and is half an hour long.
-    let denver: chrono_tz::Tz = "America/Denver".parse().unwrap();
+    let denver: grizzle_local::zone::Tz = "America/Denver".parse().unwrap();
     let later = Utc::now().with_timezone(&denver) + Span::hours(2);
     let end = later + Span::minutes(30);
     let closed = json!({

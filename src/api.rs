@@ -6,10 +6,10 @@
 use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use chrono::{Duration as Days, TimeZone, Utc};
+use chrono::{Duration as Days, Utc};
 use indexmap::IndexMap;
 use serde_json::{json, Value};
 
@@ -19,6 +19,7 @@ use crate::crypto::{hex, md5_hex, random_bytes, random_token, same_secret, slow_
 use crate::holidays;
 use crate::logging::printable;
 use crate::net::{address, is_global, split_url};
+use crate::schedules::wall_instant;
 use crate::state::{connector_count, Connector, Station, MAX_CONNECTORS, MODES};
 use crate::timeutil::{iso, parse_iso, seconds_between};
 use crate::value::{get, number, opt_int, opt_number, round_to, to_text, truthy, whole_number, Object};
@@ -740,52 +741,68 @@ pub enum Route {
     ClearAuthKey(String),
 }
 
+/// Every endpoint: its method, its path (`{}` where a station, serial or zone id goes) and the
+/// route that the ids found there make.
+#[rustfmt::skip]
+pub const ROUTES: &[(&str, &str, fn(&[String]) -> Route)] = &[
+    ("GET", "/health", |_| Route::Health),
+    ("GET", "/commercial/ext-ocpp-check/{}", |id| Route::UnlockCheck(id[0].clone())),
+    ("POST", "/client/auth/login", |_| Route::Login),
+    ("POST", "/client/auth/refresh-token", |_| Route::RefreshToken),
+    ("POST", "/client/auth/logout", |_| Route::Logout),
+    ("GET", "/client/auth/profile", |_| Route::Profile),
+    ("GET", "/client/stations", |_| Route::Stations),
+    ("GET", "/client/stations/{}", |id| Route::Station(id[0].clone())),
+    ("POST", "/client/stations/{}/mode", |id| Route::Mode(id[0].clone())),
+    ("PUT", "/client/stations/{}/currentLimit", |id| Route::CurrentLimit(id[0].clone())),
+    ("POST", "/client/stations/{}/scheduleUpdate", |id| Route::ZoneUpdate { station: id[0].clone(), schedule: true }),
+    ("POST", "/client/stations/{}/pricesByZoneUpdate", |id| Route::ZoneUpdate { station: id[0].clone(), schedule: false }),
+    ("POST", "/client/stations/{}/scheduleEnable", |id| Route::ZoneEnable(id[0].clone())),
+    ("DELETE", "/client/stations/{}/scheduleDelete/{}", |id| Route::ZoneDelete { station: id[0].clone(), zone: id[1].clone() }),
+    ("DELETE", "/client/stations/{}/pricesByZoneDelete/{}", |id| Route::ZoneDelete { station: id[0].clone(), zone: id[1].clone() }),
+    ("PUT", "/client/stations/{}/rate", |id| Route::Rate(id[0].clone())),
+    ("POST", "/client/stations/{}/reboot", |id| Route::Reboot(id[0].clone())),
+    ("GET", "/client/stations/{}/events", |id| Route::Events(id[0].clone())),
+    ("GET", "/local/stations/{}/samples", |id| Route::Samples(id[0].clone())),
+    ("GET", "/local/stations/{}/sessions", |id| Route::Sessions(id[0].clone())),
+    ("POST", "/local/stations/{}/sessions/recalculate", |id| Route::Recalculate(id[0].clone())),
+    ("GET", "/local/holidays/countries", |_| Route::Countries),
+    ("GET", "/local/stations/{}/holidays", |id| Route::HolidaysGet(id[0].clone())),
+    ("PUT", "/local/stations/{}/holidays", |id| Route::HolidaysPut(id[0].clone())),
+    ("POST", "/local/stations/{}/holidays/preview", |id| Route::HolidaysPreview(id[0].clone())),
+    ("GET", "/local/stations/{}/log", |id| Route::Log(id[0].clone())),
+    ("POST", "/local/stations/{}/ocpp", |id| Route::OcppCall(id[0].clone())),
+    ("PUT", "/local/stations/{}/settings", |id| Route::Settings(id[0].clone())),
+    ("DELETE", "/local/stations/{}", |id| Route::DeleteStation(id[0].clone())),
+    ("DELETE", "/local/stations/{}/auth-key", |id| Route::ClearAuthKey(id[0].clone())),
+];
+
 impl Route {
-    /// The endpoint for a method and a (percent-decoded) path, if there is one. HEAD is GET.
+    /// The endpoint for a method and a path as it was sent, if there is one. HEAD is GET.
+    ///
+    /// The path is split at its slashes first and each part decoded afterwards, so an encoded
+    /// slash (`%2F`) is part of a name and never a separator: `/client%2Fstations` is not a
+    /// route, and `/client/stations/A%2Fevents` asks for a station called "A/events".
     pub fn find(method: &str, path: &str) -> Option<Route> {
         let method = if method == "HEAD" { "GET" } else { method };
-        let segments: Vec<&str> = path.strip_prefix('/')?.split('/').collect();
-        if segments.iter().any(|segment| segment.is_empty()) {
+        let segments: Vec<String> = path.strip_prefix('/')?.split('/').map(percent_decode).collect();
+        if segments.iter().any(String::is_empty) {
             return None;
         }
-        let id = |segment: &str| segment.to_string();
-        Some(match (method, segments.as_slice()) {
-            ("GET", ["health"]) => Route::Health,
-            ("GET", ["commercial", "ext-ocpp-check", serial]) => Route::UnlockCheck(id(serial)),
-            ("POST", ["client", "auth", "login"]) => Route::Login,
-            ("POST", ["client", "auth", "refresh-token"]) => Route::RefreshToken,
-            ("POST", ["client", "auth", "logout"]) => Route::Logout,
-            ("GET", ["client", "auth", "profile"]) => Route::Profile,
-            ("GET", ["client", "stations"]) => Route::Stations,
-            ("GET", ["client", "stations", station]) => Route::Station(id(station)),
-            ("POST", ["client", "stations", station, "mode"]) => Route::Mode(id(station)),
-            ("PUT", ["client", "stations", station, "currentLimit"]) => Route::CurrentLimit(id(station)),
-            ("POST", ["client", "stations", station, "scheduleUpdate"]) => {
-                Route::ZoneUpdate { station: id(station), schedule: true }
+        ROUTES.iter().filter(|(allowed, ..)| *allowed == method).find_map(|(_, pattern, route)| {
+            let expected: Vec<&str> = pattern[1..].split('/').collect();
+            if expected.len() != segments.len() {
+                return None;
             }
-            ("POST", ["client", "stations", station, "pricesByZoneUpdate"]) => {
-                Route::ZoneUpdate { station: id(station), schedule: false }
+            let mut ids = Vec::new();
+            for (expected, segment) in expected.into_iter().zip(&segments) {
+                match expected {
+                    "{}" => ids.push(segment.clone()),
+                    name if name == segment => {}
+                    _ => return None,
+                }
             }
-            ("POST", ["client", "stations", station, "scheduleEnable"]) => Route::ZoneEnable(id(station)),
-            ("DELETE", ["client", "stations", station, "scheduleDelete" | "pricesByZoneDelete", zone]) => {
-                Route::ZoneDelete { station: id(station), zone: id(zone) }
-            }
-            ("PUT", ["client", "stations", station, "rate"]) => Route::Rate(id(station)),
-            ("POST", ["client", "stations", station, "reboot"]) => Route::Reboot(id(station)),
-            ("GET", ["client", "stations", station, "events"]) => Route::Events(id(station)),
-            ("GET", ["local", "stations", station, "samples"]) => Route::Samples(id(station)),
-            ("GET", ["local", "stations", station, "sessions"]) => Route::Sessions(id(station)),
-            ("POST", ["local", "stations", station, "sessions", "recalculate"]) => Route::Recalculate(id(station)),
-            ("GET", ["local", "holidays", "countries"]) => Route::Countries,
-            ("GET", ["local", "stations", station, "holidays"]) => Route::HolidaysGet(id(station)),
-            ("PUT", ["local", "stations", station, "holidays"]) => Route::HolidaysPut(id(station)),
-            ("POST", ["local", "stations", station, "holidays", "preview"]) => Route::HolidaysPreview(id(station)),
-            ("GET", ["local", "stations", station, "log"]) => Route::Log(id(station)),
-            ("POST", ["local", "stations", station, "ocpp"]) => Route::OcppCall(id(station)),
-            ("PUT", ["local", "stations", station, "settings"]) => Route::Settings(id(station)),
-            ("DELETE", ["local", "stations", station]) => Route::DeleteStation(id(station)),
-            ("DELETE", ["local", "stations", station, "auth-key"]) => Route::ClearAuthKey(id(station)),
-            _ => return None,
+            Some(route(&ids))
         })
     }
 }
@@ -970,15 +987,20 @@ impl App {
             Route::Sessions(station) => self.sessions(&station, request),
             Route::Recalculate(station) => Ok(Reply::json(&self.controller.recalculate_costs(&station)?)),
             Route::Countries => {
-                let countries: Vec<Value> = holidays::countries()
-                    .iter()
-                    .map(|country| {
-                        let subdivisions: Vec<Value> =
-                            country.subdivisions.iter().map(|s| json!({"code": s.code, "name": s.name})).collect();
-                        json!({"code": country.code, "subdivisions": subdivisions})
-                    })
-                    .collect();
-                Ok(Reply::json(&json!({"countries": countries})))
+                // The same 30 kB for every request: put together once.
+                static COUNTRIES: OnceLock<Reply> = OnceLock::new();
+                let reply = COUNTRIES.get_or_init(|| {
+                    let countries: Vec<Value> = holidays::countries()
+                        .iter()
+                        .map(|country| {
+                            let subdivisions: Vec<Value> =
+                                country.subdivisions.iter().map(|s| json!({"code": s.code, "name": s.name})).collect();
+                            json!({"code": country.code, "subdivisions": subdivisions})
+                        })
+                        .collect();
+                    Reply::json(&json!({"countries": countries}))
+                });
+                Ok(reply.clone())
             }
             Route::HolidaysGet(station) => {
                 let saved = {
@@ -1145,9 +1167,16 @@ impl App {
         }
         let tz = station_tz(station, &self.settings);
         let local = now.with_timezone(&tz);
-        let midnight = local.date_naive().and_time(chrono::NaiveTime::MIN);
-        let today = tz.from_local_datetime(&midnight).earliest().map_or(now, |t| t.with_timezone(&Utc));
-        let periods = [("today", Some(today)), ("week", Some(now - Days::days(7))), ("month", Some(now - Days::days(30))), ("all", None)];
+        // By the station's clock: since its midnight, and since this time of day 7 and 30 days
+        // ago. (A midnight the clocks skipped is the moment they changed.)
+        let wall = local.naive_local();
+        let since = |wall: chrono::NaiveDateTime| Some(wall_instant(tz, wall, false));
+        let periods = [
+            ("today", since(wall.date().and_time(chrono::NaiveTime::MIN))),
+            ("week", since(wall - Days::days(7))),
+            ("month", since(wall - Days::days(30))),
+            ("all", None),
+        ];
         let mut summary = Object::new();
         for (name, since) in periods {
             let (mut energy, mut cost, mut count) = (0.0, 0.0, 0);
@@ -1265,6 +1294,17 @@ mod tests {
         assert_eq!(Route::find("GET", "/local/stations/GRD-1"), None);
         assert_eq!(Route::find("GET", "/"), None);
         assert_eq!(Route::find("GET", ""), None);
+        // An encoded slash never separates; any other escape is just a way to write the letter.
+        assert_eq!(Route::find("GET", "/client%2Fstations"), None);
+        assert_eq!(Route::find("GET", "/local/holidays%2fcountries"), None);
+        assert_eq!(Route::find("GET", "/cl%69ent/stations"), Some(Route::Stations));
+        assert_eq!(Route::find("GET", "/client/stations/GRD-1%2Fevents"), Some(Route::Station("GRD-1/events".into())));
+        assert_eq!(Route::find("GET", "/client/stations/GRD%2D1/events"), Some(Route::Events("GRD-1".into())));
+        // Every route in the table is found under its own method and path, as itself.
+        for (method, pattern, route) in ROUTES {
+            let ids = vec!["GRD-1".to_string(); pattern.matches("{}").count()];
+            assert_eq!(Route::find(method, &pattern.replace("{}", "GRD-1")), Some(route(&ids)), "{method} {pattern}");
+        }
     }
 
     #[test]

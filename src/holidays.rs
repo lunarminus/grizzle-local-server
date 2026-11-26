@@ -292,7 +292,10 @@ fn parse_date(text: &str) -> Option<NaiveDate> {
         8 if text.is_ascii() => (&text[..4], &text[4..6], &text[6..]),
         _ => return None,
     };
-    NaiveDate::from_ymd_opt(digits(year, 4)? as i32, digits(month, 2)?, digits(day, 2)?)
+    // No year 0: there is none in the calendar the earlier (Python) versions read these dates
+    // with, and they dropped a station's whole holiday settings over a date they could not read.
+    let year = digits(year, 4).filter(|year| *year >= 1)?;
+    NaiveDate::from_ymd_opt(year as i32, digits(month, 2)?, digits(day, 2)?)
 }
 
 impl Settings {
@@ -610,7 +613,11 @@ mod tests {
         ] {
             assert_eq!(Settings::normalize(&bad).unwrap_err(), message, "{bad}");
         }
-        for bad in [json!({"extraDates": ["tomorrow"]}), json!({"extraDates": [5]}), json!({"extraDates": ["2026-02-30"]})] {
+        let year_zero = [json!({"extraDates": ["0000-01-01"]}), json!({"extraDates": [{"date": "00000229"}]})];
+        for bad in [json!({"extraDates": ["tomorrow"]}), json!({"extraDates": [5]}), json!({"extraDates": ["2026-02-30"]})]
+            .into_iter()
+            .chain(year_zero)
+        {
             let message = Settings::normalize(&bad).unwrap_err();
             assert!(message.starts_with("invalid date") && message.ends_with("use YYYY-MM-DD"), "{message}");
         }

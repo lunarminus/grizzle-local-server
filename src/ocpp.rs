@@ -54,8 +54,14 @@ const SEND_QUEUE: usize = 32;
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
 /// The settings of the WebSocket itself: no message or frame larger than [`MAX_FRAME_BYTES`].
+///
+/// A client is supposed to mask what it sends. Small embedded WebSocket clients are known to skip
+/// it, the Python server never insisted, and masking protects proxies, not us: take either.
 pub fn websocket_config() -> WebSocketConfig {
-    WebSocketConfig::default().max_message_size(Some(MAX_FRAME_BYTES)).max_frame_size(Some(MAX_FRAME_BYTES))
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_FRAME_BYTES))
+        .max_frame_size(Some(MAX_FRAME_BYTES))
+        .accept_unmasked_frames(true)
 }
 
 /// A CallError received from the charger, or a call that timed out or could not be sent.
@@ -240,6 +246,18 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Takes a call out of the pending map when the call is over, however it ends.
+struct Forget<'a> {
+    pending: &'a Mutex<HashMap<String, oneshot::Sender<Reply>>>,
+    uid: &'a str,
+}
+
+impl Drop for Forget<'_> {
+    fn drop(&mut self) {
+        lock(self.pending).remove(self.uid);
+    }
+}
+
 impl Connection {
     pub fn new(id: &str, rate_burst: f64, rate_per_second: f64, call_timeout: Duration) -> Connection {
         let (out, out_rx) = mpsc::channel(SEND_QUEUE);
@@ -274,6 +292,9 @@ impl Connection {
         let uid = random_hex(6);
         let (reply_to, reply) = oneshot::channel();
         lock(&self.pending).insert(uid.clone(), reply_to);
+        // Whatever ends this call (an answer, the deadline, or the caller's task being aborted
+        // while it waits), nobody is waiting for the answer afterwards.
+        let _forget = Forget { pending: &self.pending, uid: &uid };
         let payload = if payload.is_null() { json!({}) } else { payload };
         let frame = json!([CALL, uid, action, payload]);
         // The send is inside the deadline too: a peer that stops reading must not be able to
@@ -286,7 +307,6 @@ impl Connection {
             reply.await.unwrap_or_else(|_| Err(OcppError::new("Disconnected", "Disconnected")))
         })
         .await;
-        lock(&self.pending).remove(&uid);
         outcome.unwrap_or_else(|_| Err(OcppError::new("Timeout", &format!("{action} not answered by {}", self.id))))
     }
 
@@ -345,6 +365,11 @@ impl Connection {
                 }
             };
             let _ = tokio::time::timeout(CLOSE_GRACE, acknowledged).await;
+        } else {
+            // If the peer closed, the answer to its close is waiting to be written: a peer that
+            // closes properly should see a close and not a reset. (Nothing to write, or nobody
+            // to write to, and this returns at once.)
+            let _ = tokio::time::timeout(CLOSE_GRACE, sink.flush()).await;
         }
         self.fail_pending("Disconnected");
         self.done.send_replace(true);
@@ -748,6 +773,18 @@ mod tests {
         let err = conn.call("Reset", json!({}), Some(Duration::from_millis(50))).await.unwrap_err();
         assert_eq!(err.code, "Timeout");
         assert_eq!(err.description, "Reset not answered by GRD-TEST");
+        assert!(lock(&conn.pending).is_empty());
+
+        // Nor does a caller that is stopped while it waits (a repeated BootNotification aborts
+        // the conversation that followed the one before) leave its call behind.
+        let caller = tokio::spawn({
+            let conn = conn.clone();
+            async move { conn.call("Reset", json!({}), None).await }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(lock(&conn.pending).len(), 1);
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
         assert!(lock(&conn.pending).is_empty());
     }
 

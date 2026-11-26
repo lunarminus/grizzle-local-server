@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -66,25 +66,45 @@ fn restrict(path: &Path) {
     let _ = fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_FILE));
 }
 
-/// `NaN`, `Infinity` and `-Infinity` outside strings replaced by `null`.
+/// state.json as a strict parser accepts it, where the Python versions of this server wrote
+/// something it does not:
 ///
-/// Older versions of the server could write them into state.json; JSON proper has no spelling for
-/// them, and a strict parser would otherwise call the whole file corrupt.
-fn without_non_finite(text: &str) -> String {
+/// - `NaN`, `Infinity` and `-Infinity` (outside strings) become `null`: JSON proper has no
+///   spelling for them;
+/// - half of a surrogate pair written as an escape (`"\ud83d"` with nothing to pair with: Python
+///   kept such text as it came from a charger) becomes U+FFFD, the "not a character" character.
+///
+/// Either would otherwise have the whole file called corrupt, and every station forgotten.
+fn repaired(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut at = 0;
     let mut copied = 0;
     let mut in_string = false;
+    // Is there an escape at `at` that spells half of a surrogate pair, and is it the first half?
+    let surrogate = |at: usize| -> Option<bool> {
+        let digits = bytes.get(at..at + 6).filter(|escape| escape.starts_with(b"\\u"))?;
+        let code = u32::from_str_radix(std::str::from_utf8(&digits[2..]).ok()?, 16).ok()?;
+        (0xD800..0xE000).contains(&code).then_some(code < 0xDC00)
+    };
     while at < bytes.len() {
         let byte = bytes[at];
         if in_string {
-            match byte {
-                b'\\' => at += 1,
-                b'"' => in_string = false,
-                _ => {}
+            match (byte, surrogate(at)) {
+                (_, Some(true)) if surrogate(at + 6) == Some(false) => at += 12, // a proper pair
+                (_, Some(_)) => {
+                    out.push_str(&text[copied..at]);
+                    out.push_str("\\ufffd");
+                    at += 6;
+                    copied = at;
+                }
+                (b'\\', None) => at += 2,
+                (b'"', None) => {
+                    in_string = false;
+                    at += 1;
+                }
+                _ => at += 1,
             }
-            at += 1;
             continue;
         }
         if byte == b'"' {
@@ -104,6 +124,47 @@ fn without_non_finite(text: &str) -> String {
     }
     out.push_str(&text[copied.min(text.len())..]);
     out
+}
+
+/// How deep the brackets of a JSON text nest.
+fn nesting(text: &str) -> usize {
+    let (mut depth, mut deepest) = (0usize, 0usize);
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in text.bytes() {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
+}
+
+/// state.json nests a handful of levels, plus whatever a zone's uninterpreted fields hold (a
+/// request can nest 128 deep). The parser's own limit of 128 is too tight for that sum; this
+/// one still stops a damaged file from exhausting the stack.
+const MAX_STATE_NESTING: usize = 256;
+
+fn parse_state(text: &str) -> Option<Value> {
+    let mut reader = serde_json::Deserializer::from_str(text);
+    reader.disable_recursion_limit();
+    let value = serde::Deserialize::deserialize(&mut reader).ok()?;
+    reader.end().ok()?;
+    Some(value)
 }
 
 /// One meter reading for the history.
@@ -149,15 +210,21 @@ fn row_object(row: &rusqlite::Row<'_>, columns: &[String]) -> DbResult<Object> {
 
 impl Store {
     /// Open (creating what is missing) the data directory. Returns the store and whatever
-    /// state.json held: an empty object if there was none, or if it was unreadable (it is then
-    /// set aside as `state.corrupt.json`).
+    /// state.json held: an empty object if there was none, or if what it holds is not a state (it
+    /// is then set aside as `state.corrupt.json`).
+    ///
+    /// A state.json that is there but cannot be read (it belongs to another user, the disk gives
+    /// an error) is an error and is left alone: starting empty over it would forget every station
+    /// for a problem that `chown` fixes.
     pub fn open(data_dir: &Path) -> Result<(Store, Object), String> {
         fs::create_dir_all(data_dir).map_err(|err| format!("cannot create {}: {err}", data_dir.display()))?;
         let state_path = data_dir.join("state.json");
-        let state = Store::load(&state_path);
         let db_path = data_dir.join("history.sqlite");
         let db = Database::open(&db_path).map_err(|err| format!("cannot open {}: {err}", db_path.display()))?;
         db.execute_batch(SCHEMA).map_err(|err| format!("cannot use {}: {err}", db_path.display()))?;
+        // After the history: a state.json that has to be set aside is not set aside by a start
+        // that then fails anyway.
+        let state = Store::load(&state_path)?;
         for path in [&state_path, &db_path] {
             restrict(path);
         }
@@ -173,31 +240,26 @@ impl Store {
 
     // --- JSON state ---------------------------------------------------------
 
-    fn load(path: &Path) -> Object {
-        let Ok(text) = fs::read_to_string(path) else {
-            if path.exists() {
-                Store::set_aside(path); // there, but not text
-            }
-            return Object::new();
+    fn load(path: &Path) -> Result<Object, String> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Object::new()),
+            Err(err) => return Err(format!("cannot read {}: {err}", path.display())),
         };
-        let parsed = serde_json::from_str::<Value>(&text)
-            .or_else(|_| serde_json::from_str::<Value>(&without_non_finite(&text)));
+        let parsed = String::from_utf8(bytes).ok().filter(|text| nesting(text) <= MAX_STATE_NESTING).and_then(|text| {
+            parse_state(&text).or_else(|| parse_state(&repaired(&text)))
+        });
         match parsed {
-            Ok(Value::Object(state)) => state,
+            Some(Value::Object(state)) => Ok(state),
             _ => {
-                Store::set_aside(path);
-                Object::new()
+                let backup = path.with_extension("corrupt.json");
+                log::error!("state.json is corrupt, moving it to {}", backup.display());
+                fs::rename(path, &backup)
+                    .map_err(|err| format!("{} is corrupt and cannot be moved aside: {err}", path.display()))?;
+                restrict(&backup); // it may still hold sessions and the charger's Auth key
+                Ok(Object::new())
             }
         }
-    }
-
-    fn set_aside(path: &Path) {
-        let backup = path.with_extension("corrupt.json");
-        log::error!("state.json is corrupt, moving it to {}", backup.display());
-        if let Err(err) = fs::rename(path, &backup) {
-            log::error!("could not move state.json aside: {err}");
-        }
-        restrict(&backup); // it may still hold sessions and the charger's Auth key
     }
 
     /// Replace state.json with `state`, written to a temporary file first and flushed to disk.
@@ -500,6 +562,67 @@ mod tests {
             json!({"stations": {"GRD-1": {"priceKW": null, "displayName": "NaN and \"Infinity\"", "a": [null, null, 1]}}})
         );
         assert!(dir.path().join("state.json").exists());
+    }
+
+    /// Python read and wrote half a surrogate pair as an escape (a charger's DataTransfer text was
+    /// stored as it came). Such a file is still the owner's stations, keys and schedules.
+    #[test]
+    fn state_file_with_half_a_surrogate_pair_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("state.json"),
+            r#"{"stations": {"GRD-1": {"displayName": "half \ud83d", "b": "\ude00 other half", "c": "pair \ud83d\ude00",
+                "d": "two firsts \ud83d\ud83d\ude00", "e": "a backslash \\ud83d", "f": "\ud83d", "\udfff": NaN}}}"#,
+        )
+        .unwrap();
+        let (_store, state) = open(dir.path());
+        assert_eq!(
+            Value::Object(state),
+            json!({"stations": {"GRD-1": {"displayName": "half \u{fffd}", "b": "\u{fffd} other half", "c": "pair \u{1f600}",
+                "d": "two firsts \u{fffd}\u{1f600}", "e": "a backslash \\ud83d", "f": "\u{fffd}", "\u{fffd}": null}}})
+        );
+        assert!(dir.path().join("state.json").exists());
+        assert!(!dir.path().join("state.corrupt.json").exists());
+    }
+
+    /// A zone keeps fields it does not interpret, and such a field may nest as deep as a request
+    /// may (128): with the levels above it, deeper than a JSON parser takes by default.
+    #[test]
+    fn state_file_may_nest_deeper_than_a_request() {
+        let nested = |depth: usize| format!(r#"{{"stations": {{"GRD-1": {{"x": {}1{}}}}}}}"#, "[".repeat(depth), "]".repeat(depth));
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("state.json"), nested(200)).unwrap();
+        let (_store, state) = open(dir.path());
+        let mut inner = &state["stations"]["GRD-1"]["x"];
+        let mut depth = 0;
+        while let Some(next) = inner.get(0) {
+            inner = next;
+            depth += 1;
+        }
+        assert_eq!((depth, inner), (200, &json!(1)));
+        assert!(!dir.path().join("state.corrupt.json").exists());
+        // Something no version of the server wrote is still refused, not allowed to exhaust the stack.
+        for depth in [MAX_STATE_NESTING, 200_000] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("state.json"), nested(depth)).unwrap();
+            let (_store, state) = open(dir.path());
+            assert!(state.is_empty());
+            assert!(dir.path().join("state.corrupt.json").exists());
+        }
+        assert_eq!(nesting(r#"{"a": "[[[ \" [[", "b": [{"c": []}, []]}"#), 4);
+    }
+
+    /// Unreadable is not corrupt: the file is somebody's stations and keys, and the fix is on
+    /// the outside (`chown`, a disk that answers). Starting empty over it would be the damage.
+    #[test]
+    fn state_file_that_cannot_be_read_stops_the_start_and_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::create_dir(&path).unwrap(); // reading it fails, whoever runs the test
+        let err = Store::open(dir.path()).err().unwrap();
+        assert!(err.starts_with("cannot read ") && err.contains("state.json"), "{err}");
+        assert!(path.is_dir());
+        assert!(!dir.path().join("state.corrupt.json").exists());
     }
 
     #[test]

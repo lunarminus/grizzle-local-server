@@ -8,7 +8,7 @@
 
 use std::convert::Infallible;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -23,6 +23,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use log::Level;
 use openssl::ssl::{Ssl, SslContext, SslFiletype, SslMethod, SslOptions, SslVersion};
 use serde_json::json;
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
@@ -249,6 +250,7 @@ async fn handle(app: Arc<App>, mut http: HttpRequest<Incoming>, peer: SocketAddr
             headers.push((name.as_str().to_string(), String::from_utf8_lossy(value.as_bytes()).into_owned()));
         }
     }
+    let raw_path = http.uri().path().to_string();
     let mut request = Request {
         method: http.method().as_str().to_string(),
         path: percent_decode(http.uri().path()),
@@ -260,7 +262,7 @@ async fn handle(app: Arc<App>, mut http: HttpRequest<Incoming>, peer: SocketAddr
     if let Some(refusal) = gate(&app, &request) {
         return respond(refusal);
     }
-    let reply = match Route::find(&request.method, &request.path) {
+    let reply = match Route::find(&request.method, &raw_path) {
         Some(route) => match Limited::new(http.into_body(), MAX_BODY_BYTES).collect().await {
             Ok(body) => {
                 request.body = body.to_bytes().to_vec();
@@ -274,7 +276,7 @@ async fn handle(app: Arc<App>, mut http: HttpRequest<Incoming>, peer: SocketAddr
         None if matches!(request.method.as_str(), "GET" | "HEAD") => {
             websocket_or_page(&app, &mut http, &request, tls).await
         }
-        None => Reply::text(405, "405: Method Not Allowed").with_header("allow", allowed_methods(&request.path)),
+        None => Reply::text(405, "405: Method Not Allowed").with_header("allow", allowed_methods(&raw_path)),
     };
     respond(reply)
 }
@@ -284,9 +286,18 @@ async fn serve_connection<I>(app: Arc<App>, io: I, peer: SocketAddr, tls: bool)
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // Each request is answered by a task of its own: a client that hangs up while its request is
+    // being worked on (a command waiting for the charger's answer, a new connection waiting for
+    // the old one to prove it is alive) loses the answer, but the work is finished as it would
+    // have been, not dropped half-way.
     let service = service_fn(move |request| {
-        let app = app.clone();
-        async move { Ok::<_, Infallible>(handle(app, request, peer, tls).await) }
+        let handler = tokio::spawn(handle(app.clone(), request, peer, tls));
+        async move {
+            Ok::<_, Infallible>(handler.await.unwrap_or_else(|err| {
+                log::error!("the request from {peer} failed: {err}");
+                respond(Reply::text(500, "500: Internal Server Error"))
+            }))
+        }
     });
     let connection = http1::Builder::new()
         .timer(TokioTimer::new())
@@ -394,16 +405,44 @@ async fn serve_tls(app: Arc<App>, context: SslContext, tcp: TcpStream, peer: Soc
     serve_connection(app, Announced { inner: stream, peer }, peer, true).await;
 }
 
-async fn bind(host: &str, port: u16) -> Result<TcpListener, String> {
-    let host = if host.is_empty() { "0.0.0.0" } else { host };
-    TcpListener::bind((host, port)).await.map_err(|err| format!("cannot listen on {host} port {port}: {err}"))
+/// Listen on every address `host` stands for. As for the Python server: an empty host is every
+/// address of this machine, IPv4 and IPv6 (whichever of the two it has), and an IPv6 socket takes
+/// IPv6 only, so "::" does not quietly listen on IPv4 as well.
+async fn bind(host: &str, port: u16) -> Result<Vec<TcpListener>, String> {
+    let failed = |err: std::io::Error| format!("cannot listen on {host:?} port {port}: {err}");
+    let addresses: Vec<SocketAddr> = if host.is_empty() {
+        vec![(Ipv4Addr::UNSPECIFIED, port).into(), (Ipv6Addr::UNSPECIFIED, port).into()]
+    } else {
+        tokio::net::lookup_host((host, port)).await.map_err(failed)?.collect()
+    };
+    let mut listeners = Vec::new();
+    for address in addresses {
+        // A machine without IPv6 (or without IPv4) cannot make the socket: not an error, as
+        // long as there is something left to listen on.
+        let Ok(socket) = Socket::new(Domain::for_address(address), Type::STREAM, Some(Protocol::TCP)) else { continue };
+        let listen = || -> std::io::Result<TcpListener> {
+            if address.is_ipv6() {
+                socket.set_only_v6(true)?;
+            }
+            socket.set_reuse_address(true)?;
+            socket.set_nonblocking(true)?;
+            socket.bind(&address.into())?;
+            socket.listen(1024)?;
+            TcpListener::from_std(socket.into())
+        };
+        listeners.push(listen().map_err(failed)?);
+    }
+    if listeners.is_empty() {
+        return Err(format!("cannot listen on {host:?} port {port}: it is not an address of this machine"));
+    }
+    Ok(listeners)
 }
 
 /// The listeners, bound and ready to serve.
 pub struct Server {
     pub app: Arc<App>,
-    plain: TcpListener,
-    tls: Option<(TcpListener, SslContext)>,
+    plain: Vec<TcpListener>,
+    tls: Option<(Vec<TcpListener>, SslContext)>,
 }
 
 impl Server {
@@ -422,11 +461,11 @@ impl Server {
 
     /// Where the plain listener really is (the port, if the settings asked for port 0).
     pub fn address(&self) -> SocketAddr {
-        self.plain.local_addr().expect("a bound listener has an address")
+        self.plain[0].local_addr().expect("a bound listener has an address")
     }
 
     pub fn tls_address(&self) -> Option<SocketAddr> {
-        self.tls.as_ref().and_then(|(listener, _)| listener.local_addr().ok())
+        self.tls.as_ref().and_then(|(listeners, _)| listeners[0].local_addr().ok())
     }
 
     /// What an operator should know at startup, as log lines.
@@ -469,35 +508,42 @@ impl Server {
         let Server { app, plain, tls } = self;
         let ticker = tokio::spawn(app.controller.clone().run());
         let mut connections: JoinSet<()> = JoinSet::new();
-        let accept_tls = || async {
-            match &tls {
-                Some((listener, context)) => listener.accept().await.map(|accepted| (accepted, context.clone())),
-                None => std::future::pending().await,
-            }
-        };
+        // One task per listener hands over what it accepts, with the TLS context if it is a TLS port.
+        let (accepted, mut arrivals) = tokio::sync::mpsc::channel::<(TcpStream, SocketAddr, Option<SslContext>)>(16);
+        let mut listeners: JoinSet<()> = JoinSet::new();
+        let tls = tls.into_iter().flat_map(|(listeners, context)| listeners.into_iter().map(move |l| (l, Some(context.clone()))));
+        for (listener, context) in plain.into_iter().map(|listener| (listener, None)).chain(tls) {
+            let accepted = accepted.clone();
+            listeners.spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, peer)) => {
+                            if accepted.send((stream, peer, context.clone())).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(err) => accept_failed(&err).await,
+                    }
+                }
+            });
+        }
+        drop(accepted);
         tokio::pin!(shutdown);
         loop {
             tokio::select! {
                 () = &mut shutdown => break,
-                accepted = plain.accept() => match accepted {
-                    Ok((stream, peer)) => {
-                        let _ = stream.set_nodelay(true);
-                        connections.spawn(serve_connection(app.clone(), stream, peer, false));
-                    }
-                    Err(err) => accept_failed(&err).await,
-                },
-                accepted = accept_tls() => match accepted {
-                    Ok(((stream, peer), context)) => {
-                        let _ = stream.set_nodelay(true);
-                        connections.spawn(serve_tls(app.clone(), context, stream, peer));
-                    }
-                    Err(err) => accept_failed(&err).await,
-                },
+                Some((stream, peer, context)) = arrivals.recv() => {
+                    let _ = stream.set_nodelay(true);
+                    match context {
+                        Some(context) => connections.spawn(serve_tls(app.clone(), context, stream, peer)),
+                        None => connections.spawn(serve_connection(app.clone(), stream, peer, false)),
+                    };
+                }
                 Some(_) = connections.join_next() => {} // forget the ones that have ended
             }
         }
-        drop(plain); // no new connections
-        drop(tls);
+        listeners.shutdown().await; // no new connections
+        drop(arrivals);
         app.controller.stop().await;
         connections.shutdown().await;
         ticker.abort();

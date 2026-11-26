@@ -3,10 +3,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono_tz::Tz;
 
 use crate::net::{split_url, IpNet};
 use crate::value::clip;
+use crate::zone::Tz;
 
 /// Passwords this project has shipped in its documentation or compose file, plus the obvious ones.
 pub const WELL_KNOWN_PASSWORDS: [&str; 6] = ["grizzle", "change-me", "changeme", "password", "admin", "admin@local"];
@@ -168,8 +168,24 @@ pub struct Settings {
 
 impl Settings {
     /// Settings from the process environment.
+    ///
+    /// A value that is not valid UTF-8 (a compose or .env file saved in another encoding) is an
+    /// error. Read as "not set", it would quietly make the API password the well-known default
+    /// and switch off the OCPP password and the list of allowed chargers.
     pub fn from_env() -> Result<Settings, String> {
-        Settings::from_lookup(|name| std::env::var(name).ok())
+        let unreadable = std::cell::RefCell::new(Vec::new());
+        let settings = Settings::from_lookup(|name| match std::env::var(name) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                unreadable.borrow_mut().push(name.to_string());
+                None
+            }
+        });
+        match unreadable.into_inner().first() {
+            Some(name) => Err(format!("{name}: the value is not valid UTF-8 (save the file that sets it as UTF-8)")),
+            None => settings,
+        }
     }
 
     /// The settings an environment with nothing set gives.

@@ -8,8 +8,9 @@ use std::io::Write;
 use std::sync::Mutex;
 
 use chrono::Utc;
-use chrono_tz::Tz;
 use log::{Level, LevelFilter, Log, Metadata, Record};
+
+use crate::zone::Tz;
 
 pub const MAX_LOG_MESSAGE: usize = 4000;
 
