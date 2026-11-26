@@ -173,7 +173,8 @@ mod tests {
         assert_eq!(small_int(&json!(3), 1, 8), Some(3));
         assert_eq!(small_int(&json!(3.0), 1, 8), Some(3));
         assert_eq!(small_int(&json!("3"), 1, 8), Some(3));
-        for bad in [json!(true), json!(3.5), json!("3 "), json!("1234567"), json!(9), json!(null), json!([3]), json!("٣")]
+        for bad in
+            [json!(true), json!(3.5), json!("3 "), json!("1234567"), json!(9), json!(null), json!([3]), json!("٣")]
         {
             assert_eq!(small_int(&bad, 1, 8), None, "{bad}");
         }
@@ -184,7 +185,8 @@ mod tests {
         assert_eq!(reading(&json!(12.5), false), Some(12.5));
         assert_eq!(reading(&json!("12.5"), true), Some(12.5));
         assert_eq!(reading(&json!("12.5"), false), None);
-        for bad in [json!("NaN"), json!("Infinity"), json!("-inf"), json!("1e13"), json!(true), json!("x"), json!(1e13)] {
+        for bad in [json!("NaN"), json!("Infinity"), json!("-inf"), json!("1e13"), json!(true), json!("x"), json!(1e13)]
+        {
             assert_eq!(reading(&bad, true), None, "{bad}");
         }
     }

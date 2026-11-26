@@ -88,7 +88,8 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let settings = Settings::from_pairs(&[("GRIZZLE_HOST", "127.0.0.1"), ("GRIZZLE_PORT", &port.to_string())]).unwrap();
+        let settings =
+            Settings::from_pairs(&[("GRIZZLE_HOST", "127.0.0.1"), ("GRIZZLE_PORT", &port.to_string())]).unwrap();
         assert!(check(&settings).is_err());
     }
 

@@ -57,7 +57,8 @@ async fn next_tick(server: &TestServer) {
 
 /// The limits of the charging profiles the server has sent, in amps.
 fn limits_sent(cp: &RawCharger) -> Vec<f64> {
-    let limit = |call: &Value| call["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"].as_f64();
+    let limit =
+        |call: &Value| call["csChargingProfiles"]["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"].as_f64();
     cp.calls("SetChargingProfile").iter().map(|call| limit(call).expect("a limit")).collect()
 }
 
@@ -116,13 +117,15 @@ async fn remote_start_works_after_a_host_reboot() {
     // lastRemoteStart was a monotonic-clock reading. Saved, then read back after the host rebooted
     // (clock near zero again), it looked like "tried a moment ago" for days: no car could start.
     const SERIAL: &str = "GRD-L0000SESS1";
-    let connector = json!({"id": 1, "status": "Available", "mode": "Active", "transaction": null, "lastRemoteStart": 9e9});
+    let connector =
+        json!({"id": 1, "status": "Available", "mode": "Active", "transaction": null, "lastRemoteStart": 9e9});
     let station = json!({"id": SERIAL, "connectorCount": 1, "connectors": {"1": connector}, "pricesByZone": []});
     let server = server_on(json!({"stations": {SERIAL: station}}), &[]).await;
     // The charger reconnects; one that kept running sends no BootNotification (which would reset the limiter).
     let cp = charger(&server, SERIAL).await;
     assert_eq!(cp.call("StatusNotification", status("Preparing")).await[0], 3);
-    wait_until("RemoteStartTransaction", Duration::from_secs(4), || !cp.calls("RemoteStartTransaction").is_empty()).await;
+    wait_until("RemoteStartTransaction", Duration::from_secs(4), || !cp.calls("RemoteStartTransaction").is_empty())
+        .await;
 }
 
 // History survives a lost state file.
@@ -247,11 +250,11 @@ fn session_relative_register_may_outgrow_meter_start() {
 #[test]
 fn meter_stop_is_read_in_whichever_convention_fits() {
     let cases: [(i64, &[i64], i64, f64); 5] = [
-        (819_392, &[0, 1500], 2000, 2000.0),       // the Duo: lifetime start, session-relative everything else
-        (819_392, &[0, 1500], 821_392, 2000.0),    // session-relative MeterValues, lifetime meterStop
+        (819_392, &[0, 1500], 2000, 2000.0), // the Duo: lifetime start, session-relative everything else
+        (819_392, &[0, 1500], 821_392, 2000.0), // session-relative MeterValues, lifetime meterStop
         (500_000, &[500_000, 501_500], 502_000, 2000.0), // a charger that reports the lifetime register throughout
-        (500_000, &[], 502_000, 2000.0),           // no MeterValues at all
-        (5000, &[], 3000, 3000.0),                 // ...and a meterStop that can only be session-relative
+        (500_000, &[], 502_000, 2000.0),     // no MeterValues at all
+        (5000, &[], 3000, 3000.0),           // ...and a meterStop that can only be session-relative
     ];
     for (meter_start, readings, meter_stop, expected) in cases {
         let dir = tempfile::tempdir().unwrap();
@@ -375,7 +378,10 @@ fn recalculating_costs_uses_one_transaction_and_the_index() {
         let mut inner = controller.lock();
         for tid in 1..=200 {
             let day = format!("2026-10-{:02}", 1 + tid % 28);
-            inner.store.start_session(tid, SERIAL, 1, Some("t"), &format!("{day}T10:00:00.000Z"), Some(0), Some(0.0)).unwrap();
+            inner
+                .store
+                .start_session(tid, SERIAL, 1, Some("t"), &format!("{day}T10:00:00.000Z"), Some(0), Some(0.0))
+                .unwrap();
             let samples: Vec<Sample> = (0..30)
                 .map(|minute| Sample {
                     station: SERIAL.to_string(),
@@ -388,13 +394,19 @@ fn recalculating_costs_uses_one_transaction_and_the_index() {
                 .collect();
             inner.store.add_samples(&samples).unwrap();
             let stop_at = format!("{day}T11:00:00.000Z");
-            inner.store.finish_session(tid, &stop_at, Some(3000), Some(3000.0), Some(3600), Some(0.0), Some("Local"), None).unwrap();
+            inner
+                .store
+                .finish_session(tid, &stop_at, Some(3000), Some(3000.0), Some(3600), Some(0.0), Some("Local"), None)
+                .unwrap();
         }
     }
     let before = commits(dir.path());
     let result = controller.recalculate_costs(SERIAL).unwrap();
     assert_eq!(commits(dir.path()), before + 1);
-    assert!(result["sessions"] == 200 && close_to(result["cost_after"].as_f64().unwrap(), 200.0 * 3.0 * 0.20), "{result}");
+    assert!(
+        result["sessions"] == 200 && close_to(result["cost_after"].as_f64().unwrap(), 200.0 * 3.0 * 0.20),
+        "{result}"
+    );
     assert!(sessions(&controller, SERIAL).iter().all(|session| close_to(session["cost"].as_f64().unwrap(), 0.6)));
 }
 
@@ -436,7 +448,11 @@ fn a_session_reported_by_an_unset_clock_keeps_its_length() {
         begin(&controller, payload);
     };
     started(1000, "1970-01-01T00:10:00Z");
-    handle(&controller, "StopTransaction", json!({"transactionId": 1, "meterStop": 8000, "timestamp": "1970-01-01T01:40:00Z"}));
+    handle(
+        &controller,
+        "StopTransaction",
+        json!({"transactionId": 1, "meterStop": 8000, "timestamp": "1970-01-01T01:40:00Z"}),
+    );
     let recorded = session(&controller, 1);
     assert_eq!(recorded["duration_s"], 90 * 60);
     let start_at = parse_iso(recorded["start_at"].as_str().unwrap()).unwrap();
@@ -479,8 +495,18 @@ async fn forgetting_a_station_removes_its_history() {
 fn an_impossible_transaction_counter_does_not_stop_sessions() {
     // A counter in state.json beyond what the history database can store (a damaged or hand-edited
     // file) was handed out as it was, and from then on no session could be recorded at all.
-    let counters =
-        ["1000000000000000000000000000000", "9223372036854775808", "9223372036854775807", "0", "-5", "\"7\"", "2.5", "true", "null", "[9]"];
+    let counters = [
+        "1000000000000000000000000000000",
+        "9223372036854775808",
+        "9223372036854775807",
+        "0",
+        "-5",
+        "\"7\"",
+        "2.5",
+        "true",
+        "null",
+        "[9]",
+    ];
     for counter in counters {
         let dir = tempfile::tempdir().unwrap();
         save_state(dir.path(), &format!("{{\"next_transaction_id\": {counter}}}"));
@@ -593,7 +619,8 @@ async fn status_text_is_cleaned_like_every_other_field() {
     }
     let token = server.login().await;
     let log = server.get(&format!("/local/stations/{SERIAL}/log"), Some(&token)).await;
-    let unreadable = log.json()["frames"].as_array().unwrap().iter().filter(|frame| frame["label"] == "unparseable").count();
+    let unreadable =
+        log.json()["frames"].as_array().unwrap().iter().filter(|frame| frame["label"] == "unparseable").count();
     assert_eq!((log.status, unreadable), (200, 2));
 }
 
@@ -608,7 +635,8 @@ async fn a_charger_without_an_id_keeps_the_station_it_had() {
         (vec!["unknown-127.0.0.1"], "unknown-127.0.0.1"),
         (vec!["unknown-127.0.0.1", "unknown-192.168.1.50"], "unknown-192.168.1.50"),
     ] {
-        let stations: serde_json::Map<String, Value> = known.iter().map(|id| (id.to_string(), json!({"id": id}))).collect();
+        let stations: serde_json::Map<String, Value> =
+            known.iter().map(|id| (id.to_string(), json!({"id": id}))).collect();
         let server = server_on(json!({"stations": stations}), &[("GRIZZLE_TRUSTED_PROXIES", "127.0.0.1")]).await;
         let how = Connect::path("/ocpp1.6").header("X-Forwarded-For", "192.168.1.50");
         let cp = RawCharger::connect_with(&server, &how).await.expect("the charger is admitted");
@@ -667,7 +695,8 @@ async fn long_fields_and_many_sampled_values_are_cut_to_size() {
     let status = json!({"connectorId": 1, "status": long, "errorCode": long, "vendorErrorCode": long, "info": long});
     assert_eq!(cp.call("StatusNotification", status).await[0], 3);
     assert_eq!(cp.call("StartTransaction", json!({"connectorId": 1, "idTag": long, "meterStart": 0})).await[0], 3);
-    let many: Vec<Value> = (0..500).map(|n| json!({"value": n.to_string(), "measurand": "Voltage", "phase": "L1"})).collect();
+    let many: Vec<Value> =
+        (0..500).map(|n| json!({"value": n.to_string(), "measurand": "Voltage", "phase": "L1"})).collect();
     assert_eq!(cp.call("MeterValues", json!({"connectorId": 1, "meterValue": [{"sampledValue": many}]})).await[0], 3);
 
     let inner = server.controller().lock();

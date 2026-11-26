@@ -463,7 +463,8 @@ impl RawCharger {
             let action = frame[2].as_str().unwrap_or_default().to_string();
             lock(&shared.received).push((action.clone(), frame[3].clone()));
             if shared.answer.load(Ordering::SeqCst) {
-                let reply = lock(&shared.replies).get(&action).cloned().unwrap_or_else(|| json!({"status": "Accepted"}));
+                let reply =
+                    lock(&shared.replies).get(&action).cloned().unwrap_or_else(|| json!({"status": "Accepted"}));
                 let _ = out.send(Message::text(json!([3, frame[1], reply]).to_string()));
             }
         } else if let Some(waiter) = lock(&shared.pending).remove(&frame[1].to_string()) {

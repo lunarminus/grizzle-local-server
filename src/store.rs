@@ -246,9 +246,10 @@ impl Store {
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Object::new()),
             Err(err) => return Err(format!("cannot read {}: {err}", path.display())),
         };
-        let parsed = String::from_utf8(bytes).ok().filter(|text| nesting(text) <= MAX_STATE_NESTING).and_then(|text| {
-            parse_state(&text).or_else(|| parse_state(&repaired(&text)))
-        });
+        let parsed = String::from_utf8(bytes)
+            .ok()
+            .filter(|text| nesting(text) <= MAX_STATE_NESTING)
+            .and_then(|text| parse_state(&text).or_else(|| parse_state(&repaired(&text))));
         match parsed {
             Some(Value::Object(state)) => Ok(state),
             _ => {
@@ -269,7 +270,8 @@ impl Store {
         let formatter = serde_json::ser::PrettyFormatter::with_indent(b" ");
         let mut serializer = serde_json::Serializer::with_formatter(&mut payload, formatter);
         serde::Serialize::serialize(state, &mut serializer).map_err(std::io::Error::other)?;
-        let mut file: File = OpenOptions::new().write(true).create(true).truncate(true).mode(PRIVATE_FILE).open(&tmp)?;
+        let mut file: File =
+            OpenOptions::new().write(true).create(true).truncate(true).mode(PRIVATE_FILE).open(&tmp)?;
         restrict(&tmp); // the mode above only applies when the file is new
         file.write_all(&payload)?;
         // Without this a power cut can leave the renamed file empty, and an empty state means
@@ -381,7 +383,9 @@ impl Store {
     fn trim_samples(&mut self, station: &str, added: i64) -> DbResult<()> {
         let mut count = match self.sample_counts.get(station) {
             Some(count) => count + added,
-            None => self.db.query_row("SELECT COUNT(*) FROM samples WHERE station=?", params![station], |r| r.get(0))?,
+            None => {
+                self.db.query_row("SELECT COUNT(*) FROM samples WHERE station=?", params![station], |r| r.get(0))?
+            }
         };
         let excess = count - self.max_samples;
         if excess > self.max_samples / 10 {
@@ -589,7 +593,9 @@ mod tests {
     /// may (128): with the levels above it, deeper than a JSON parser takes by default.
     #[test]
     fn state_file_may_nest_deeper_than_a_request() {
-        let nested = |depth: usize| format!(r#"{{"stations": {{"GRD-1": {{"x": {}1{}}}}}}}"#, "[".repeat(depth), "]".repeat(depth));
+        let nested = |depth: usize| {
+            format!(r#"{{"stations": {{"GRD-1": {{"x": {}1{}}}}}}}"#, "[".repeat(depth), "]".repeat(depth))
+        };
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("state.json"), nested(200)).unwrap();
         let (_store, state) = open(dir.path());
@@ -657,7 +663,16 @@ mod tests {
         let (mut store, _) = open(dir.path());
         store.start_session(1, "GRD-1", 2, Some("tag"), "2026-11-08T10:00:00.000Z", Some(1000), Some(0.1)).unwrap();
         store
-            .finish_session(1, "2026-11-08T11:00:00.000Z", Some(6000), Some(5000.0), Some(3600), Some(0.75), Some("Local"), Some(0.15))
+            .finish_session(
+                1,
+                "2026-11-08T11:00:00.000Z",
+                Some(6000),
+                Some(5000.0),
+                Some(3600),
+                Some(0.75),
+                Some("Local"),
+                Some(0.15),
+            )
             .unwrap();
         store.start_session(2, "GRD-1", 1, None, "2026-11-08T12:00:00.000Z", None, None).unwrap();
         store.finish_session(2, "2026-11-08T12:30:00.000Z", None, None, None, None, None, None).unwrap();
@@ -717,7 +732,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut store, _) = open(dir.path());
         let ago = |days: i64| (Utc::now() - Duration::days(days)).format("%Y-%m-%dT%H:%M:%S.000Z").to_string();
-        store.add_samples(&[sample("GRD-1", &ago(91), 1.0), sample("GRD-1", &ago(89), 2.0), sample("GRD-1", &ago(0), 3.0)]).unwrap();
+        store
+            .add_samples(&[
+                sample("GRD-1", &ago(91), 1.0),
+                sample("GRD-1", &ago(89), 2.0),
+                sample("GRD-1", &ago(0), 3.0),
+            ])
+            .unwrap();
         store.prune_samples(90).unwrap();
         let left: Vec<f64> =
             store.samples("GRD-1", "", None, 100).unwrap().iter().map(|r| r["energy_wh"].as_f64().unwrap()).collect();

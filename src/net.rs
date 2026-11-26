@@ -23,7 +23,9 @@ impl IpNet {
             None => (text, None),
         };
         let address: IpAddr = match address.split_once('%') {
-            Some((address, zone)) if !zone.is_empty() => address.parse::<Ipv6Addr>().map(IpAddr::V6).map_err(|_| unusable())?,
+            Some((address, zone)) if !zone.is_empty() => {
+                address.parse::<Ipv6Addr>().map(IpAddr::V6).map_err(|_| unusable())?
+            }
             _ => address.parse().map_err(|_| unusable())?,
         };
         let bits = if address.is_ipv4() { 32 } else { 128 };
@@ -228,7 +230,9 @@ mod tests {
         assert!(IpNet::parse("172.18.0.0/255.255.0.0").unwrap().contains("172.18.9.9".parse().unwrap()));
         assert!(IpNet::parse("fe80::1%eth0").unwrap().contains("fe80::1".parse().unwrap()));
         assert_eq!(prefix("fe80::%eth0/64"), Ok(64));
-        for bad in ["10.0.0.0/255.0.255.0", "fd00::/ffff::", "10.0.0.0/ 8", "10.0.0.1%eth0", "fe80::1%", "10.0.0.0/255.0.0"] {
+        for bad in
+            ["10.0.0.0/255.0.255.0", "fd00::/ffff::", "10.0.0.0/ 8", "10.0.0.1%eth0", "fe80::1%", "10.0.0.0/255.0.0"]
+        {
             assert!(IpNet::parse(bad).is_err(), "{bad}");
         }
     }

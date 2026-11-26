@@ -141,8 +141,9 @@ fn next_change_in_the_hour_that_does_not_exist() {
 fn a_window_does_not_pause_when_the_clocks_go_back() {
     let zone = window("01:30", "05:00");
     let start = utc(2027, 11, 7, 6, 0); // 00:00 MDT; seven hours on it is 06:00 MST
-    let states: Vec<bool> =
-        (0..7 * 60).map(|minute| zone_active(&zone, (start + Span::minutes(minute)).with_timezone(&denver_zone()), None)).collect();
+    let states: Vec<bool> = (0..7 * 60)
+        .map(|minute| zone_active(&zone, (start + Span::minutes(minute)).with_timezone(&denver_zone()), None))
+        .collect();
     let flips: Vec<(usize, bool)> =
         (1..states.len()).filter(|i| states[*i] != states[i - 1]).map(|i| (i, states[i])).collect();
     assert_eq!(flips, [(90, true), (360, false)]); // on at the first 01:30 (07:30Z), off at 05:00 MST (12:00Z)
@@ -229,7 +230,8 @@ fn overnight_range_is_judged_per_calendar_day() {
     assert_eq!(inside(denver(2026, 11, 13, 21, 0)), Some("20:00-06:00")); // Friday 21:00
     assert_eq!(inside(denver(2026, 11, 14, 3, 0)), None); // Saturday 03:00: Saturday isn't listed
     assert_eq!(next(denver(2026, 11, 13, 21, 0)), Some(denver(2026, 11, 14, 0, 0))); // Friday evening ends at midnight
-    assert_eq!(next(denver(2026, 11, 14, 12, 0)), Some(denver(2026, 11, 15, 0, 0))); // Saturday -> Sunday 00:00
+    assert_eq!(next(denver(2026, 11, 14, 12, 0)), Some(denver(2026, 11, 15, 0, 0)));
+    // Saturday -> Sunday 00:00
 }
 
 // Holidays.
@@ -563,7 +565,7 @@ async fn unlock_returns_firmware_expected_md5() {
     let server = TestServer::start().await;
     let response = server.get("/commercial/ext-ocpp-check/GRD-L0000430161", None).await;
     assert_eq!(response.status, 200); // public: the charger sends no Authorization header, so this must not be a 401
-    // exactly the 32-char lowercase hex, no trailing newline (firmware does a strcmp)
+                                      // exactly the 32-char lowercase hex, no trailing newline (firmware does a strcmp)
     assert_eq!(response.body, "bf9e764a49121d4006c699d7b991314d");
 }
 

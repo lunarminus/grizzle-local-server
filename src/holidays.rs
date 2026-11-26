@@ -356,7 +356,8 @@ impl Settings {
         }
         let mut excluded_names = BTreeSet::new();
         for name in excluded {
-            let name = name.as_str().filter(|n| n.chars().count() <= 200).ok_or("excludedNames must be holiday names")?;
+            let name =
+                name.as_str().filter(|n| n.chars().count() <= 200).ok_or("excludedNames must be holiday names")?;
             if !name.trim().is_empty() {
                 excluded_names.insert(name.trim().to_string());
             }
@@ -568,7 +569,8 @@ mod tests {
         assert_eq!(custom.holiday_name(day(2026, 12, 25)).as_deref(), Some("Christmas Day"));
 
         let rows = custom.upcoming(day(2026, 7, 1), 40);
-        let listed: Vec<(String, bool, bool)> = rows.iter().map(|r| (r.date.to_string(), r.included, r.custom)).collect();
+        let listed: Vec<(String, bool, bool)> =
+            rows.iter().map(|r| (r.date.to_string(), r.included, r.custom)).collect();
         assert_eq!(
             listed,
             [
@@ -614,9 +616,10 @@ mod tests {
             assert_eq!(Settings::normalize(&bad).unwrap_err(), message, "{bad}");
         }
         let year_zero = [json!({"extraDates": ["0000-01-01"]}), json!({"extraDates": [{"date": "00000229"}]})];
-        for bad in [json!({"extraDates": ["tomorrow"]}), json!({"extraDates": [5]}), json!({"extraDates": ["2026-02-30"]})]
-            .into_iter()
-            .chain(year_zero)
+        for bad in
+            [json!({"extraDates": ["tomorrow"]}), json!({"extraDates": [5]}), json!({"extraDates": ["2026-02-30"]})]
+                .into_iter()
+                .chain(year_zero)
         {
             let message = Settings::normalize(&bad).unwrap_err();
             assert!(message.starts_with("invalid date") && message.ends_with("use YYYY-MM-DD"), "{message}");

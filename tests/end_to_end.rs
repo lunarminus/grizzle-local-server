@@ -55,7 +55,10 @@ async fn login_and_station_shape() {
     assert_eq!(station["bootNotification"]["chargePointModel"], "GRD 40A 2025");
     assert_eq!(station["model"]["displayName"], "Grizzl-E Duo");
     assert_eq!(station["connectors"].as_array().unwrap().len(), 2);
-    assert_eq!((&station["connectors"][0]["connectorId"], &station["connectors"][1]["connectorId"]), (&json!(1), &json!(2)));
+    assert_eq!(
+        (&station["connectors"][0]["connectorId"], &station["connectors"][1]["connectorId"]),
+        (&json!(1), &json!(2))
+    );
     assert_eq!(station["connectors"][0]["status"], "Available");
     assert_eq!(station["connectors"][0]["mode"], "Active");
     assert_eq!(station["model"]["maxCurrent"], 40);
@@ -259,7 +262,8 @@ async fn reboot_and_raw_call() {
 async fn token_refresh() {
     let server = server().await;
     let tokens = server.login_with(EMAIL, PASSWORD).await.json();
-    let refreshed = server.post("/client/auth/refresh-token", None, &json!({"refreshToken": tokens["refreshToken"]})).await;
+    let refreshed =
+        server.post("/client/auth/refresh-token", None, &json!({"refreshToken": tokens["refreshToken"]})).await;
     assert_eq!(refreshed.status, 200);
     let new = refreshed.json();
     assert_ne!(new["token"], tokens["token"]);
@@ -273,7 +277,8 @@ async fn token_refresh() {
 #[tokio::test]
 async fn state_survives_restart() {
     let server = TestServer::with(&[("GRIZZLE_API_EMAIL", "a@b"), ("GRIZZLE_API_PASSWORD", "x")]).await;
-    let options = FakeOptions { path: format!("/{SERIAL}"), meter_interval: Duration::from_secs(5), ..FakeOptions::default() };
+    let options =
+        FakeOptions { path: format!("/{SERIAL}"), meter_interval: Duration::from_secs(5), ..FakeOptions::default() };
     let charger = FakeCharger::connect_with(&server, SERIAL, options).await.unwrap();
     let login = server.login_with("a@b", "x").await;
     assert_eq!(login.status, 200);
@@ -284,7 +289,8 @@ async fn state_survives_restart() {
     let settings = (*server.app.settings).clone();
     let dir = server.stop().await;
 
-    let saved: Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("data/state.json")).unwrap()).unwrap();
+    let saved: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.path().join("data/state.json")).unwrap()).unwrap();
     let station = &saved["stations"][SERIAL];
     assert_eq!(station["connectors"]["1"]["mode"], "Inactive");
     assert_eq!(station["currentLimit"], 20);
@@ -352,7 +358,8 @@ async fn config_keys_teach_dip_switch_and_connectors() {
         state.config.insert("NumberOfConnectors".into(), "2".into());
         state.config.insert("AuthTag".into(), "house_tag".into());
     }
-    let learned = || server.controller().lock().stations.get(SERIAL).is_some_and(|s| s.dip_switch_current_limit == Some(32));
+    let learned =
+        || server.controller().lock().stations.get(SERIAL).is_some_and(|s| s.dip_switch_current_limit == Some(32));
     wait_for("the configuration to be read", learned).await;
     {
         let inner = server.controller().lock();
@@ -440,7 +447,8 @@ async fn recalculate_reprices_past_and_running_sessions() {
     handle(&controller, "StartTransaction", start);
     handle(&controller, "MeterValues", sample(1, 1, "2026-11-09T15:30:00Z", 2000.0)); // 08:30, 2 kWh so far
     handle(&controller, "MeterValues", sample(1, 1, "2026-11-09T16:30:00Z", 5000.0)); // 09:30, 5 kWh so far
-    let stop = json!({"transactionId": 1, "meterStop": 506000, "timestamp": "2026-11-09T17:00:00Z", "reason": "Remote"});
+    let stop =
+        json!({"transactionId": 1, "meterStop": 506000, "timestamp": "2026-11-09T17:00:00Z", "reason": "Remote"});
     handle(&controller, "StopTransaction", stop);
     let session = |id: i64| -> Value {
         let sessions = controller.lock().store.sessions(SERIAL, 50).unwrap();

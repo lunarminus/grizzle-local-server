@@ -628,7 +628,18 @@ mod tests {
 
     #[test]
     fn frames_that_are_not_ocpp_are_dropped() {
-        for bad in ["", "{}", "[]", "[2]", "[2,\"a\"]", "[5,\"a\",{}]", "[\"2\",\"a\",{}]", "[true,\"a\",{}]", "nonsense", "[2,\"a\",NaN]"] {
+        for bad in [
+            "",
+            "{}",
+            "[]",
+            "[2]",
+            "[2,\"a\"]",
+            "[5,\"a\",{}]",
+            "[\"2\",\"a\",{}]",
+            "[true,\"a\",{}]",
+            "nonsense",
+            "[2,\"a\",NaN]",
+        ] {
             assert!(parse_frame(bad).is_none(), "{bad}");
         }
         assert!(parse_frame("[2,\"a\",\"Heartbeat\",{}]").is_some());
@@ -669,7 +680,11 @@ mod tests {
         Connection::new("GRD-TEST", 120.0, 10.0, Duration::from_secs(30))
     }
 
-    async fn feed(conn: &Connection, text: &str, handler: &(dyn Fn(&str, Object) -> HandlerResult + Sync)) -> Vec<Value> {
+    async fn feed(
+        conn: &Connection,
+        text: &str,
+        handler: &(dyn Fn(&str, Object) -> HandlerResult + Sync),
+    ) -> Vec<Value> {
         conn.handle_text(text, handler).await.unwrap();
         let mut sent = Vec::new();
         let mut queue = lock(&conn.out_rx);
@@ -719,7 +734,14 @@ mod tests {
     async fn unhashable_unique_ids_do_not_kill_the_connection() {
         let conn = connection();
         let handler = |_: &str, _: Object| -> HandlerResult { Ok(json!({})) };
-        for odd in [r#"[2,["a"],"Heartbeat",{}]"#, r#"[2,{"a":1},"Heartbeat",{}]"#, r#"[2,null,"Heartbeat",{}]"#, r#"[2,true,"Heartbeat",{}]"#, r#"[2,"a",5,{}]"#, r#"[2,"a","Heartbeat"]"#] {
+        for odd in [
+            r#"[2,["a"],"Heartbeat",{}]"#,
+            r#"[2,{"a":1},"Heartbeat",{}]"#,
+            r#"[2,null,"Heartbeat",{}]"#,
+            r#"[2,true,"Heartbeat",{}]"#,
+            r#"[2,"a",5,{}]"#,
+            r#"[2,"a","Heartbeat"]"#,
+        ] {
             assert!(feed(&conn, odd, &handler).await.is_empty(), "{odd}");
         }
         for odd in [r#"[3,["a"],{}]"#, r#"[3,{"a":1},{}]"#, r#"[4,null,"x","y",{}]"#, r#"[3,5,{}]"#] {
@@ -735,7 +757,9 @@ mod tests {
         let uid_of = |conn: &Connection| -> String {
             let mut queue = lock(&conn.out_rx);
             match queue.as_mut().unwrap().try_recv().unwrap() {
-                Message::Text(text) => serde_json::from_str::<Value>(text.as_str()).unwrap()[1].as_str().unwrap().to_string(),
+                Message::Text(text) => {
+                    serde_json::from_str::<Value>(text.as_str()).unwrap()[1].as_str().unwrap().to_string()
+                }
                 other => panic!("{other:?}"),
             }
         };
@@ -757,7 +781,10 @@ mod tests {
         let uid = uid_of(&conn);
         conn.handle_text(&format!(r#"[4,"{uid}","NotSupported","no\nway",{{"x":1}}]"#), &handler).await.unwrap();
         let err = caller.await.unwrap().unwrap_err();
-        assert_eq!((err.code.as_str(), err.description.as_str(), &err.details), ("NotSupported", "no\\nway", &json!({"x": 1})));
+        assert_eq!(
+            (err.code.as_str(), err.description.as_str(), &err.details),
+            ("NotSupported", "no\\nway", &json!({"x": 1}))
+        );
 
         // A reply too broken to parse still ends the wait.
         let caller = tokio::spawn({
@@ -798,7 +825,10 @@ mod tests {
         let frames = conn.frames();
         assert_eq!(frames[0]["label"], "<- DataTransfer");
         assert_eq!(frames[0]["data"]["omitted"], "frame too large to keep in the log");
-        assert_eq!(frames[1], json!({"at": frames[1]["at"], "dir": "out", "label": "-> result DataTransfer", "data": [3, "1", {}]}));
+        assert_eq!(
+            frames[1],
+            json!({"at": frames[1]["at"], "dir": "out", "label": "-> result DataTransfer", "data": [3, "1", {}]})
+        );
         assert_eq!(frames[2]["label"], "unparseable");
         assert_eq!(frames[2]["data"], "not json at all");
         for n in 0..500 {

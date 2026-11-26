@@ -43,18 +43,8 @@ pub const LOGIN_WINDOW_SECONDS: f64 = 300.0;
 pub const MAX_SESSION_ROWS: i64 = 1000;
 pub const MAX_OCPP_CALL_TIMEOUT: f64 = 120.0;
 /// Host names nobody can register in public DNS, so no web site can point one of them at this server.
-pub const PRIVATE_NAME_SUFFIXES: [&str; 10] = [
-    ".local",
-    ".lan",
-    ".home",
-    ".home.arpa",
-    ".internal",
-    ".intranet",
-    ".corp",
-    ".localdomain",
-    ".localhost",
-    ".test",
-];
+pub const PRIVATE_NAME_SUFFIXES: [&str; 10] =
+    [".local", ".lan", ".home", ".home.arpa", ".internal", ".intranet", ".corp", ".localdomain", ".localhost", ".test"];
 /// The names the charger calls us by (and the certificate from scripts/make-cert.sh is for). Only a
 /// DNS override on the owner's own network makes them lead here.
 pub const VENDOR_HOSTS: [&str; 2] = ["ocpp.unitedchargers.com", "connect-api.unitedchargers.com"];
@@ -77,7 +67,12 @@ impl Reply {
 
     pub fn json_status(status: u16, data: &Value) -> Reply {
         // Strict JSON by construction: a number that is not finite has no JSON value and is null.
-        Reply { status, content_type: "application/json; charset=utf-8", headers: Vec::new(), body: data.to_string().into_bytes() }
+        Reply {
+            status,
+            content_type: "application/json; charset=utf-8",
+            headers: Vec::new(),
+            body: data.to_string().into_bytes(),
+        }
     }
 
     /// An error in the API's usual shape: `{"message": ..., "statusCode": ...}`.
@@ -290,11 +285,11 @@ fn build_connector(station: &Station, connector: &Connector) -> Value {
 
 /// A station the way the cloud describes one, plus what only this server has.
 pub fn build_station(station: &Station, online: bool, settings: &Settings) -> Value {
-    let live: Vec<&Connector> =
-        (1..=connector_count(station)).filter_map(|cid| station.connectors.get(&cid)).collect();
+    let live: Vec<&Connector> = (1..=connector_count(station)).filter_map(|cid| station.connectors.get(&cid)).collect();
     let connectors: Vec<Value> = live.iter().map(|connector| build_connector(station, connector)).collect();
     let statuses: Vec<&str> = connectors.iter().filter_map(|c| c["status"].as_str()).collect();
-    let status = if statuses.contains(&"Charging") { "Charging" } else { statuses.first().copied().unwrap_or("Unavailable") };
+    let status =
+        if statuses.contains(&"Charging") { "Charging" } else { statuses.first().copied().unwrap_or("Unavailable") };
     let mode = match live.first() {
         Some(first) if live.iter().all(|connector| connector.mode == first.mode) => first.mode.as_str(),
         _ => "Active",
@@ -305,7 +300,10 @@ pub fn build_station(station: &Station, online: bool, settings: &Settings) -> Va
     let today = Utc::now().with_timezone(&station_tz(station, settings)).date_naive();
     let upcoming: Vec<Value> = if holiday_settings.enabled {
         let rows = holiday_settings.upcoming(today, 370);
-        rows.iter().filter(|row| row.included).map(|row| json!({"date": row.date.to_string(), "name": row.name})).collect()
+        rows.iter()
+            .filter(|row| row.included)
+            .map(|row| json!({"date": row.date.to_string(), "name": row.name}))
+            .collect()
     } else {
         Vec::new()
     };
@@ -586,9 +584,9 @@ impl Auth {
             _ => None,
         };
         // The slow hash is worked out without holding the state.
-        let same = saved.as_ref().map(|(salt, mark)| {
-            unhex(salt).is_some_and(|salt| same_secret(Some(&self.credentials_mark(&salt)), mark))
-        });
+        let same = saved
+            .as_ref()
+            .map(|(salt, mark)| unhex(salt).is_some_and(|salt| same_secret(Some(&self.credentials_mark(&salt)), mark)));
         if same == Some(true) {
             return;
         }
@@ -628,7 +626,8 @@ impl Auth {
         let (token, refresh) = (random_token(32), random_token(32));
         let mut inner = self.controller.lock();
         inner.tokens.retain(|_, info| Auth::refresh_expiry(info) >= now);
-        let info = Token { refresh: refresh.clone(), expires: now + TOKEN_TTL, refresh_expires: Some(now + REFRESH_TTL) };
+        let info =
+            Token { refresh: refresh.clone(), expires: now + TOKEN_TTL, refresh_expires: Some(now + REFRESH_TTL) };
         inner.tokens.insert(token.clone(), info);
         while inner.tokens.len() > MAX_TOKENS {
             let oldest = inner.tokens.iter().min_by(|a, b| a.1.expires.total_cmp(&b.1.expires)).map(|(t, _)| t.clone());
@@ -741,10 +740,13 @@ pub enum Route {
     ClearAuthKey(String),
 }
 
-/// Every endpoint: its method, its path (`{}` where a station, serial or zone id goes) and the
-/// route that the ids found there make.
+/// An endpoint: its method, its path (`{}` where a station, serial or zone id goes) and the route
+/// that the ids found there make.
+pub type Endpoint = (&'static str, &'static str, fn(&[String]) -> Route);
+
+/// Every endpoint there is.
 #[rustfmt::skip]
-pub const ROUTES: &[(&str, &str, fn(&[String]) -> Route)] = &[
+pub const ROUTES: &[Endpoint] = &[
     ("GET", "/health", |_| Route::Health),
     ("GET", "/commercial/ext-ocpp-check/{}", |id| Route::UnlockCheck(id[0].clone())),
     ("POST", "/client/auth/login", |_| Route::Login),
@@ -917,7 +919,10 @@ impl App {
                 let body = request.json_body()?;
                 let token = get(&body, "refreshToken");
                 let token = if truthy(token) { to_text(token) } else { String::new() };
-                Ok(self.auth.refresh(&token).map_or_else(|| Reply::error(401, "Invalid refresh token"), |s| Reply::json(&s)))
+                Ok(self
+                    .auth
+                    .refresh(&token)
+                    .map_or_else(|| Reply::error(401, "Invalid refresh token"), |s| Reply::json(&s)))
             }
             Route::Logout => {
                 // Always 200: an expired or unknown token simply has no session left to end.
@@ -1125,16 +1130,16 @@ impl App {
     fn samples(&self, station: &str, request: &Request) -> Handled {
         self.require_station(station)?;
         let since = match request.query_param("since").filter(|since| !since.is_empty()) {
-            Some(since) => iso(parse_iso(&since).ok_or_else(|| {
-                Reply::error(400, "since must be an ISO 8601 time such as 2026-11-08T00:00:00Z")
-            })?),
+            Some(since) => iso(parse_iso(&since)
+                .ok_or_else(|| Reply::error(400, "since must be an ISO 8601 time such as 2026-11-08T00:00:00Z"))?),
             None => Utc::now().format("%Y-%m-%dT00:00:00Z").to_string(),
         };
         let connector = match request.query_param("connector").filter(|connector| !connector.is_empty()) {
             Some(connector) => Some(whole(&Value::from(connector), "connector", 1, MAX_CONNECTORS, None)?),
             None => None,
         };
-        let rows = self.controller.lock().store.samples(station, &since, connector, 2000).map_err(CommandError::from)?;
+        let rows =
+            self.controller.lock().store.samples(station, &since, connector, 2000).map_err(CommandError::from)?;
         Ok(Reply::json(&json!({"samples": rows})))
     }
 
@@ -1309,7 +1314,8 @@ mod tests {
 
     #[test]
     fn query_parameters_and_percent_decoding() {
-        let request = Request { query: "limit=5&since=2026-11-08T00%3A00%3A00Z&a+b=c+d&flag".into(), ..Request::default() };
+        let request =
+            Request { query: "limit=5&since=2026-11-08T00%3A00%3A00Z&a+b=c+d&flag".into(), ..Request::default() };
         assert_eq!(request.query_param("limit").as_deref(), Some("5"));
         assert_eq!(request.query_param("since").as_deref(), Some("2026-11-08T00:00:00Z"));
         assert_eq!(request.query_param("a b").as_deref(), Some("c d"));
@@ -1321,7 +1327,8 @@ mod tests {
 
     #[test]
     fn bearer_tokens_come_from_the_header_only() {
-        let with = |value: &str| Request { headers: vec![("authorization".into(), value.into())], ..Request::default() };
+        let with =
+            |value: &str| Request { headers: vec![("authorization".into(), value.into())], ..Request::default() };
         assert_eq!(with("Bearer abc").bearer(), "abc");
         assert_eq!(with("bearer  abc ").bearer(), "abc");
         assert_eq!(with("Basic abc").bearer(), "");
@@ -1338,7 +1345,16 @@ mod tests {
         assert_eq!(ok(json!(" 5 ")), 5);
         assert_eq!(ok(json!(null)), 7);
         assert_eq!(ok(json!("")), 7);
-        for bad in [json!(11), json!(-1), json!(5.5), json!("five"), json!(true), json!([5]), json!("5.0"), json!("12345678901")] {
+        for bad in [
+            json!(11),
+            json!(-1),
+            json!(5.5),
+            json!("five"),
+            json!(true),
+            json!([5]),
+            json!("5.0"),
+            json!("12345678901"),
+        ] {
             let refusal = whole(&bad, "n", 0, 10, Some(7)).unwrap_err();
             assert_eq!(refusal.status, 400, "{bad}");
             assert!(String::from_utf8_lossy(&refusal.body).contains("n must be a whole number from 0 to 10"));
@@ -1486,7 +1502,11 @@ mod tests {
             ..Request::default()
         };
         let plain = Settings::defaults();
-        assert_eq!(client_ip(&request("172.18.0.2", "203.0.113.7"), &plain), "172.18.0.2", "anyone can send the header");
+        assert_eq!(
+            client_ip(&request("172.18.0.2", "203.0.113.7"), &plain),
+            "172.18.0.2",
+            "anyone can send the header"
+        );
         let proxied = Settings::from_pairs(&[("GRIZZLE_TRUSTED_PROXIES", "172.18.0.0/16, 10.0.0.1")]).unwrap();
         assert_eq!(client_ip(&request("172.18.0.2", "203.0.113.7"), &proxied), "203.0.113.7");
         assert_eq!(client_ip(&request("192.168.1.9", "203.0.113.7"), &proxied), "192.168.1.9", "not from the proxy");

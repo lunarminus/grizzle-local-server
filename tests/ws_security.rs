@@ -6,7 +6,7 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use grizzle_local::api::{Route, PUBLIC_PATHS};
+use grizzle_local::api::{PUBLIC_PATHS, ROUTES};
 use grizzle_local::config::Settings;
 use grizzle_local::ocpp::Connection;
 
@@ -15,36 +15,6 @@ use support::{capture_logs, logged, settings, wait_for, Connect, FakeCharger, Fa
 const SERIAL: &str = "GRD-L0000TEST1";
 const OTHER: &str = "GRD-L0000TEST2";
 const AUTH_KEY: &str = "s3cr3t-auth-key";
-
-/// Every /client and /local route except the public ones, with `{}` where a station or zone id
-/// goes. The server has no table of its routes to read them from; this is api.rs's `Route::find`.
-const PROTECTED_ROUTES: [(&str, &str); 25] = [
-    ("GET", "/client/auth/profile"),
-    ("GET", "/client/stations"),
-    ("GET", "/client/stations/{}"),
-    ("POST", "/client/stations/{}/mode"),
-    ("PUT", "/client/stations/{}/currentLimit"),
-    ("POST", "/client/stations/{}/scheduleUpdate"),
-    ("POST", "/client/stations/{}/pricesByZoneUpdate"),
-    ("POST", "/client/stations/{}/scheduleEnable"),
-    ("DELETE", "/client/stations/{}/scheduleDelete/{}"),
-    ("DELETE", "/client/stations/{}/pricesByZoneDelete/{}"),
-    ("PUT", "/client/stations/{}/rate"),
-    ("POST", "/client/stations/{}/reboot"),
-    ("GET", "/client/stations/{}/events"),
-    ("GET", "/local/stations/{}/samples"),
-    ("GET", "/local/stations/{}/sessions"),
-    ("POST", "/local/stations/{}/sessions/recalculate"),
-    ("GET", "/local/holidays/countries"),
-    ("GET", "/local/stations/{}/holidays"),
-    ("PUT", "/local/stations/{}/holidays"),
-    ("POST", "/local/stations/{}/holidays/preview"),
-    ("GET", "/local/stations/{}/log"),
-    ("POST", "/local/stations/{}/ocpp"),
-    ("PUT", "/local/stations/{}/settings"),
-    ("DELETE", "/local/stations/{}"),
-    ("DELETE", "/local/stations/{}/auth-key"),
-];
 
 /// A real charger as SERIAL, booted. An empty key is a charger that has none.
 async fn start_charger(server: &TestServer, auth_key: &str) -> FakeCharger {
@@ -128,13 +98,18 @@ async fn upgrade_header_does_not_bypass_rest_auth() {
     let variants: [&[(&str, &str)]; 2] =
         [&[("Upgrade", "websocket"), json], &[("Upgrade", "WebSocket"), ("Connection", "Upgrade"), json]];
     for headers in variants {
-        for (method, pattern) in PROTECTED_ROUTES {
+        let mut protected = 0;
+        // Every /client and /local route the server has, except the ones meant to be public.
+        let api = |pattern: &str| pattern.starts_with("/client/") || pattern.starts_with("/local/");
+        for (method, pattern, _) in
+            ROUTES.iter().filter(|(_, pattern, _)| api(pattern) && !PUBLIC_PATHS.contains(pattern))
+        {
             let path = pattern.replace("{}", SERIAL);
-            assert!(Route::find(method, &path).is_some(), "{method} {path} is not a route");
-            assert!(!PUBLIC_PATHS.contains(&path.as_str()));
             let response = server.request(method, &path, headers, Some(body)).await;
             assert_eq!(response.status, 401, "{method} {path} with {headers:?}");
+            protected += 1;
         }
+        assert_eq!(protected, 25, "a new route? then this test covers it too, and the count goes up");
     }
     assert!(server.controller().is_online(SERIAL));
     charger.close().await;
@@ -367,6 +342,7 @@ async fn concurrent_first_connections_cannot_both_get_in() {
         assert_eq!(pinned_key(server, serial).as_deref(), Some(winners[0]));
         assert!(server.controller().is_online(serial));
     }
+    assert_eq!(server.controller().admissions_in_progress(), 0, "nothing is kept per serial once a handshake is over");
 
     // The one wait the check does have is the liveness probe, so with a dead socket holding the
     // serial two handshakes overlap for certain. Checked one after the other, the second finds

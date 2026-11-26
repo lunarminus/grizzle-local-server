@@ -15,7 +15,9 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Datelike, Duration, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Timelike, Utc};
+use chrono::{
+    DateTime, Datelike, Duration, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Timelike, Utc,
+};
 use serde_json::Value;
 
 use crate::value::{char_len, get, parse_float, truthy, whole_number, Object};
@@ -78,9 +80,7 @@ fn whole(key: &str, value: &Value, lo: i64, hi: i64) -> Result<i64, String> {
         }
         _ => None,
     };
-    number
-        .filter(|n| (lo..=hi).contains(n))
-        .ok_or_else(|| format!("{key} must be a whole number from {lo} to {hi}"))
+    number.filter(|n| (lo..=hi).contains(n)).ok_or_else(|| format!("{key} must be a whole number from {lo} to {hi}"))
 }
 
 /// A finite number (numeric text is accepted), or `None` for null and "".
@@ -255,9 +255,7 @@ pub fn applies_to(zone: &Zone, connector_id: i64) -> bool {
 fn wall_offset(tz: Tz, wall: NaiveDateTime, later: bool) -> i32 {
     match tz.offset_from_local_datetime(&wall) {
         LocalResult::Single(offset) => offset.fix().local_minus_utc(),
-        LocalResult::Ambiguous(first, second) => {
-            if later { second } else { first }.fix().local_minus_utc()
-        }
+        LocalResult::Ambiguous(first, second) => if later { second } else { first }.fix().local_minus_utc(),
         LocalResult::None => {
             // Far enough to either side to be clear of the change, whatever the zone's offset.
             let reference = if later { wall + Duration::hours(26) } else { wall - Duration::hours(26) };
@@ -375,7 +373,8 @@ pub fn next_change(
         horizon_days = 370;
     }
     let tz = now.timezone();
-    let allowed = |moment: DateTime<Tz>| charging_allowed(enabled.iter().copied(), moment, connector_id, is_holiday).is_some();
+    let allowed =
+        |moment: DateTime<Tz>| charging_allowed(enabled.iter().copied(), moment, connector_id, is_holiday).is_some();
     let current = allowed(now);
     let midnight = now.date_naive().and_time(NaiveTime::MIN);
     let zone_ranges: Vec<Vec<(i64, i64)>> = enabled.iter().map(|zone| ranges(zone)).collect();
@@ -581,16 +580,40 @@ mod tests {
         assert_eq!(next_change(&zones, first_0145, 1, None), Some(at(tz, 2026, 11, 1, 5, 0)));
     }
 
+    /// Some zones change their clocks at midnight, so the day starts at 01:00: "since midnight"
+    /// is then "since the clocks changed", not a time that cannot be worked out.
+    #[test]
+    fn a_wall_clock_reading_is_an_instant_even_when_the_clocks_skipped_or_repeated_it() {
+        let wall = |y: i32, mo: u32, d: u32, h: u32, mi: u32| {
+            NaiveDate::from_ymd_opt(y, mo, d).unwrap().and_hms_opt(h, mi, 0).unwrap()
+        };
+        let instant = |y: i32, mo: u32, d: u32, h: u32, mi: u32| Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap();
+        let santiago: Tz = "America/Santiago".parse().unwrap();
+        assert_eq!(wall_instant(santiago, wall(2026, 9, 6, 0, 0), false), instant(2026, 9, 6, 4, 0));
+        assert_eq!(wall_instant(santiago, wall(2026, 9, 5, 0, 0), false), instant(2026, 9, 5, 4, 0));
+        assert_eq!(wall_instant(santiago, wall(2026, 9, 7, 0, 0), false), instant(2026, 9, 7, 3, 0));
+        let cairo: Tz = "Africa/Cairo".parse().unwrap();
+        assert_eq!(wall_instant(cairo, wall(2026, 4, 24, 0, 0), false), instant(2026, 4, 23, 22, 0));
+        let denver: Tz = "America/Denver".parse().unwrap();
+        assert_eq!(wall_instant(denver, wall(2026, 3, 8, 2, 30), false), instant(2026, 3, 8, 9, 30));
+        assert_eq!(wall_instant(denver, wall(2026, 11, 1, 1, 30), false), instant(2026, 11, 1, 7, 30));
+        assert_eq!(wall_instant(denver, wall(2026, 11, 1, 1, 30), true), instant(2026, 11, 1, 8, 30));
+    }
+
     /// Step through four days minute by minute and compare every answer with a plain scan.
     fn check_against_scan(tz: Tz, start: DateTime<Tz>, zones: &[Zone]) {
         let minutes = 4 * 24 * 60;
         let state: Vec<bool> = (0..=minutes + 9 * 24 * 60)
-            .map(|m| charging_allowed(zones, (start.with_timezone(&Utc) + Duration::minutes(m)).with_timezone(&tz), 1, None).is_some())
+            .map(|m| {
+                charging_allowed(zones, (start.with_timezone(&Utc) + Duration::minutes(m)).with_timezone(&tz), 1, None)
+                    .is_some()
+            })
             .collect();
         for m in (0..minutes).step_by(7) {
             let now = (start.with_timezone(&Utc) + Duration::minutes(m)).with_timezone(&tz);
             let expected = (m as usize + 1..state.len()).find(|i| state[*i] != state[m as usize]);
-            let got = next_change(zones, now, 1, None).map(|t| (t.with_timezone(&Utc) - start.with_timezone(&Utc)).num_minutes());
+            let got = next_change(zones, now, 1, None)
+                .map(|t| (t.with_timezone(&Utc) - start.with_timezone(&Utc)).num_minutes());
             assert_eq!(got, expected.map(|i| i as i64), "at {now}");
         }
     }
@@ -599,7 +622,9 @@ mod tests {
     fn next_change_agrees_with_a_minute_by_minute_scan() {
         let tz: Tz = "America/Denver".parse().unwrap();
         let zones = vec![
-            zone(json!({"scheduleEnabled": true, "startHours": 1, "startMinutes": 30, "endHours": 2, "endMinutes": 30})),
+            zone(
+                json!({"scheduleEnabled": true, "startHours": 1, "startMinutes": 30, "endHours": 2, "endMinutes": 30}),
+            ),
             zone(json!({"scheduleEnabled": true, "startHours": 22, "endHours": 1, "endMinutes": 15, "days": [0, 6]})),
         ];
         check_against_scan(tz, at(tz, 2026, 3, 6, 12, 0), &zones); // spring forward
@@ -678,7 +703,8 @@ mod tests {
     fn zone_ids() {
         assert_eq!(zone_id(&json!("abc-1.2:3_4")).unwrap(), "abc-1.2:3_4");
         assert_eq!(zone_id(&json!(42)).unwrap(), "42");
-        for bad in [json!(""), json!("a b"), json!("a/b"), json!(true), json!(null), json!(1.5), json!("x".repeat(65))] {
+        for bad in [json!(""), json!("a b"), json!("a/b"), json!(true), json!(null), json!(1.5), json!("x".repeat(65))]
+        {
             assert!(zone_id(&bad).is_err(), "{bad}");
         }
     }

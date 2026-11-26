@@ -269,8 +269,9 @@ async fn rejected_certificate_is_logged() {
     capture_logs();
     let server = tls_server(&[]).await;
     // A client that verifies, like a careful device would.
-    let refused =
-        tls_from("127.0.0.5", server.tls_address.unwrap(), true).await.err().expect("a self-signed certificate");
+    let Err(refused) = tls_from("127.0.0.5", server.tls_address.unwrap(), true).await else {
+        panic!("a self-signed certificate was accepted by a client that verifies");
+    };
     assert!(refused.contains("certificate verify failed"), "{refused}");
     let said = || logged("REJECTED OUR CERTIFICATE").iter().any(|line| line.contains("TLS: 127.0.0.5:"));
     wait_for("the rejection to be logged", said).await;
@@ -394,7 +395,9 @@ async fn main_installs_the_formatter_that_keeps_log_lines_single() {
 
 #[tokio::test]
 async fn startup_says_what_an_operator_should_know() {
-    let cases: [(&[(&str, &str)], &[(&str, &str)]); 2] = [
+    type Pairs<'a> = &'a [(&'a str, &'a str)];
+    // (the environment, the (level, text) of lines the log must then have)
+    let cases: [(Pairs, Pairs); 2] = [
         (
             &[("GRIZZLE_API_PASSWORD", "change-me")],
             &[

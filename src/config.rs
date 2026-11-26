@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-
 use crate::net::{split_url, IpNet};
 use crate::value::clip;
 use crate::zone::Tz;
@@ -227,9 +226,7 @@ impl Settings {
             .iter()
             .map(|proxy| IpNet::parse(proxy))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| {
-                format!("GRIZZLE_TRUSTED_PROXIES: {err} (use addresses or networks such as 10.0.0.0/8)")
-            })?;
+            .map_err(|err| format!("GRIZZLE_TRUSTED_PROXIES: {err} (use addresses or networks such as 10.0.0.0/8)"))?;
         let allowed_chargers = words(&text("GRIZZLE_ALLOWED_CHARGERS", ""));
         for serial in &allowed_chargers {
             // An entry that can never be a charger's id would lock every charger out without saying

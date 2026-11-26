@@ -51,8 +51,7 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const CERT_ALERTS: [&str; 4] = ["CERTIFICATE", "UNKNOWN_CA", "CERTIFICATE_UNKNOWN", "BAD_CERTIFICATE"];
 /// What OpenSSL offers when Python's `ssl` module sets a server up, which is what the charger has
 /// been seen to connect to: forward secrecy only, AES-GCM and ChaCha20 first, no SHA-1 MACs.
-const TLS_CIPHERS: &str =
-    "@SECLEVEL=2:ECDH+AESGCM:ECDH+CHACHA20:ECDH+AES:DHE+AES:!aNULL:!eNULL:!aDSS:!SHA1:!AESCCM";
+const TLS_CIPHERS: &str = "@SECLEVEL=2:ECDH+AESGCM:ECDH+CHACHA20:ECDH+AES:DHE+AES:!aNULL:!eNULL:!aDSS:!SHA1:!AESCCM";
 
 /// Headers for the web page.
 pub fn page_headers(settings: &Settings) -> Vec<(&'static str, String)> {
@@ -213,7 +212,9 @@ async fn websocket_or_page(app: &Arc<App>, http: &mut HttpRequest<Incoming>, req
     tokio::spawn(async move {
         match upgrade.await {
             Ok(upgraded) => {
-                let socket = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, Some(websocket_config())).await;
+                let socket =
+                    WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, Some(websocket_config()))
+                        .await;
                 let handler = |action: &str, payload| controller.handle(&conn.id, action, &payload);
                 conn.run(socket, &handler).await;
             }
@@ -485,7 +486,9 @@ impl Server {
                 listening
             ),
         )];
-        messages.extend(settings.security_warnings().into_iter().map(|warning| (Level::Warn, format!("SECURITY: {warning}"))));
+        messages.extend(
+            settings.security_warnings().into_iter().map(|warning| (Level::Warn, format!("SECURITY: {warning}"))),
+        );
         messages.push((
             Level::Info,
             if settings.allowed_chargers.is_empty() {
@@ -511,7 +514,9 @@ impl Server {
         // One task per listener hands over what it accepts, with the TLS context if it is a TLS port.
         let (accepted, mut arrivals) = tokio::sync::mpsc::channel::<(TcpStream, SocketAddr, Option<SslContext>)>(16);
         let mut listeners: JoinSet<()> = JoinSet::new();
-        let tls = tls.into_iter().flat_map(|(listeners, context)| listeners.into_iter().map(move |l| (l, Some(context.clone()))));
+        let tls = tls
+            .into_iter()
+            .flat_map(|(listeners, context)| listeners.into_iter().map(move |l| (l, Some(context.clone()))));
         for (listener, context) in plain.into_iter().map(|listener| (listener, None)).chain(tls) {
             let accepted = accepted.clone();
             listeners.spawn(async move {
@@ -560,7 +565,8 @@ async fn accept_failed(err: &std::io::Error) {
 /// Completes when the process is asked to stop (SIGTERM from `docker stop`, or Ctrl-C).
 async fn stop_signal() {
     use tokio::signal::unix::{signal, SignalKind};
-    let (Ok(mut terminate), Ok(mut interrupt)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+    let (Ok(mut terminate), Ok(mut interrupt)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt()))
+    else {
         log::error!("cannot listen for SIGTERM and SIGINT; only killing the process will stop it");
         return std::future::pending().await;
     };

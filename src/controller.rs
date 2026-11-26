@@ -31,7 +31,9 @@ use crate::crypto::{random_hex, same_secret};
 use crate::holidays;
 use crate::logging::{printable, printable_value};
 use crate::ocpp::{Connection, HandlerError, HandlerResult, OcppError};
-use crate::schedules::{charging_allowed, next_change, normalize_zone, price_now, zone_id, HolidayCheck, Zone, MAX_NAME_LENGTH};
+use crate::schedules::{
+    charging_allowed, next_change, normalize_zone, price_now, zone_id, HolidayCheck, Zone, MAX_NAME_LENGTH,
+};
 use crate::state::{
     boot_fields, clean_config, connector_count, data_transfer, Meter, Mode, Station, Transaction, MAX_CONNECTORS,
     MAX_CURRENT, MAX_TRANSACTION_ID, MAX_ZONES, MODES,
@@ -133,11 +135,13 @@ pub struct Inner {
     tasks: Vec<AbortHandle>,
 }
 
+/// The lock that serialises a charge point id's admissions, and how many hold or await it.
+type AdmissionLock = (Arc<tokio::sync::Mutex<()>>, usize);
+
 pub struct Controller {
     pub settings: Arc<Settings>,
     inner: Mutex<Inner>,
-    /// charge point id -> (the lock that serialises its admissions, how many hold or await it)
-    admissions: Mutex<HashMap<String, (Arc<tokio::sync::Mutex<()>>, usize)>>,
+    admissions: Mutex<HashMap<String, AdmissionLock>>,
     stopping: AtomicBool,
 }
 
@@ -212,6 +216,7 @@ fn internal(err: impl ToString) -> HandlerError {
 }
 
 /// Close the connector's session, if it has one: work out energy, length and cost, and record them.
+#[allow(clippy::too_many_arguments)] // where it is (the first four) and how it ended (the rest)
 fn finish_transaction(
     station: &mut Station,
     cid: i64,
@@ -502,7 +507,8 @@ impl Inner {
             .tokens
             .iter()
             .map(|(token, info)| {
-                let info = json!({"refresh": info.refresh, "expires": info.expires, "refreshExpires": info.refresh_expires});
+                let info =
+                    json!({"refresh": info.refresh, "expires": info.expires, "refreshExpires": info.refresh_expires});
                 (token.clone(), info)
             })
             .collect();
@@ -531,7 +537,13 @@ impl Inner {
 
     // --- inbound OCPP --------------------------------------------------------
 
-    fn handle(&mut self, settings: &Settings, station_id: &str, action: &str, payload: &Object) -> (HandlerResult, Vec<Effect>) {
+    fn handle(
+        &mut self,
+        settings: &Settings,
+        station_id: &str,
+        action: &str,
+        payload: &Object,
+    ) -> (HandlerResult, Vec<Effect>) {
         self.ensure_station(settings, station_id).last_seen = Some(now_iso());
         let mut effects = Vec::new();
         let result = match action {
@@ -617,7 +629,8 @@ impl Inner {
             Value::String(status) if !status.is_empty() => clip(status, 32).to_string(),
             _ => return Err(HandlerError::rejected("TypeConstraintViolation", "status must be a string")),
         };
-        let error_code = text(get(payload, "errorCode"), 50).filter(|c| !c.is_empty()).unwrap_or_else(|| "NoError".into());
+        let error_code =
+            text(get(payload, "errorCode"), 50).filter(|c| !c.is_empty()).unwrap_or_else(|| "NoError".into());
         let station = &mut self.stations[station_id];
         if cid == 0 {
             station.status = Some(status);
@@ -677,7 +690,8 @@ impl Inner {
             // A different session on a connector that still has one open: the old one is over,
             // whether or not we were told. Close it, or it stays "not closed" in the history forever.
             let reason = Some("Superseded".to_string());
-            finish_transaction(station, cid, &mut self.store, settings, None, reason, &started, None).map_err(internal)?;
+            finish_transaction(station, cid, &mut self.store, settings, None, reason, &started, None)
+                .map_err(internal)?;
         }
         let tid = self.allocate_transaction_id();
         let station = &mut self.stations[station_id];
@@ -751,7 +765,8 @@ impl Inner {
         let station = &mut self.stations[station_id];
         station.ensure_connector(cid).map_err(internal)?;
         let tid = small_int(get(payload, "transactionId"), 1, MAX_TRANSACTION_ID);
-        take_meter_values(station, cid, &mut self.store, settings, get(payload, "meterValue"), tid).map_err(internal)?;
+        take_meter_values(station, cid, &mut self.store, settings, get(payload, "meterValue"), tid)
+            .map_err(internal)?;
         Ok(json!({}))
     }
 
@@ -849,7 +864,9 @@ impl Controller {
                 Some(station) => {
                     stations.insert(station_id.clone(), Station::from_saved(station_id, station, &settings));
                 }
-                None => log::warn!("dropping unreadable station entry {} from the saved state", printable(station_id, 80)),
+                None => {
+                    log::warn!("dropping unreadable station entry {} from the saved state", printable(station_id, 80))
+                }
             }
         }
         let mut tokens = BTreeMap::new();
@@ -1027,7 +1044,10 @@ impl Controller {
         let Some(conn) = self.lock().connections.get(cp_id).cloned().filter(|conn| !conn.is_closed()) else {
             return false;
         };
-        match conn.call("TriggerMessage", json!({"requestedMessage": "Heartbeat"}), Some(self.settings.liveness_timeout)).await {
+        match conn
+            .call("TriggerMessage", json!({"requestedMessage": "Heartbeat"}), Some(self.settings.liveness_timeout))
+            .await
+        {
             Ok(_) => true,
             // A CallError reply still proves someone is answering; a timeout or a drop doesn't.
             Err(err) => !matches!(err.code.as_str(), "Timeout" | "Disconnected") && !conn.is_closed(),
@@ -1171,7 +1191,8 @@ impl Controller {
             }
             Err(err) => log::warn!("{station_id}: GetConfiguration failed: {err}"),
         }
-        let connectors = |controller: &Controller| controller.lock().stations.get(station_id).map_or(0, connector_count);
+        let connectors =
+            |controller: &Controller| controller.lock().stations.get(station_id).map_or(0, connector_count);
         for cid in 1..=connectors(self) {
             let payload = json!({"requestedMessage": "StatusNotification", "connectorId": cid});
             if let Err(err) = self.call(station_id, "TriggerMessage", payload, None).await {
@@ -1286,10 +1307,9 @@ impl Controller {
             }
         };
         match self.call(station_id, action, payload, None).await {
-            Ok(result) => log::info!(
-                "{station_id} connector {cid}: {action} -> {}",
-                printable_value(get(&result, "status"), 32)
-            ),
+            Ok(result) => {
+                log::info!("{station_id} connector {cid}: {action} -> {}", printable_value(get(&result, "status"), 32))
+            }
             Err(err) => log::warn!("{station_id} connector {cid}: {action} failed: {err}"),
         }
     }
@@ -1586,7 +1606,8 @@ impl Controller {
         let mut inner = self.lock();
         inner.stations.shift_remove(station_id);
         inner.dirty = true;
-        for task in [inner.boot_tasks.remove(station_id), inner.station_ticks.remove(station_id)].into_iter().flatten() {
+        for task in [inner.boot_tasks.remove(station_id), inner.station_ticks.remove(station_id)].into_iter().flatten()
+        {
             task.abort();
         }
         inner.store.delete_history(station_id)?;

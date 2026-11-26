@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::future::join_all;
-use grizzle_local::api::{origin_allowed, App, LOGIN_MAX_FAILURES, LOGIN_WINDOW_SECONDS, MAX_TOKENS, REFRESH_TTL, TOKEN_TTL};
+use grizzle_local::api::{
+    origin_allowed, App, LOGIN_MAX_FAILURES, LOGIN_WINDOW_SECONDS, MAX_TOKENS, REFRESH_TTL, TOKEN_TTL,
+};
 use grizzle_local::config::{frame_ancestors, Settings};
 use grizzle_local::controller::{station_tz, Token};
 use grizzle_local::schedules::{normalize_zone, zone_id};
@@ -156,7 +158,11 @@ async fn malformed_login_bodies_are_client_errors() {
     let bodies: [&[u8]; 6] = [deep.as_bytes(), b"{\"emailOrPhone\": ", b"\xff\xfe", b"[]", b"\"text\"", b"12"];
     for body in bodies {
         let status = raw(&server, "POST", LOGIN, "", body).await.status;
-        assert!([400, 401].contains(&status), "{status} for {:?}", String::from_utf8_lossy(&body[..body.len().min(20)]));
+        assert!(
+            [400, 401].contains(&status),
+            "{status} for {:?}",
+            String::from_utf8_lossy(&body[..body.len().min(20)])
+        );
     }
 }
 
@@ -388,10 +394,14 @@ async fn bad_query_parameters_are_400_not_500() {
     const SERIAL: &str = "GRD-API-BADQUERY";
     let (server, token) = station(SERIAL).await;
     for path in [
-        client(SERIAL, "events?limit=abc"), client(SERIAL, "events?limit=--5"),
-        client(SERIAL, "events?limit=99999999999999999999"), local(SERIAL, "sessions?limit=1e3"),
-        local(SERIAL, "samples?connector=abc"), local(SERIAL, "samples?connector=999999"),
-        local(SERIAL, "samples?since=yesterday"), local(SERIAL, "samples?since=9999-12-31T23:59:59-23:59"),
+        client(SERIAL, "events?limit=abc"),
+        client(SERIAL, "events?limit=--5"),
+        client(SERIAL, "events?limit=99999999999999999999"),
+        local(SERIAL, "sessions?limit=1e3"),
+        local(SERIAL, "samples?connector=abc"),
+        local(SERIAL, "samples?connector=999999"),
+        local(SERIAL, "samples?since=yesterday"),
+        local(SERIAL, "samples?since=9999-12-31T23:59:59-23:59"),
     ] {
         let response = server.get(&path, Some(&token)).await;
         assert_eq!(response.status, 400, "{path}: {}", response.body);
@@ -411,7 +421,8 @@ async fn good_query_parameters_still_work() {
         }
     }
     // A whole number outside 1..1000 is brought into range, as it always was; it is not an error.
-    let rows = [("", 50), ("?limit=5", 5), ("?limit=1000", 1000), ("?limit=5000", 1000), ("?limit=0", 1), ("?limit=-7", 1)];
+    let rows =
+        [("", 50), ("?limit=5", 5), ("?limit=1000", 1000), ("?limit=5000", 1000), ("?limit=0", 1), ("?limit=-7", 1)];
     for (query, rows) in rows {
         let data = server.json(&token, &client(SERIAL, &format!("events{query}"))).await;
         assert_eq!(data["sessions"].as_array().unwrap().len(), rows, "{query}");
@@ -419,7 +430,10 @@ async fn good_query_parameters_still_work() {
     let data = server.json(&token, &local(SERIAL, "sessions?limit=5000")).await;
     assert_eq!(data["sessions"].as_array().unwrap().len(), 1000);
     for tail in [
-        "sessions?limit=5", "samples", "samples?connector=1", "samples?since=2026-11-08T00:00:00Z",
+        "sessions?limit=5",
+        "samples",
+        "samples?connector=1",
+        "samples?since=2026-11-08T00:00:00Z",
         "samples?since=2026-11-08T02:00:00%2B02:00&connector=2",
     ] {
         assert_eq!(server.get(&local(SERIAL, tail), Some(&token)).await.status, 200, "{tail}");
@@ -435,28 +449,59 @@ async fn bad_bodies_are_400_and_change_nothing() {
     let too_many_dates = json!({"extraDates": vec![json!({"date": "2026-12-24"}); 501]}).to_string();
     // The bodies are text because a client can send NaN and Infinity, which are not JSON.
     let cases: [(&str, String, &[&str]); 6] = [
-        ("PUT", client(SERIAL, "currentLimit"), &[
-            r#"{"value": "lots"}"#, r#"{"value": Infinity}"#, r#"{"value": null}"#, r#"{"value": [16]}"#, "{}",
-        ]),
-        ("PUT", client(SERIAL, "rate"), &[
-            r#"{"priceKW": NaN}"#, r#"{"priceKW": Infinity}"#, r#"{"priceKW": "NaN"}"#, r#"{"priceKW": -0.1}"#,
-            r#"{"priceKW": true}"#, r#"{"priceKW": {"a": 1}}"#,
-        ]),
-        ("POST", client(SERIAL, "mode"), &[
-            r#"{"mode": "Active", "connectorId": 99}"#,
-            r#"{"mode": "Active", "connectorId": 2}"#, // the station has one
-            r#"{"mode": "Active", "connectorId": "one"}"#, r#"{"mode": ["Active"], "connectorId": 1}"#,
-        ]),
-        ("POST", local(SERIAL, "ocpp"), &[
-            r#"{"action": "Reset", "timeout": "soon"}"#, r#"{"action": "Reset", "timeout": NaN}"#,
-            r#"{"action": "Reset", "timeout": 1000000000.0}"#, r#"{"action": "Reset", "timeout": -1}"#,
-            r#"{"action": "Reset", "payload": [1]}"#, r#"{"action": "Reset", "payload": {"x": NaN}}"#,
-            &long_action, r#"{"action": 5}"#,
-        ]),
-        ("PUT", local(SERIAL, "holidays"), &[
-            r#"{"enabled": true, "country": 12}"#, r#"{"priceKW": NaN}"#, r#"{"priceKW": [1]}"#,
-            r#"{"excludedNames": "Christmas Day"}"#, r#"{"excludedNames": [5]}"#, &too_many_dates,
-        ]),
+        (
+            "PUT",
+            client(SERIAL, "currentLimit"),
+            &[r#"{"value": "lots"}"#, r#"{"value": Infinity}"#, r#"{"value": null}"#, r#"{"value": [16]}"#, "{}"],
+        ),
+        (
+            "PUT",
+            client(SERIAL, "rate"),
+            &[
+                r#"{"priceKW": NaN}"#,
+                r#"{"priceKW": Infinity}"#,
+                r#"{"priceKW": "NaN"}"#,
+                r#"{"priceKW": -0.1}"#,
+                r#"{"priceKW": true}"#,
+                r#"{"priceKW": {"a": 1}}"#,
+            ],
+        ),
+        (
+            "POST",
+            client(SERIAL, "mode"),
+            &[
+                r#"{"mode": "Active", "connectorId": 99}"#,
+                r#"{"mode": "Active", "connectorId": 2}"#, // the station has one
+                r#"{"mode": "Active", "connectorId": "one"}"#,
+                r#"{"mode": ["Active"], "connectorId": 1}"#,
+            ],
+        ),
+        (
+            "POST",
+            local(SERIAL, "ocpp"),
+            &[
+                r#"{"action": "Reset", "timeout": "soon"}"#,
+                r#"{"action": "Reset", "timeout": NaN}"#,
+                r#"{"action": "Reset", "timeout": 1000000000.0}"#,
+                r#"{"action": "Reset", "timeout": -1}"#,
+                r#"{"action": "Reset", "payload": [1]}"#,
+                r#"{"action": "Reset", "payload": {"x": NaN}}"#,
+                &long_action,
+                r#"{"action": 5}"#,
+            ],
+        ),
+        (
+            "PUT",
+            local(SERIAL, "holidays"),
+            &[
+                r#"{"enabled": true, "country": 12}"#,
+                r#"{"priceKW": NaN}"#,
+                r#"{"priceKW": [1]}"#,
+                r#"{"excludedNames": "Christmas Day"}"#,
+                r#"{"excludedNames": [5]}"#,
+                &too_many_dates,
+            ],
+        ),
         ("POST", local(SERIAL, "holidays/preview"), &[r#"{"extraDates": {"date": "2026-12-24"}}"#]),
     ];
     for (method, path, bodies) in cases {
@@ -612,7 +657,10 @@ async fn zones_are_stored_normalised() {
     let zones = saved(&server, SERIAL)["pricesByZone"].clone();
     assert_eq!(zones.as_array().unwrap().len(), 1);
     let changed = &zones[0];
-    assert_eq!((&changed["endHours"], &changed["scheduleEnabled"], &changed["name"]), (&json!(20), &json!(true), &json!("Peak")));
+    assert_eq!(
+        (&changed["endHours"], &changed["scheduleEnabled"], &changed["name"]),
+        (&json!(20), &json!(true), &json!("Peak"))
+    );
     let update = json!({"price": {"_id": zone["_id"], "name": "Renamed", "endHours": 99}});
     assert_eq!(server.post(&path, Some(&token), &update).await.status, 400);
     assert_eq!(saved(&server, SERIAL)["pricesByZone"], zones);
@@ -657,7 +705,8 @@ async fn state_and_history_files_are_private() {
     let data = write_state(dir.path(), "{}");
     fs::write(data.join("state.tmp"), "leftover from a crash").unwrap();
     for name in ["state.json", "state.tmp"] {
-        fs::set_permissions(data.join(name), fs::Permissions::from_mode(0o644)).unwrap(); // as an older version left it
+        fs::set_permissions(data.join(name), fs::Permissions::from_mode(0o644)).unwrap();
+        // as an older version left it
     }
     let server = start_in(&dir, &[]).await;
     let charger = RawCharger::connect(&server, SERIAL, Some((SERIAL, "the-charger's-cloud-key"))).await.unwrap();

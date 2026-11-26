@@ -15,7 +15,9 @@ use crate::config::Settings;
 use crate::holidays;
 use crate::logging::{printable, printable_value};
 use crate::schedules::{normalize_zone, zone_id, Zone, MAX_NAME_LENGTH};
-use crate::value::{clip, get, number, objects, opt_int, opt_number, opt_text, reading, small_int, text, to_float, truthy, Object};
+use crate::value::{
+    clip, get, number, objects, opt_int, opt_number, opt_text, reading, small_int, text, to_float, truthy, Object,
+};
 
 /// A Duo has 2 connectors; nothing in the family has more than a few.
 pub const MAX_CONNECTORS: i64 = 8;
@@ -428,7 +430,8 @@ fn mended_zone(zone: &Value) -> Value {
         mended.insert("name".to_string(), Value::from(clip(name.trim(), MAX_NAME_LENGTH)));
     }
     if let Some(limit) = zone.get("currentLimit") {
-        let limit = reading(limit, false).filter(|limit| *limit > 0.0).map(|limit| limit.clamp(1.0, MAX_CURRENT as f64));
+        let limit =
+            reading(limit, false).filter(|limit| *limit > 0.0).map(|limit| limit.clamp(1.0, MAX_CURRENT as f64));
         mended.insert("currentLimit".to_string(), opt_number(limit));
     }
     if let Some(days) = get(zone, "days").as_array() {
@@ -713,7 +716,10 @@ mod tests {
         assert_eq!((station.timezone.as_str(), station.currency.as_str()), ("UTC", "USD"));
         assert_eq!(station.price_kw, 0.0);
         assert_eq!((station.max_current, station.min_current), (40, 6));
-        assert_eq!((station.current_limit, station.applied_limit, station.dip_switch_current_limit), (None, Some(24), None));
+        assert_eq!(
+            (station.current_limit, station.applied_limit, station.dip_switch_current_limit),
+            (None, Some(24), None)
+        );
         assert!(station.limit_in_force, "a limit applied by a version that never lifted it is still in force");
         assert_eq!(station.connector_count, 2);
         assert_eq!(station.connectors.keys().copied().collect::<Vec<_>>(), [1, 2]);
@@ -736,7 +742,10 @@ mod tests {
         assert_eq!(mended["name"].as_str().unwrap().len(), MAX_NAME_LENGTH);
         assert_eq!((&mended["currentLimit"], &mended["days"]), (&json!(100), &json!([1])));
         assert!(station.holidays.is_none());
-        assert_eq!(station.data_transfers, [json!({"at": "t", "vendorId": "v", "messageId": null, "data": "{\"a\":1}"})]);
+        assert_eq!(
+            station.data_transfers,
+            [json!({"at": "t", "vendorId": "v", "messageId": null, "data": "{\"a\":1}"})]
+        );
     }
 
     #[test]
@@ -747,7 +756,9 @@ mod tests {
         assert_eq!(connector_count(&station), MAX_CONNECTORS);
         station.connector_count = -3;
         assert_eq!(connector_count(&station), 1);
-        for (stored, expected) in [(json!(0), 1), (json!(9), 1), (json!(true), 1), (json!("2"), 1), (json!(2.0), 1), (json!(3), 3)] {
+        for (stored, expected) in
+            [(json!(0), 1), (json!(9), 1), (json!(true), 1), (json!("2"), 1), (json!(2.0), 1), (json!(3), 3)]
+        {
             assert_eq!(load(json!({"connectorCount": stored})).connector_count, expected);
         }
     }
@@ -778,7 +789,8 @@ mod tests {
         assert_eq!(boot.keys().collect::<Vec<_>>(), ["chargePointVendor", "chargePointModel", "timestamp"]);
         assert!(boot_fields(&Object::new(), None).is_empty());
 
-        let mut items: Vec<Value> = (0..1000).map(|i| json!({"key": format!("k{i}"), "value": "v".repeat(2000)})).collect();
+        let mut items: Vec<Value> =
+            (0..1000).map(|i| json!({"key": format!("k{i}"), "value": "v".repeat(2000)})).collect();
         items.insert(0, json!({"key": 5, "value": "x"}));
         items.insert(1, json!({"key": "", "value": "x"}));
         items.insert(2, json!({"key": "k".repeat(101), "value": "x"}));

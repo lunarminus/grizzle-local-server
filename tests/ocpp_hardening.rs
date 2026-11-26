@@ -10,6 +10,7 @@ mod support;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use grizzle_local::controller::MAX_METER_VALUES;
 use grizzle_local::ocpp::{Connection, MAX_FRAME_BYTES};
 use grizzle_local::state::{Station, MAX_CONFIG_KEYS, MAX_CONNECTORS};
 use grizzle_local::timeutil::parse_iso;
@@ -88,7 +89,8 @@ async fn connector_ids_up_to_the_limit_still_work() {
     let cp = charger(&server, SERIAL).await;
     assert_eq!(cp.call("StatusNotification", status(json!({"connectorId": MAX_CONNECTORS}))).await[0], 3);
     assert_eq!(stored(&server, SERIAL)["connectorCount"], MAX_CONNECTORS);
-    assert_eq!(cp.call("StatusNotification", status(json!({"connectorId": 0}))).await[0], 3); // the station itself
+    assert_eq!(cp.call("StatusNotification", status(json!({"connectorId": 0}))).await[0], 3);
+    // the station itself
 }
 
 /// Boot `cp` as a charger whose configuration claims these two values, and wait until the server
@@ -289,7 +291,8 @@ async fn non_finite_meter_values_never_reach_the_api() {
 
     let token = server.login().await;
     for history in ["sessions", "samples"] {
-        server.json(&token, &format!("/local/stations/{SERIAL}/{history}")).await; // JSON a browser can parse
+        server.json(&token, &format!("/local/stations/{SERIAL}/{history}")).await;
+        // JSON a browser can parse
     }
     let station = server.station(&token, SERIAL).await; // and so is /client/stations
     let meter = &station["connectors"][0]["lastMeter"];
@@ -534,7 +537,7 @@ async fn many_meter_values_in_one_message_are_capped() {
     let one = json!({"sampledValue": [{"value": "230", "measurand": "Voltage"}]});
     assert_eq!(cp.call("MeterValues", json!({"connectorId": 1, "meterValue": vec![one; 500]})).await[0], 3);
     let rows = server.controller().lock().store.samples(SERIAL, "", None, 2000).unwrap().len();
-    assert_eq!(rows, 16); // the controller's MAX_METER_VALUES
+    assert_eq!(rows, MAX_METER_VALUES);
 }
 
 // Frames that aren't quite OCPP.

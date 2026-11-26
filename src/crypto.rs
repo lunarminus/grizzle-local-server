@@ -28,10 +28,7 @@ pub fn random_hex(count: usize) -> String {
 
 /// An unguessable token: `count` random bytes in URL-safe base64 without padding.
 pub fn random_token(count: usize) -> String {
-    openssl::base64::encode_block(&random_bytes(count))
-        .trim_end_matches('=')
-        .replace('+', "-")
-        .replace('/', "_")
+    openssl::base64::encode_block(&random_bytes(count)).trim_end_matches('=').replace('+', "-").replace('/', "_")
 }
 
 /// Constant-time comparison of two secrets. A missing or empty `given` matches nothing.

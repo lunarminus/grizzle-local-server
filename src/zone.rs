@@ -37,7 +37,10 @@ impl Tz {
     }
 
     fn offset(&self, seconds: i32) -> TzOffset {
-        TzOffset { tz: *self, fixed: FixedOffset::east_opt(seconds).unwrap_or_else(|| FixedOffset::east_opt(0).unwrap()) }
+        TzOffset {
+            tz: *self,
+            fixed: FixedOffset::east_opt(seconds).unwrap_or_else(|| FixedOffset::east_opt(0).unwrap()),
+        }
     }
 }
 
@@ -198,7 +201,9 @@ mod tests {
     #[test]
     fn a_wall_clock_reading_can_happen_once_twice_or_never() {
         let denver = zone("America/Denver");
-        let wall = |m: u32, d: u32, h: u32, min: u32| NaiveDate::from_ymd_opt(2026, m, d).unwrap().and_hms_opt(h, min, 0).unwrap();
+        let wall = |m: u32, d: u32, h: u32, min: u32| {
+            NaiveDate::from_ymd_opt(2026, m, d).unwrap().and_hms_opt(h, min, 0).unwrap()
+        };
         let hours = |offset: TzOffset| offset.fix().local_minus_utc() / 3600;
         match denver.offset_from_local_datetime(&wall(6, 1, 12, 0)) {
             LocalResult::Single(offset) => assert_eq!(hours(offset), -6),
@@ -227,7 +232,8 @@ mod tests {
         }
         // The copy built into the binary, which is what a system without a database gets.
         let built_in = TimeZoneDatabase::bundled().get("America/Vancouver").unwrap();
-        let december = jiff::Timestamp::new(Utc.with_ymd_and_hms(2026, 12, 1, 12, 0, 0).unwrap().timestamp(), 0).unwrap();
+        let december =
+            jiff::Timestamp::new(Utc.with_ymd_and_hms(2026, 12, 1, 12, 0, 0).unwrap().timestamp(), 0).unwrap();
         assert_eq!(built_in.to_offset(december).seconds(), -7 * 3600);
     }
 
