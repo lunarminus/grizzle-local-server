@@ -31,13 +31,20 @@ pub fn url(settings: &Settings) -> String {
 /// ourselves). `Ok` if it answers 200.
 pub fn check(settings: &Settings) -> Result<(), String> {
     let (host, port) = target(settings);
-    let address = (host.as_str(), port)
-        .to_socket_addrs()
-        .map_err(|err| err.to_string())?
-        .next()
-        .ok_or_else(|| format!("{host} is not an address"))?;
     let failed = |err: std::io::Error| err.to_string();
-    let mut stream = TcpStream::connect_timeout(&address, TIMEOUT).map_err(failed)?;
+    // A name can stand for several addresses, and the server listens on those the machine has.
+    let mut refused = format!("{host} is not an address");
+    let mut connected = None;
+    for address in (host.as_str(), port).to_socket_addrs().map_err(failed)? {
+        match TcpStream::connect_timeout(&address, TIMEOUT) {
+            Ok(stream) => {
+                connected = Some(stream);
+                break;
+            }
+            Err(err) => refused = err.to_string(),
+        }
+    }
+    let mut stream = connected.ok_or(refused)?;
     stream.set_read_timeout(Some(TIMEOUT)).map_err(failed)?;
     stream.set_write_timeout(Some(TIMEOUT)).map_err(failed)?;
     let request = format!("GET /health HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");

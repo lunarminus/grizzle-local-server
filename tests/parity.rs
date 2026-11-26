@@ -64,6 +64,33 @@ async fn frames_that_are_not_masked_are_answered() {
     assert!(server.controller().is_online(SERIAL));
 }
 
+/// Every ping is owed an answer. From a peer that never reads its answers, the server stops
+/// taking pings (its reading is rate-limited like any other frame, and what waits to be written
+/// is bounded) instead of queueing an answer to each for as long as the peer cares to go on.
+#[tokio::test]
+async fn a_peer_that_pings_without_reading_is_not_served_without_limit() {
+    let server = TestServer::start().await;
+    let mut stream = TcpStream::connect(server.address).await.unwrap();
+    stream.write_all(&upgrade_request(SERIAL)).await.unwrap();
+    let head = read_until(&mut stream, |bytes| bytes.ends_with(b"\r\n\r\n")).await;
+    assert!(head.starts_with(b"HTTP/1.1 101 "), "{}", String::from_utf8_lossy(&head));
+
+    let mut ping = vec![0x89, 125]; // a ping with as much in it as a ping may hold, not masked
+    ping.extend_from_slice(&[b'p'; 125]);
+    let block = ping.repeat(512);
+    let mut taken = 0usize;
+    let flood = async {
+        loop {
+            stream.write_all(&block).await.unwrap();
+            taken += block.len();
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(3), flood).await;
+    // What fits in the socket's buffers on the way is taken, and a burst of frames; not more.
+    assert!(taken < 16 << 20, "the server took {} MB of pings in three seconds", taken >> 20);
+    assert_eq!(server.get("/health", None).await.status, 200, "and it still answers everybody else");
+}
+
 /// A charger that ends the connection properly is answered with a close, not cut off.
 #[tokio::test]
 async fn a_charger_that_closes_gets_a_close_back() {

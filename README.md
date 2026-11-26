@@ -34,7 +34,7 @@ Nothing leaves your LAN: the charger talks to this container, and the
   integration only needs a different server URL. Plus a few `/local/...` extras:
   raw OCPP calls, the frame log, meter history.
 - One small binary, one process, one port; state survives restarts. Since 0.9 the server is written
-  in Rust: it starts in a few milliseconds and runs in about 10 MB of memory with a charger
+  in Rust: it starts in a fraction of a second and runs in about 10 MB of memory with a charger
   connected (the Python versions took about 45 MB). It uses the same data directory.
 - **Built for a network you don't fully trust.** Everything a charger or an API client sends is
   validated and bounded; see [Security](#security) for what is and isn't protected.
@@ -399,8 +399,8 @@ GRIZZLE_DATA_DIR=./data GRIZZLE_PORT=9000 cargo run --release
 python tools/fake_charger.py ws://localhost:9000/ocpp1.6/GRD-FAKE0001 --plug-in 5
 ```
 
-Building needs a Rust toolchain (1.85 or later), a C compiler and OpenSSL's headers (`libssl-dev`);
-SQLite is compiled in.
+Building needs a Rust toolchain (1.85 or later), a C compiler, `pkg-config` and OpenSSL's headers
+(`libssl-dev`); SQLite is compiled in.
 
 ```
 src/
@@ -467,6 +467,12 @@ on 2026-11-08, connected through the DNS override:
   `ChargingScheduleAllowedChargingRateUnit` Current, `AuthorizeRemoteTxRequests` false,
   `Autostart` false, `SupportedFeatureProfiles` Core, FirmwareManagement, SmartCharging,
   RemoteTrigger.
+
+All of the above was established with the Python versions of the server (up to 0.8). The Rust
+server (0.9) is tested against the same pretend charger and its TLS listener offers the same
+protocol versions and ciphers, but it has not been connected to the real charger yet. After
+upgrading, the first thing to look for in the log is `TLS: handshake with … OK` followed by the
+charger's BootNotification.
 
 Still to confirm, in order:
 

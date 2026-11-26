@@ -27,7 +27,7 @@ serde_json = { version = "1", features = ["preserve_order", "unbounded_depth"] }
 indexmap = "2"
 rusqlite = { version = "0.37", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-jiff = { version = "1", default-features = false, features = ["std", "tz-fat", "tzdb-zoneinfo", "tzdb-bundle-always"] }
+jiff = { version = "1", default-features = false, features = ["std", "tz-fat", "tz-system", "tzdb-zoneinfo", "tzdb-bundle-always"] }
 openssl = "0.10"
 tokio-openssl = "0.6"
 miniz_oxide = "0.8"

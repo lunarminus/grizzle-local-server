@@ -8,6 +8,7 @@
 
 use std::convert::Infallible;
 use std::future::Future;
+use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -303,6 +304,9 @@ where
     let connection = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(HEADER_TIMEOUT)
+        // A client may send its request and close its sending side (`printf ... | nc`): it is
+        // still there to read the answer.
+        .half_close(true)
         .serve_connection(TokioIo::new(io), service)
         .with_upgrades();
     if let Err(err) = connection.await {
@@ -416,27 +420,53 @@ async fn bind(host: &str, port: u16) -> Result<Vec<TcpListener>, String> {
     } else {
         tokio::net::lookup_host((host, port)).await.map_err(failed)?.collect()
     };
+    listen_on(&addresses).map_err(failed)
+}
+
+/// A listener on each of `addresses` that this machine can listen on; an error if there is none.
+///
+/// A name may stand for an address the machine does not have: "localhost" is ::1 as well, also
+/// where IPv6 is switched off. Such an address is passed over (and one listed twice is used once);
+/// anything else that goes wrong (the port is taken, it is not ours to take) is an error.
+fn listen_on(addresses: &[SocketAddr]) -> std::io::Result<Vec<TcpListener>> {
     let mut listeners = Vec::new();
-    for address in addresses {
-        // A machine without IPv6 (or without IPv4) cannot make the socket: not an error, as
-        // long as there is something left to listen on.
-        let Ok(socket) = Socket::new(Domain::for_address(address), Type::STREAM, Some(Protocol::TCP)) else { continue };
+    let mut unusable = None;
+    for (index, address) in addresses.iter().enumerate() {
+        if addresses[..index].contains(address) {
+            continue;
+        }
+        // A machine without IPv6 (or without IPv4) cannot even make the socket.
+        let socket = match Socket::new(Domain::for_address(*address), Type::STREAM, Some(Protocol::TCP)) {
+            Ok(socket) => socket,
+            Err(err) => {
+                unusable = Some(err);
+                continue;
+            }
+        };
         let listen = || -> std::io::Result<TcpListener> {
             if address.is_ipv6() {
                 socket.set_only_v6(true)?;
             }
             socket.set_reuse_address(true)?;
             socket.set_nonblocking(true)?;
-            socket.bind(&address.into())?;
+            socket.bind(&(*address).into())?;
             socket.listen(1024)?;
             TcpListener::from_std(socket.into())
         };
-        listeners.push(listen().map_err(failed)?);
+        match listen() {
+            Ok(listener) => listeners.push(listener),
+            Err(err) if err.kind() == ErrorKind::AddrNotAvailable => {
+                log::debug!("not listening on {address}: {err}");
+                unusable = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
     }
-    if listeners.is_empty() {
-        return Err(format!("cannot listen on {host:?} port {port}: it is not an address of this machine"));
+    match (listeners.is_empty(), unusable) {
+        (true, Some(err)) => Err(err),
+        (true, None) => Err(std::io::Error::new(ErrorKind::AddrNotAvailable, "it stands for no address")),
+        (false, _) => Ok(listeners),
     }
-    Ok(listeners)
 }
 
 /// The listeners, bound and ready to serve.
@@ -590,6 +620,24 @@ pub async fn serve(settings: Settings) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_host_name_may_stand_for_addresses_this_machine_lacks() {
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let elsewhere: SocketAddr = "192.0.2.9:0".parse().unwrap(); // a documentation address: nobody's
+                                                                    // Listed twice, an address is listened on once; one the machine does not have is passed over.
+        assert_eq!(listen_on(&[local, local]).unwrap().len(), 1);
+        assert_eq!(listen_on(&[elsewhere, local, elsewhere]).unwrap().len(), 1);
+        // With nothing left to listen on, the reason is the system's.
+        assert_eq!(listen_on(&[elsewhere]).unwrap_err().kind(), ErrorKind::AddrNotAvailable);
+        assert_eq!(listen_on(&[]).unwrap_err().kind(), ErrorKind::AddrNotAvailable);
+        // A port that is taken is still an error, whatever else could be listened on.
+        let taken = listen_on(&[local]).unwrap().remove(0).local_addr().unwrap();
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let holder = listen_on(&[taken]);
+        assert!(holder.is_ok(), "nobody holds it any more");
+        assert_eq!(listen_on(&[other, taken]).unwrap_err().kind(), ErrorKind::AddrInUse);
+    }
 
     fn request(path: &str, authorization: Option<&str>) -> Request {
         Request {

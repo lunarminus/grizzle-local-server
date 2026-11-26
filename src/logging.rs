@@ -107,10 +107,10 @@ pub fn level_from_name(name: &str) -> LevelFilter {
 
 /// Send everything to stderr through the formatter that keeps network-supplied text on one line.
 ///
-/// Times are written in the zone `TZ` names (UTC if it names none we know). Calling it again
-/// only changes the level.
+/// Times are written in the zone `TZ` names, else in the machine's own local time. Calling it
+/// again only changes the level.
 pub fn configure(level: &str) {
-    let zone = std::env::var("TZ").ok().and_then(|name| name.parse().ok()).unwrap_or(Tz::UTC);
+    let zone = std::env::var("TZ").ok().and_then(|name| name.parse().ok()).unwrap_or_else(Tz::local);
     let _ = log::set_boxed_logger(Box::new(StderrLogger { zone }));
     log::set_max_level(level_from_name(level));
 }

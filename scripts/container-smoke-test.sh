@@ -74,7 +74,9 @@ owner="$(docker exec "$NAME" stat -c '%u %a' /data/state.json)"
 [ "$owner" = "10001 600" ] || fail "state.json is '$owner', expected '10001 600'"
 
 echo "== TLS works from a key the unprivileged user could not read"
-docker logs "$NAME" 2>&1 | grep -q "and wss:// on 8443" || fail "the TLS listener did not start"
+# Not `docker logs | grep -q`: grep leaving at the first match can fail the pipe (pipefail).
+LOGS="$(docker logs "$NAME" 2>&1)"
+grep -q "and wss:// on 8443" <<<"$LOGS" || fail "the TLS listener did not start"
 curl -fsSk --max-time 4 "https://127.0.0.1:$TLS_PORT/health" >/dev/null || fail "no answer on the TLS port"
 
 echo "== chargers connect (plain and TLS)"

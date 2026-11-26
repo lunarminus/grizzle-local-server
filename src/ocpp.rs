@@ -50,6 +50,9 @@ pub const MAX_FRAME_DEPTH: usize = 32;
 const HEARTBEAT: Duration = Duration::from_secs(120);
 /// Frames waiting to be written. A peer that stops reading fills this, and then senders wait.
 const SEND_QUEUE: usize = 32;
+/// How much may wait in the socket to be written before the peer counts as gone. Well above the
+/// largest frame the server sends (a raw call from the API: a request body, 1 MiB at most).
+const MAX_UNSENT_BYTES: usize = 8 * 1024 * 1024;
 /// How long a peer gets to acknowledge our close before the socket is dropped anyway.
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
@@ -57,12 +60,20 @@ const CLOSE_GRACE: Duration = Duration::from_secs(2);
 ///
 /// A client is supposed to mask what it sends. Small embedded WebSocket clients are known to skip
 /// it, the Python server never insisted, and masking protects proxies, not us: take either.
+///
+/// What waits to be written is bounded as well. A peer that sends pings and never reads would
+/// otherwise have an answer to each one queued for it, for as long as it cares to go on.
 pub fn websocket_config() -> WebSocketConfig {
     WebSocketConfig::default()
         .max_message_size(Some(MAX_FRAME_BYTES))
         .max_frame_size(Some(MAX_FRAME_BYTES))
+        .max_write_buffer_size(MAX_UNSENT_BYTES)
         .accept_unmasked_frames(true)
 }
+
+/// A frame could not be written: the connection is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplyNotSent;
 
 /// A CallError received from the charger, or a call that timed out or could not be sent.
 #[derive(Debug, Clone, PartialEq)]
@@ -310,10 +321,10 @@ impl Connection {
         outcome.unwrap_or_else(|_| Err(OcppError::new("Timeout", &format!("{action} not answered by {}", self.id))))
     }
 
-    async fn send(&self, frame: &Value, label: &str) -> Result<(), ()> {
+    async fn send(&self, frame: &Value, label: &str) -> Result<(), ReplyNotSent> {
         let text = frame.to_string();
         self.record("out", label, &text, true);
-        self.out.send(Message::text(text)).await.map_err(|_| ())
+        self.out.send(Message::text(text)).await.map_err(|_| ReplyNotSent)
     }
 
     // --- inbound ------------------------------------------------------------
@@ -403,15 +414,20 @@ impl Connection {
             pong_by = None;
             match message {
                 None | Some(Err(WsError::ConnectionClosed | WsError::AlreadyClosed)) => return None,
-                Some(Ok(Message::Text(text))) => {
+                Some(Ok(Message::Close(_))) => return None,
+                Some(Ok(message)) => {
+                    // Whatever kind of frame it is: a ping costs an answer too.
                     self.throttle().await;
-                    if self.handle_text(text.as_str(), handler).await.is_err() {
-                        return None; // the reply couldn't be sent: the socket is gone
+                    match message {
+                        Message::Text(text) => {
+                            if self.handle_text(text.as_str(), handler).await.is_err() {
+                                return None; // the reply couldn't be sent: the socket is gone
+                            }
+                        }
+                        Message::Binary(_) => log::debug!("{}: ignoring binary frame", self.id),
+                        _ => {} // ping and pong: answered by the socket itself
                     }
                 }
-                Some(Ok(Message::Binary(_))) => log::debug!("{}: ignoring binary frame", self.id),
-                Some(Ok(Message::Close(_))) => return None,
-                Some(Ok(_)) => {} // ping and pong: answered by the socket itself
                 Some(Err(WsError::Capacity(err))) => {
                     log::warn!("{}: closing the connection: {}", self.id, printable(&err.to_string(), 200));
                     return Some(CloseFrame { code: CloseCode::Size, reason: "frame too large".into() });
@@ -457,7 +473,7 @@ impl Connection {
         &self,
         text: &str,
         handler: &(dyn Fn(&str, Object) -> HandlerResult + Sync),
-    ) -> Result<(), ()> {
+    ) -> Result<(), ReplyNotSent> {
         let Some(mut frame) = parse_frame(text) else {
             self.record("in", "unparseable", clip(text, 500), false);
             log::warn!("{}: dropping unparseable frame: {}", self.id, printable(text, 200));
@@ -511,7 +527,7 @@ impl Connection {
         action: &str,
         payload: Object,
         handler: &(dyn Fn(&str, Object) -> HandlerResult + Sync),
-    ) -> Result<(), ()> {
+    ) -> Result<(), ReplyNotSent> {
         let name = printable(action, 64);
         // Never let a handler bug kill the socket.
         let outcome = catch_unwind(AssertUnwindSafe(|| handler(action, payload)))

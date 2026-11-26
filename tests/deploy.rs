@@ -231,6 +231,28 @@ async fn stop_saves_before_it_waits_for_sockets_to_close() {
     assert!(still_closing && saved_while_closing, "closing: {still_closing}, saved: {saved_while_closing}");
 }
 
+/// `printf 'GET /health ...' | nc host 9000`: the request, then the end of what the client has
+/// to say. It is still there to read the answer. (Only the server as a process of its own shows
+/// this: inside the test's own runtime the answer is written before the hang-up is noticed.)
+#[tokio::test]
+async fn a_client_that_closes_its_sending_side_still_gets_its_answer() {
+    let server = Process::start(&[]).await;
+    let address = server.address;
+    let reply = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream.write_all(b"GET /health HTTP/1.1\r\nHost: grizzle\r\n\r\n").unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut reply = Vec::new();
+        let _ = stream.read_to_end(&mut reply);
+        reply
+    })
+    .await
+    .unwrap();
+    assert!(reply.starts_with(b"HTTP/1.1 200 "), "{:?}", String::from_utf8_lossy(&reply));
+}
+
 #[tokio::test]
 async fn no_charger_is_admitted_once_shutdown_has_begun() {
     // A handshake that is waiting on the liveness probe when shutdown starts used to be connected

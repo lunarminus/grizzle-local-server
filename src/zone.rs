@@ -25,7 +25,19 @@ impl Tz {
 
     /// The zone's name, as it was asked for.
     pub fn name(&self) -> &'static str {
-        self.0.and_then(Rules::iana_name).unwrap_or("UTC")
+        match self.0 {
+            None => "UTC",
+            Some(rules) => rules.iana_name().unwrap_or("local"),
+        }
+    }
+
+    /// The zone this machine keeps its own clock in: what `TZ` says, in any of the spellings the
+    /// system takes, else `/etc/localtime`; UTC if neither says anything. (For the times in the
+    /// log. Schedules go by the zone that is configured, and never by where the server happens
+    /// to run.)
+    pub fn local() -> Tz {
+        static LOCAL: OnceLock<Option<&'static Rules>> = OnceLock::new();
+        Tz(*LOCAL.get_or_init(|| Rules::try_system().ok().map(|rules| &*Box::leak(Box::new(rules)))))
     }
 
     fn seconds_at(&self, utc: &NaiveDateTime) -> i32 {
