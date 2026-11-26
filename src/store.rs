@@ -491,7 +491,7 @@ impl Store {
 
     fn rows(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> DbResult<Vec<Object>> {
         let mut statement = self.db.prepare_cached(sql)?;
-        let columns: Vec<String> = statement.column_names().into_iter().map(str::to_string).collect();
+        let columns: Vec<String> = statement.column_names().map(str::to_string).collect();
         let rows = statement.query_map(params, |row| row_object(row, &columns))?;
         rows.collect()
     }
