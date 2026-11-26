@@ -5,5 +5,5 @@
 aiohttp>=3.9,<4
 # tools/gen_holidays.py: src/holidays.bin is this package's output. After an update, run the tool and
 # commit the file (CI's `gen_holidays.py --check` fails until then).
-holidays>=0.60
+holidays>=0.109
 tzdata

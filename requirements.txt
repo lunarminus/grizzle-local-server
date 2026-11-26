@@ -313,9 +313,9 @@ frozenlist==1.8.0 \
     # via
     #   aiohttp
     #   aiosignal
-holidays==0.108 \
-    --hash=sha256:5a08fdccd0b8737093d483ba0d0d9696560396d99d3fa6ef9264fd2ac48749c7 \
-    --hash=sha256:b6daaa1f630512427fb0889700efaf9fa2eb4209f777ef4ce9ee216a4f0d0691
+holidays==0.109 \
+    --hash=sha256:7d39c910167116d41fa6aae18d5e72b4541700cdd37743d799c83db3419201b0 \
+    --hash=sha256:b1ebc71e8fdb62c7cbf043f781f19e2ea1c69c02ecff5c13dcfda4ebd1d3bb69
     # via -r requirements.in
 idna==3.20 \
     --hash=sha256:a7db850025b95ded1eae8a46181a1a6c56c92c96f0e2b005d9ff8dc0210cab44 \
