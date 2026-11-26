@@ -43,7 +43,7 @@ jobs:
       # `holidays` package (about a minute).
       - run: pytest -q
       # And the other half: the server reads out of the table exactly what the package said, for
-      # every country and region, with and without observed days, every year (177,558 calendars).
+      # every country and region, with and without observed days, every year (some 180,000 calendars).
       - run: python tools/gen_holidays.py --dump "$RUNNER_TEMP/calendars.jsonl" --output "$RUNNER_TEMP/holidays.bin"
       - run: HOLIDAYS_DUMP="$RUNNER_TEMP/calendars.jsonl" cargo test --release --locked --lib every_calendar -- --ignored
       # The entrypoint's tests need root (dropping it is what they test), which this job's user is not.

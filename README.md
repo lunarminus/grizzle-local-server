@@ -434,15 +434,16 @@ and the image builds with `--locked`. The Python tools have their own lock files
 `requirements-dev.txt` for their tests and the linter; install both with
 `pip install --require-hashes -r requirements.txt -r requirements-dev.txt` and run `pytest`.
 
-**The holiday table.** `src/holidays.bin` (about 330 KB) holds every holiday of every country and
+**The holiday table.** `src/holidays.bin` (about 350 KB) holds every holiday of every country and
 region the Python `holidays` package knows, with and without observed days, for 2000 to 2100.
 `python tools/gen_holidays.py` rewrites it from the version of the package pinned in
 `requirements.txt`; `--check` (which CI runs) fails if the file is not what that version gives, so
 an update of the package, which may correct or add holidays, cannot go unnoticed. CI also checks
 the other half, that the server reads out of the table exactly what the package said:
 `python tools/gen_holidays.py --dump calendars.jsonl` writes the package's answers to a file, and
-`HOLIDAYS_DUMP=calendars.jsonl cargo test --release --lib every_calendar -- --ignored` compares all
-177,558 calendars with it (every country and region, with and without observed days, every year).
+`HOLIDAYS_DUMP=calendars.jsonl cargo test --release --lib every_calendar -- --ignored` compares
+every calendar with it (some 180,000: each country and region, with and without observed days,
+every year).
 
 ## Status
 
