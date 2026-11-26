@@ -1,0 +1,636 @@
+//! Persistence: a JSON document for live state, SQLite for history.
+//!
+//! Both files are in the format the Python versions of this server wrote, so an existing data
+//! directory carries on as it is.
+
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+
+use chrono::{Duration, Utc};
+use rusqlite::types::ValueRef;
+use rusqlite::{params, Connection as Database};
+use serde_json::{Map, Number, Value};
+
+use crate::value::Object;
+
+/// state.json holds the API's bearer tokens and the charger's cloud Auth key: owner-only.
+const PRIVATE_FILE: u32 = 0o600;
+/// History kept per station, whatever its age. A charger reporting every 30 s fills about a
+/// quarter of this in the 90 days samples are kept for; what a station sends beyond it replaces
+/// its own oldest rows instead of growing the database without end.
+pub const MAX_SAMPLES_PER_STATION: i64 = 1_000_000;
+pub const MAX_SESSIONS_PER_STATION: i64 = 100_000;
+/// The largest integer SQLite stores. A transaction counter at or beyond it in state.json (a damaged
+/// or hand-edited file) can never be recorded, so numbering does not continue from it.
+pub const LAST_ID: i64 = i64::MAX;
+
+const SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS sessions (
+        id INTEGER PRIMARY KEY,
+        station TEXT NOT NULL,
+        connector INTEGER NOT NULL,
+        id_tag TEXT,
+        start_at TEXT NOT NULL,
+        stop_at TEXT,
+        meter_start INTEGER,
+        meter_stop INTEGER,
+        energy_wh REAL,
+        duration_s INTEGER,
+        price_kwh REAL,
+        cost REAL,
+        reason TEXT
+    );
+    CREATE TABLE IF NOT EXISTS samples (
+        station TEXT NOT NULL,
+        connector INTEGER NOT NULL,
+        transaction_id INTEGER,
+        at TEXT NOT NULL,
+        energy_wh REAL,
+        power_w REAL,
+        current_a REAL,
+        voltage_v REAL,
+        temperature_c REAL,
+        soc REAL
+    );
+    CREATE INDEX IF NOT EXISTS samples_station_at ON samples(station, at);
+    CREATE INDEX IF NOT EXISTS samples_station_tx ON samples(station, transaction_id, at);
+    CREATE INDEX IF NOT EXISTS sessions_station_start ON sessions(station, start_at);
+";
+
+fn restrict(path: &Path) {
+    // Ignored on a filesystem without Unix permissions (SMB, some NAS datasets), and for a file
+    // that isn't there yet.
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_FILE));
+}
+
+/// `NaN`, `Infinity` and `-Infinity` outside strings replaced by `null`.
+///
+/// Older versions of the server could write them into state.json; JSON proper has no spelling for
+/// them, and a strict parser would otherwise call the whole file corrupt.
+fn without_non_finite(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    let mut copied = 0;
+    let mut in_string = false;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if in_string {
+            match byte {
+                b'\\' => at += 1,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            at += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            at += 1;
+            continue;
+        }
+        let word = ["-Infinity", "Infinity", "NaN"].into_iter().find(|word| bytes[at..].starts_with(word.as_bytes()));
+        if let Some(word) = word {
+            out.push_str(&text[copied..at]);
+            out.push_str("null");
+            at += word.len();
+            copied = at;
+        } else {
+            at += 1;
+        }
+    }
+    out.push_str(&text[copied.min(text.len())..]);
+    out
+}
+
+/// One meter reading for the history.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Sample {
+    pub station: String,
+    pub connector: i64,
+    pub transaction_id: Option<i64>,
+    pub at: String,
+    pub energy_wh: Option<f64>,
+    pub power_w: Option<f64>,
+    pub current_a: Option<f64>,
+    pub voltage_v: Option<f64>,
+    pub temperature_c: Option<f64>,
+    pub soc: Option<f64>,
+}
+
+type DbResult<T> = Result<T, rusqlite::Error>;
+
+pub struct Store {
+    state_path: PathBuf,
+    db: Database,
+    /// Rows per station, counted once and kept up to date.
+    sample_counts: HashMap<String, i64>,
+    pub max_samples: i64,
+    pub max_sessions: i64,
+}
+
+fn row_object(row: &rusqlite::Row<'_>, columns: &[String]) -> DbResult<Object> {
+    let mut object = Map::with_capacity(columns.len());
+    for (index, name) in columns.iter().enumerate() {
+        let value = match row.get_ref(index)? {
+            ValueRef::Null => Value::Null,
+            ValueRef::Integer(int) => Value::from(int),
+            ValueRef::Real(real) => Number::from_f64(real).map_or(Value::Null, Value::Number),
+            ValueRef::Text(text) => Value::from(String::from_utf8_lossy(text).into_owned()),
+            ValueRef::Blob(_) => Value::Null,
+        };
+        object.insert(name.clone(), value);
+    }
+    Ok(object)
+}
+
+impl Store {
+    /// Open (creating what is missing) the data directory. Returns the store and whatever
+    /// state.json held: an empty object if there was none, or if it was unreadable (it is then
+    /// set aside as `state.corrupt.json`).
+    pub fn open(data_dir: &Path) -> Result<(Store, Object), String> {
+        fs::create_dir_all(data_dir).map_err(|err| format!("cannot create {}: {err}", data_dir.display()))?;
+        let state_path = data_dir.join("state.json");
+        let state = Store::load(&state_path);
+        let db_path = data_dir.join("history.sqlite");
+        let db = Database::open(&db_path).map_err(|err| format!("cannot open {}: {err}", db_path.display()))?;
+        db.execute_batch(SCHEMA).map_err(|err| format!("cannot use {}: {err}", db_path.display()))?;
+        for path in [&state_path, &db_path] {
+            restrict(path);
+        }
+        let store = Store {
+            state_path,
+            db,
+            sample_counts: HashMap::new(),
+            max_samples: MAX_SAMPLES_PER_STATION,
+            max_sessions: MAX_SESSIONS_PER_STATION,
+        };
+        Ok((store, state))
+    }
+
+    // --- JSON state ---------------------------------------------------------
+
+    fn load(path: &Path) -> Object {
+        let Ok(text) = fs::read_to_string(path) else {
+            if path.exists() {
+                Store::set_aside(path); // there, but not text
+            }
+            return Object::new();
+        };
+        let parsed = serde_json::from_str::<Value>(&text)
+            .or_else(|_| serde_json::from_str::<Value>(&without_non_finite(&text)));
+        match parsed {
+            Ok(Value::Object(state)) => state,
+            _ => {
+                Store::set_aside(path);
+                Object::new()
+            }
+        }
+    }
+
+    fn set_aside(path: &Path) {
+        let backup = path.with_extension("corrupt.json");
+        log::error!("state.json is corrupt, moving it to {}", backup.display());
+        if let Err(err) = fs::rename(path, &backup) {
+            log::error!("could not move state.json aside: {err}");
+        }
+        restrict(&backup); // it may still hold sessions and the charger's Auth key
+    }
+
+    /// Replace state.json with `state`, written to a temporary file first and flushed to disk.
+    pub fn write_state(&self, state: &Value) -> std::io::Result<()> {
+        let tmp = self.state_path.with_extension("tmp");
+        let mut payload = Vec::with_capacity(4096);
+        let formatter = serde_json::ser::PrettyFormatter::with_indent(b" ");
+        let mut serializer = serde_json::Serializer::with_formatter(&mut payload, formatter);
+        serde::Serialize::serialize(state, &mut serializer).map_err(std::io::Error::other)?;
+        let mut file: File = OpenOptions::new().write(true).create(true).truncate(true).mode(PRIVATE_FILE).open(&tmp)?;
+        restrict(&tmp); // the mode above only applies when the file is new
+        file.write_all(&payload)?;
+        // Without this a power cut can leave the renamed file empty, and an empty state means
+        // every station (and every pinned Auth key) is forgotten.
+        let _ = file.sync_all();
+        drop(file);
+        fs::rename(&tmp, &self.state_path)
+    }
+
+    pub fn state_path(&self) -> &Path {
+        &self.state_path
+    }
+
+    /// A transaction id no recorded session has, whatever state.json remembers.
+    ///
+    /// The counter is saved with the rest of the state, a few seconds after the session row is
+    /// committed: after a crash in between (or a lost state file) it is behind the history.
+    pub fn unused_id(&self, counter: i64) -> i64 {
+        let counter = if (1..LAST_ID).contains(&counter) { counter } else { 1 };
+        let newest: Option<i64> = self
+            .db
+            .query_row("SELECT MAX(id) FROM sessions WHERE id < ?", params![LAST_ID], |row| row.get(0))
+            .unwrap_or(None);
+        counter.max(newest.unwrap_or(0) + 1)
+    }
+
+    // --- SQLite history -----------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_session(
+        &mut self,
+        tid: i64,
+        station: &str,
+        connector: i64,
+        id_tag: Option<&str>,
+        start_at: &str,
+        meter_start: Option<i64>,
+        price_kwh: Option<f64>,
+    ) -> DbResult<()> {
+        // A plain INSERT: ids are never reused, and if one ever were, failing here is better
+        // than quietly replacing a recorded session.
+        self.db.execute(
+            "INSERT INTO sessions(id, station, connector, id_tag, start_at, meter_start, price_kwh)
+             VALUES (?,?,?,?,?,?,?)",
+            params![tid, station, connector, id_tag, start_at, meter_start, price_kwh],
+        )?;
+        Ok(())
+    }
+
+    /// Close a session. `price_kwh` (the average it was charged at) replaces the starting price if given.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_session(
+        &mut self,
+        tid: i64,
+        stop_at: &str,
+        meter_stop: Option<i64>,
+        energy_wh: Option<f64>,
+        duration_s: Option<i64>,
+        cost: Option<f64>,
+        reason: Option<&str>,
+        price_kwh: Option<f64>,
+    ) -> DbResult<()> {
+        self.db.execute(
+            "UPDATE sessions SET stop_at=?, meter_stop=?, energy_wh=?, duration_s=?, cost=?, reason=?,
+             price_kwh=COALESCE(?, price_kwh) WHERE id=?",
+            params![stop_at, meter_stop, energy_wh, duration_s, cost, reason, price_kwh, tid],
+        )?;
+        Ok(())
+    }
+
+    /// Insert several samples in one transaction (one commit, however many readings a message carries).
+    pub fn add_samples(&mut self, rows: &[Sample]) -> DbResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.db.transaction()?;
+        {
+            let mut insert = transaction.prepare_cached(
+                "INSERT INTO samples(station, connector, transaction_id, at, energy_wh, power_w, current_a,
+                 voltage_v, temperature_c, soc) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            )?;
+            for row in rows {
+                insert.execute(params![
+                    row.station,
+                    row.connector,
+                    row.transaction_id,
+                    row.at,
+                    row.energy_wh,
+                    row.power_w,
+                    row.current_a,
+                    row.voltage_v,
+                    row.temperature_c,
+                    row.soc
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        let mut added: HashMap<&str, i64> = HashMap::new();
+        for row in rows {
+            *added.entry(row.station.as_str()).or_default() += 1;
+        }
+        for (station, count) in added {
+            self.trim_samples(station, count)?;
+        }
+        Ok(())
+    }
+
+    /// Keep a station within `max_samples` (plus a tenth of slack, so trimming is rare).
+    fn trim_samples(&mut self, station: &str, added: i64) -> DbResult<()> {
+        let mut count = match self.sample_counts.get(station) {
+            Some(count) => count + added,
+            None => self.db.query_row("SELECT COUNT(*) FROM samples WHERE station=?", params![station], |r| r.get(0))?,
+        };
+        let excess = count - self.max_samples;
+        if excess > self.max_samples / 10 {
+            self.db.execute(
+                "DELETE FROM samples WHERE rowid IN
+                 (SELECT rowid FROM samples WHERE station=? ORDER BY at LIMIT ?)",
+                params![station, excess],
+            )?;
+            count -= excess;
+        }
+        self.sample_counts.insert(station.to_string(), count);
+        Ok(())
+    }
+
+    fn rows(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> DbResult<Vec<Object>> {
+        let mut statement = self.db.prepare_cached(sql)?;
+        let columns: Vec<String> = statement.column_names().into_iter().map(str::to_string).collect();
+        let rows = statement.query_map(params, |row| row_object(row, &columns))?;
+        rows.collect()
+    }
+
+    /// A station's sessions, newest first.
+    pub fn sessions(&self, station: &str, limit: i64) -> DbResult<Vec<Object>> {
+        self.rows("SELECT * FROM sessions WHERE station=? ORDER BY start_at DESC LIMIT ?", &[&station, &limit])
+    }
+
+    pub fn samples(&self, station: &str, since: &str, connector: Option<i64>, limit: i64) -> DbResult<Vec<Object>> {
+        match connector {
+            None => self.rows(
+                "SELECT * FROM samples WHERE station=? AND at>=? ORDER BY at LIMIT ?",
+                &[&station, &since, &limit],
+            ),
+            Some(connector) => self.rows(
+                "SELECT * FROM samples WHERE station=? AND connector=? AND at>=? ORDER BY at LIMIT ?",
+                &[&station, &connector, &since, &limit],
+            ),
+        }
+    }
+
+    /// A transaction's energy readings in time order, for repricing: `(at, energy_wh)`.
+    pub fn energy_samples(&self, station: &str, tid: i64) -> DbResult<Vec<(String, f64)>> {
+        let mut statement = self.db.prepare_cached(
+            "SELECT at, energy_wh FROM samples WHERE station=? AND transaction_id=? AND energy_wh IS NOT NULL
+             ORDER BY at",
+        )?;
+        let rows = statement.query_map(params![station, tid], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Update many sessions' costs in one transaction: `(id, cost, price per kWh)` each.
+    pub fn set_session_costs(&mut self, rows: &[(i64, f64, Option<f64>)]) -> DbResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.db.transaction()?;
+        {
+            let mut update = transaction.prepare_cached("UPDATE sessions SET cost=?, price_kwh=? WHERE id=?")?;
+            for (tid, cost, price_kwh) in rows {
+                update.execute(params![cost, price_kwh, tid])?;
+            }
+        }
+        transaction.commit()
+    }
+
+    /// Drop samples older than `keep_days`, and the oldest finished sessions of a station that
+    /// has more than `max_sessions` (a number no real charger reaches in decades).
+    pub fn prune_samples(&mut self, keep_days: i64) -> DbResult<()> {
+        // Sample times are ISO 8601 with a "T"; compare against the same spelling.
+        let cutoff = (Utc::now() - Duration::days(keep_days)).format("%Y-%m-%dT%H:%M:%S.000Z").to_string();
+        let max_sessions = self.max_sessions;
+        let transaction = self.db.transaction()?;
+        transaction.execute("DELETE FROM samples WHERE at < ?", params![cutoff])?;
+        let crowded: Vec<(String, i64)> = {
+            let mut statement =
+                transaction.prepare("SELECT station, COUNT(*) FROM sessions GROUP BY station HAVING COUNT(*) > ?")?;
+            let rows = statement.query_map(params![max_sessions], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<DbResult<_>>()?
+        };
+        for (station, count) in crowded {
+            transaction.execute(
+                "DELETE FROM sessions WHERE id IN
+                 (SELECT id FROM sessions WHERE station=? AND stop_at IS NOT NULL ORDER BY start_at LIMIT ?)",
+                params![station, count - max_sessions],
+            )?;
+        }
+        transaction.commit()?;
+        self.sample_counts.clear(); // recount after pruning
+        Ok(())
+    }
+
+    /// Remove everything recorded for a station (it is being forgotten).
+    pub fn delete_history(&mut self, station: &str) -> DbResult<()> {
+        let transaction = self.db.transaction()?;
+        transaction.execute("DELETE FROM samples WHERE station=?", params![station])?;
+        transaction.execute("DELETE FROM sessions WHERE station=?", params![station])?;
+        transaction.commit()?;
+        self.sample_counts.remove(station);
+        Ok(())
+    }
+
+    /// The database itself, for tests that look at how it is used.
+    pub fn database(&self) -> &Database {
+        &self.db
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn open(dir: &Path) -> (Store, Object) {
+        Store::open(dir).unwrap()
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn sample(station: &str, at: &str, energy: f64) -> Sample {
+        Sample { station: station.into(), connector: 1, at: at.into(), energy_wh: Some(energy), ..Sample::default() }
+    }
+
+    #[test]
+    fn state_and_history_files_are_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, state) = open(dir.path());
+        assert!(state.is_empty());
+        store.write_state(&json!({"stations": {}})).unwrap();
+        assert_eq!(mode(&dir.path().join("state.json")), 0o600);
+        assert_eq!(mode(&dir.path().join("history.sqlite")), 0o600);
+        assert!(!dir.path().join("state.tmp").exists());
+        // A file an older version left world-readable is tightened when the store opens.
+        fs::set_permissions(dir.path().join("state.json"), fs::Permissions::from_mode(0o644)).unwrap();
+        drop(store);
+        let (_store, state) = open(dir.path());
+        assert_eq!(mode(&dir.path().join("state.json")), 0o600);
+        assert_eq!(Value::Object(state), json!({"stations": {}}));
+    }
+
+    #[test]
+    fn the_first_save_after_a_crash_is_private_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = open(dir.path());
+        // A temporary file left behind by a crash, readable by everyone.
+        fs::write(dir.path().join("state.tmp"), "{").unwrap();
+        fs::set_permissions(dir.path().join("state.tmp"), fs::Permissions::from_mode(0o644)).unwrap();
+        store.write_state(&json!({"a": 1})).unwrap();
+        assert_eq!(mode(&dir.path().join("state.json")), 0o600);
+        assert_eq!(fs::read_to_string(dir.path().join("state.json")).unwrap(), "{\n \"a\": 1\n}");
+    }
+
+    #[test]
+    fn state_file_that_is_not_an_object_is_set_aside() {
+        for corrupt in ["[1, 2, 3]", "\"text\"", "{\"stations\": ", "", "\u{0}\u{1}"] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("state.json"), corrupt).unwrap();
+            let (_store, state) = open(dir.path());
+            assert!(state.is_empty(), "{corrupt:?}");
+            assert!(!dir.path().join("state.json").exists());
+            let backup = dir.path().join("state.corrupt.json");
+            assert_eq!(fs::read_to_string(&backup).unwrap(), corrupt);
+            assert_eq!(mode(&backup), 0o600);
+        }
+    }
+
+    #[test]
+    fn state_file_non_finite_numbers_are_dropped_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("state.json"),
+            r#"{"stations": {"GRD-1": {"priceKW": NaN, "displayName": "NaN and \"Infinity\"", "a": [Infinity, -Infinity, 1]}}}"#,
+        )
+        .unwrap();
+        let (_store, state) = open(dir.path());
+        assert_eq!(
+            Value::Object(state),
+            json!({"stations": {"GRD-1": {"priceKW": null, "displayName": "NaN and \"Infinity\"", "a": [null, null, 1]}}})
+        );
+        assert!(dir.path().join("state.json").exists());
+    }
+
+    #[test]
+    fn transaction_ids_never_reuse_recorded_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, _) = open(dir.path());
+        assert_eq!(store.unused_id(1), 1);
+        store.start_session(41, "GRD-1", 1, Some("tag"), "2026-11-08T00:00:00.000Z", Some(100), Some(0.1)).unwrap();
+        assert_eq!(store.unused_id(1), 42, "the history is ahead of a lost counter");
+        assert_eq!(store.unused_id(100), 100);
+        for impossible in [0, -5, LAST_ID] {
+            assert_eq!(store.unused_id(impossible), 42);
+        }
+        assert_eq!(store.unused_id(LAST_ID - 1), LAST_ID - 1);
+        assert!(store.start_session(41, "GRD-1", 1, None, "2026-11-08T00:00:00.000Z", None, None).is_err());
+    }
+
+    #[test]
+    fn large_transaction_ids_that_can_be_stored_keep_counting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, _) = open(dir.path());
+        store.start_session(LAST_ID - 10, "GRD-1", 1, None, "2026-11-08T00:00:00.000Z", None, None).unwrap();
+        assert_eq!(store.unused_id(5), LAST_ID - 9);
+        // A session recorded under the very last id is not counted on from.
+        store.start_session(LAST_ID, "GRD-1", 1, None, "2026-11-08T00:00:00.000Z", None, None).unwrap();
+        assert_eq!(store.unused_id(5), LAST_ID - 9);
+    }
+
+    #[test]
+    fn sessions_and_samples_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, _) = open(dir.path());
+        store.start_session(1, "GRD-1", 2, Some("tag"), "2026-11-08T10:00:00.000Z", Some(1000), Some(0.1)).unwrap();
+        store
+            .finish_session(1, "2026-11-08T11:00:00.000Z", Some(6000), Some(5000.0), Some(3600), Some(0.75), Some("Local"), Some(0.15))
+            .unwrap();
+        store.start_session(2, "GRD-1", 1, None, "2026-11-08T12:00:00.000Z", None, None).unwrap();
+        store.finish_session(2, "2026-11-08T12:30:00.000Z", None, None, None, None, None, None).unwrap();
+        let sessions = store.sessions("GRD-1", 50).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0]["id"], 2, "newest first");
+        assert_eq!(
+            Value::Object(sessions[1].clone()),
+            json!({"id": 1, "station": "GRD-1", "connector": 2, "id_tag": "tag", "start_at": "2026-11-08T10:00:00.000Z",
+                "stop_at": "2026-11-08T11:00:00.000Z", "meter_start": 1000, "meter_stop": 6000, "energy_wh": 5000.0,
+                "duration_s": 3600, "price_kwh": 0.15, "cost": 0.75, "reason": "Local"})
+        );
+        assert_eq!(store.sessions("GRD-1", 1).unwrap().len(), 1);
+        assert!(store.sessions("GRD-2", 50).unwrap().is_empty());
+
+        let mut second = sample("GRD-1", "2026-11-08T10:01:00.000Z", 1100.0);
+        second.connector = 2;
+        second.transaction_id = Some(1);
+        store.add_samples(&[sample("GRD-1", "2026-11-08T10:00:30.000Z", 1050.0), second]).unwrap();
+        assert_eq!(store.samples("GRD-1", "2026-11-08T00:00:00.000Z", None, 2000).unwrap().len(), 2);
+        assert_eq!(store.samples("GRD-1", "2026-11-08T10:00:45.000Z", None, 2000).unwrap().len(), 1);
+        assert_eq!(store.samples("GRD-1", "2026-11-08T00:00:00.000Z", Some(2), 2000).unwrap().len(), 1);
+        assert_eq!(store.energy_samples("GRD-1", 1).unwrap(), [("2026-11-08T10:01:00.000Z".to_string(), 1100.0)]);
+
+        store.set_session_costs(&[(1, 1.25, Some(0.25)), (2, 0.0, None)]).unwrap();
+        let sessions = store.sessions("GRD-1", 50).unwrap();
+        assert_eq!((&sessions[1]["cost"], &sessions[1]["price_kwh"]), (&json!(1.25), &json!(0.25)));
+        assert_eq!((&sessions[0]["cost"], &sessions[0]["price_kwh"]), (&json!(0.0), &json!(null)));
+
+        store.delete_history("GRD-1").unwrap();
+        assert!(store.sessions("GRD-1", 50).unwrap().is_empty());
+        assert!(store.samples("GRD-1", "", None, 2000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn history_per_station_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, _) = open(dir.path());
+        store.max_samples = 100;
+        let count = |store: &Store, station: &str| store.samples(station, "", None, 100_000).unwrap().len();
+        store.add_samples(&[sample("GRD-OTHER", "2026-11-08T00:00:00.000Z", 1.0)]).unwrap();
+        for batch in 0..30 {
+            let rows: Vec<Sample> =
+                (0..10).map(|i| sample("GRD-1", &format!("2026-11-08T{:02}:{:02}:00.000Z", batch, i), 1.0)).collect();
+            store.add_samples(&rows).unwrap();
+            assert!(count(&store, "GRD-1") <= 110, "never more than the limit plus a tenth");
+        }
+        assert!(count(&store, "GRD-1") >= 100);
+        // The oldest went first, and nobody else's rows were touched.
+        let kept = store.samples("GRD-1", "", None, 1).unwrap();
+        assert!(kept[0]["at"].as_str().unwrap() > "2026-11-08T10:00:00.000Z");
+        assert_eq!(count(&store, "GRD-OTHER"), 1);
+    }
+
+    #[test]
+    fn pruning_removes_what_is_older_than_the_limit_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, _) = open(dir.path());
+        let ago = |days: i64| (Utc::now() - Duration::days(days)).format("%Y-%m-%dT%H:%M:%S.000Z").to_string();
+        store.add_samples(&[sample("GRD-1", &ago(91), 1.0), sample("GRD-1", &ago(89), 2.0), sample("GRD-1", &ago(0), 3.0)]).unwrap();
+        store.prune_samples(90).unwrap();
+        let left: Vec<f64> =
+            store.samples("GRD-1", "", None, 100).unwrap().iter().map(|r| r["energy_wh"].as_f64().unwrap()).collect();
+        assert_eq!(left, [2.0, 3.0]);
+
+        // Sessions are kept whatever their age, up to the limit; only finished ones make room.
+        store.max_sessions = 3;
+        for id in 1..=5 {
+            store.start_session(id, "GRD-1", 1, None, &format!("2020-01-0{id}T00:00:00.000Z"), None, None).unwrap();
+            if id != 1 {
+                store.finish_session(id, "2020-01-09T00:00:00.000Z", None, None, None, None, None, None).unwrap();
+            }
+        }
+        store.start_session(9, "GRD-2", 1, None, "2020-01-01T00:00:00.000Z", None, None).unwrap();
+        store.prune_samples(90).unwrap();
+        let ids: Vec<i64> = store.sessions("GRD-1", 50).unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, [5, 4, 1], "the two oldest finished sessions went; the open one stayed");
+        assert_eq!(store.sessions("GRD-2", 50).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_history_queries_use_their_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = open(dir.path());
+        let plan = |sql: &str| -> String {
+            let mut statement = store.database().prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let rows = statement.query_map([], |row| row.get::<_, String>(3)).unwrap();
+            rows.map(Result::unwrap).collect::<Vec<_>>().join("; ")
+        };
+        let energy = plan(
+            "SELECT at, energy_wh FROM samples WHERE station='x' AND transaction_id=1 AND energy_wh IS NOT NULL ORDER BY at",
+        );
+        assert!(energy.contains("samples_station_tx") && !energy.contains("TEMP B-TREE"), "{energy}");
+        let sessions = plan("SELECT * FROM sessions WHERE station='x' ORDER BY start_at DESC LIMIT 5");
+        assert!(sessions.contains("sessions_station_start") && !sessions.contains("TEMP B-TREE"), "{sessions}");
+        let samples = plan("SELECT * FROM samples WHERE station='x' AND at>='y' ORDER BY at LIMIT 5");
+        assert!(samples.contains("samples_station_at") && !samples.contains("TEMP B-TREE"), "{samples}");
+    }
+}

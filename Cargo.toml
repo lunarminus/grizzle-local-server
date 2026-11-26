@@ -1,0 +1,44 @@
+[package]
+name = "grizzle-local"
+version = "0.9.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Local replacement for the Grizzl-E Connect cloud: an OCPP 1.6-J central system and a REST API"
+license = "MIT"
+publish = false
+
+[lib]
+name = "grizzle_local"
+path = "src/lib.rs"
+
+[[bin]]
+name = "grizzle-local"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "signal", "macros", "io-util"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+indexmap = "2"
+rusqlite = { version = "0.37", features = ["bundled"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
+openssl = "0.10"
+tokio-openssl = "0.6"
+miniz_oxide = "0.8"
+log = { version = "0.4", features = ["std"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
