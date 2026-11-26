@@ -37,7 +37,17 @@ impl Tz {
     /// to run.)
     pub fn local() -> Tz {
         static LOCAL: OnceLock<Option<&'static Rules>> = OnceLock::new();
-        Tz(*LOCAL.get_or_init(|| Rules::try_system().ok().map(|rules| &*Box::leak(Box::new(rules)))))
+        Tz(*LOCAL.get_or_init(|| {
+            let rules = Rules::try_system().ok().or_else(|| {
+                // "CET-1CEST": summer time, but not from when to when. The C library then goes
+                // by the rule the United States use, and so did every earlier version's log.
+                let zone = std::env::var("TZ").ok()?;
+                let zone = zone.trim_start_matches(':');
+                (!zone.is_empty() && !zone.contains(','))
+                    .then(|| Rules::posix(&format!("{zone},M3.2.0,M11.1.0")).ok())?
+            });
+            rules.map(|rules| &*Box::leak(Box::new(rules)))
+        }))
     }
 
     fn seconds_at(&self, utc: &NaiveDateTime) -> i32 {

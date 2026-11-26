@@ -11,8 +11,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::pin::Pin;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::OnceLock;
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -33,8 +33,29 @@ use support::{
 
 const BINARY: &str = env!("CARGO_BIN_EXE_grizzle-local");
 
+/// Starting a process copies this one for a moment, open sockets included. A port found free by
+/// listening on it and letting go is therefore only free if no process was being started just
+/// then (the copy would still be listening on it): tests run side by side, so both are done
+/// under this lock.
+///
+/// Even so the port is only probably free when it is used: another test may be given the same
+/// one in between. Whoever starts a server on such a port tries again with another if it is taken.
+static FORK: Mutex<()> = Mutex::new(());
+const TRIES: usize = 5;
+
 fn free_port() -> u16 {
+    let _alone = FORK.lock().unwrap_or_else(|e| e.into_inner());
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+fn started(command: &mut Command) -> Child {
+    let _alone = FORK.lock().unwrap_or_else(|e| e.into_inner());
+    command.spawn().unwrap()
+}
+
+/// Run it to the end; its exit status and what it wrote.
+fn finished(command: &mut Command) -> Output {
+    started(command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())).wait_with_output().unwrap()
 }
 
 /// A self-signed certificate and key from scripts/make-cert.sh, one pair for the whole file.
@@ -43,7 +64,7 @@ fn certs() -> (&'static str, &'static str) {
     let (cert, key) = CERTS.get_or_init(|| {
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("deploy-certs");
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/make-cert.sh");
-        let made = Command::new("sh").arg(script).arg(&dir).output().unwrap();
+        let made = finished(Command::new("sh").arg(script).arg(&dir));
         assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
         (dir.join("fullchain.pem").display().to_string(), dir.join("privkey.pem").display().to_string())
     });
@@ -53,10 +74,17 @@ fn certs() -> (&'static str, &'static str) {
 /// A server in this process that also listens for TLS.
 async fn tls_server(pairs: &[(&str, &str)]) -> TestServer {
     let (cert, key) = certs();
-    let port = free_port().to_string();
-    let mut all = vec![("GRIZZLE_TLS_CERT", cert), ("GRIZZLE_TLS_KEY", key), ("GRIZZLE_TLS_PORT", port.as_str())];
-    all.extend_from_slice(pairs);
-    TestServer::with(&all).await
+    let mut refusal = String::new();
+    for _ in 0..TRIES {
+        let port = free_port().to_string();
+        let mut all = vec![("GRIZZLE_TLS_CERT", cert), ("GRIZZLE_TLS_KEY", key), ("GRIZZLE_TLS_PORT", port.as_str())];
+        all.extend_from_slice(pairs);
+        match TestServer::try_with(&all).await {
+            Ok(server) => return server,
+            Err(why) => refusal = why,
+        }
+    }
+    panic!("no server with TLS could be started: {refusal}");
 }
 
 /// A TLS connection to `address` made from the address `local`. Unless `verify`, any certificate
@@ -108,44 +136,75 @@ async fn websocket<S: AsyncRead + AsyncWrite + Unpin>(
 struct Process {
     child: Child,
     address: SocketAddr,
+    /// Where it listens for TLS, if it was started with a certificate.
+    tls_address: SocketAddr,
     dir: tempfile::TempDir,
     stderr: Option<std::thread::JoinHandle<String>>,
 }
 
 impl Process {
     /// Start it with these environment variables (on top of a sign-in of EMAIL / PASSWORD,
-    /// loopback only, no TLS) and wait until it answers.
+    /// loopback only, and TLS only if they name a certificate) and wait until it answers.
     async fn start(env: &[(&str, &str)]) -> Process {
+        let mut refusal = String::new();
+        for _ in 0..TRIES {
+            match Process::try_start(env).await {
+                Ok(process) => return process,
+                Err(why) => refusal = why,
+            }
+        }
+        panic!("the server could not be started: {refusal}");
+    }
+
+    /// `Err` is what the server said if it gave up instead of serving (its port was taken).
+    async fn try_start(env: &[(&str, &str)]) -> Result<Process, String> {
         let dir = tempfile::tempdir().unwrap();
         let address = SocketAddr::from(([127, 0, 0, 1], free_port()));
-        let mut child = Command::new(BINARY)
+        let tls_address = SocketAddr::from(([127, 0, 0, 1], free_port()));
+        let tls = env.iter().any(|(name, _)| *name == "GRIZZLE_TLS_CERT");
+        let mut command = Command::new(BINARY);
+        command
             .env_clear()
             .env("GRIZZLE_DATA_DIR", dir.path().join("data"))
             .env("GRIZZLE_HOST", "127.0.0.1")
             .env("GRIZZLE_PORT", address.port().to_string())
-            .env("GRIZZLE_TLS_PORT", "0")
+            .env("GRIZZLE_TLS_PORT", if tls { tls_address.port() } else { 0 }.to_string())
             .env("GRIZZLE_API_EMAIL", EMAIL)
             .env("GRIZZLE_API_PASSWORD", PASSWORD)
             .envs(env.iter().copied())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        let mut child = started(&mut command);
         let mut pipe = child.stderr.take().unwrap();
         let stderr = std::thread::spawn(move || {
             let mut text = String::new();
             let _ = pipe.read_to_string(&mut text);
             text
         });
-        let process = Process { child, address, dir, stderr: Some(stderr) };
-        wait_for("the server to listen", || std::net::TcpStream::connect(address).is_ok()).await;
+        let mut process = Process { child, address, tls_address, dir, stderr: Some(stderr) };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if process.child.try_wait().unwrap().is_some() {
+                return Err(process.stderr.take().unwrap().join().unwrap());
+            }
+            if std::net::TcpStream::connect(address).is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the server neither listens nor gives up");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         // Once it answers it is serving, so its own handler takes a signal and not the default one.
         assert_eq!(http(address, "GET", "/health", &[], None).await.status, 200);
-        process
+        // (If it was somebody else who answered on that port, ours has given up by now.)
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if process.child.try_wait().unwrap().is_some() {
+            return Err(process.stderr.take().unwrap().join().unwrap());
+        }
+        Ok(process)
     }
 
     /// SIGTERM, as `docker stop` sends it. The exit status and everything the server wrote to stderr.
     async fn terminate(&mut self) -> (ExitStatus, String) {
-        assert!(Command::new("kill").args(["-TERM", &self.child.id().to_string()]).status().unwrap().success());
+        assert!(finished(Command::new("kill").args(["-TERM", &self.child.id().to_string()])).status.success());
         let mut status = None;
         // Docker waits ten seconds, then kills.
         wait_until("the server to exit", Duration::from_secs(8), || {
@@ -169,15 +228,9 @@ async fn sigterm_with_chargers_connected_saves_and_exits_promptly() {
     // `docker stop` with a charger connected (that is: always). A server that waits for its open
     // connections before it saves sits out the timeout, Docker kills it, and the save never runs.
     let (cert, key) = certs();
-    let tls_port = free_port().to_string();
-    let mut server = Process::start(&[
-        ("GRIZZLE_TLS_PORT", &tls_port),
-        ("GRIZZLE_TLS_CERT", cert),
-        ("GRIZZLE_TLS_KEY", key),
-        ("GRIZZLE_TICK_SECONDS", "3600"),
-    ])
-    .await;
-    let tls_address = SocketAddr::new(server.address.ip(), tls_port.parse().unwrap());
+    let mut server =
+        Process::start(&[("GRIZZLE_TLS_CERT", cert), ("GRIZZLE_TLS_KEY", key), ("GRIZZLE_TICK_SECONDS", "3600")]).await;
+    let tls_address = server.tls_address;
     let plain = FakeCharger::connect_to(server.address, "GRD-PLAIN001", FakeOptions::default()).await.unwrap();
     let over_tls = FakeOptions { tls: true, ..FakeOptions::default() };
     let secure = FakeCharger::connect_to(tls_address, "GRD-TLS00001", over_tls).await.unwrap();
@@ -371,7 +424,7 @@ fn generated_certificate_is_a_server_certificate_not_a_ca() {
     // `openssl req -x509` makes a CA by default: whoever copied privkey.pem could have signed
     // certificates for any site, valid wherever this certificate had been trusted.
     let (cert, key) = certs();
-    let shown = Command::new("openssl").args(["x509", "-in", cert, "-noout", "-text"]).output().unwrap();
+    let shown = finished(Command::new("openssl").args(["x509", "-in", cert, "-noout", "-text"]));
     assert!(shown.status.success());
     let text = String::from_utf8_lossy(&shown.stdout);
     assert!(text.contains("CA:FALSE") && !text.contains("CA:TRUE"));
@@ -389,7 +442,7 @@ async fn health_check_asks_where_the_server_listens() {
         command.arg("healthcheck").env_clear().env("GRIZZLE_HOST", "127.0.0.1").env("GRIZZLE_PORT", port.to_string());
         // A proxy setting must not come between us and ourselves (and no NO_PROXY keeps us from it).
         command.env("http_proxy", "http://127.0.0.1:9");
-        tokio::task::spawn_blocking(move || command.output().unwrap().status.code()).await.unwrap()
+        tokio::task::spawn_blocking(move || finished(&mut command).status.code()).await.unwrap()
     };
     assert_eq!(check(server.address.port()).await, Some(0));
     assert_eq!(check(free_port()).await, Some(1));
@@ -412,6 +465,35 @@ async fn main_installs_the_formatter_that_keeps_log_lines_single() {
         let whole =
             words.len() == 4 && words[0].len() == 10 && words[2] == "WARNING" && words[3].starts_with("grizzle_local");
         assert!(whole, "{line}");
+    }
+}
+
+/// The times in the log are local times, as they were with the Python versions: by `TZ` in
+/// whichever way the system reads it, not only when it is a zone's name.
+#[tokio::test]
+async fn log_times_are_local_however_tz_spells_the_zone() {
+    // (TZ, hours ahead of UTC it may mean)
+    let cases: [(&str, &[f64]); 6] = [
+        ("Asia/Tokyo", &[9.0]),
+        (":Asia/Kolkata", &[5.5]),
+        ("XYZ5", &[-5.0]),
+        ("<+0330>-3:30", &[3.5]),
+        // Summer time without saying when: by the rule of the United States, as the C library has it.
+        ("CET-1CEST", &[1.0, 2.0]),
+        ("UTC", &[0.0]),
+    ];
+    for (tz, hours) in cases {
+        let before = chrono::Utc::now().naive_utc();
+        let mut server = Process::start(&[("TZ", tz)]).await;
+        let (_, stderr) = server.terminate().await;
+        let first = stderr.lines().next().unwrap_or_default();
+        let logged = chrono::NaiveDateTime::parse_from_str(first.get(..19).unwrap_or_default(), "%Y-%m-%d %H:%M:%S")
+            .unwrap_or_else(|err| panic!("TZ={tz}: {first:?} does not start with a time: {err}"));
+        let ahead = (logged - before).num_seconds() as f64 / 3600.0;
+        assert!(
+            hours.iter().any(|hours| (ahead - hours).abs() < 0.02),
+            "TZ={tz}: the log is {ahead:.2} h ahead of UTC"
+        );
     }
 }
 

@@ -65,8 +65,8 @@ async fn frames_that_are_not_masked_are_answered() {
 }
 
 /// Every ping is owed an answer. From a peer that never reads its answers, the server stops
-/// taking pings (its reading is rate-limited like any other frame, and what waits to be written
-/// is bounded) instead of queueing an answer to each for as long as the peer cares to go on.
+/// taking pings (they are rate-limited like any other frame) instead of queueing an answer to
+/// each as fast as the peer can send them. (src/ocpp.rs tests the limit on what is queued.)
 #[tokio::test]
 async fn a_peer_that_pings_without_reading_is_not_served_without_limit() {
     let server = TestServer::start().await;
@@ -89,6 +89,44 @@ async fn a_peer_that_pings_without_reading_is_not_served_without_limit() {
     // What fits in the socket's buffers on the way is taken, and a burst of frames; not more.
     assert!(taken < 16 << 20, "the server took {} MB of pings in three seconds", taken >> 20);
     assert_eq!(server.get("/health", None).await.status, 200, "and it still answers everybody else");
+}
+
+/// A message may come in pieces, and a piece may be empty. An endless run of empty pieces never
+/// adds up to a message, so the limit on messages never sees it; the limit on bytes does, and
+/// the rest of the server (one thread) is not kept waiting behind it.
+#[tokio::test]
+async fn a_flood_that_never_becomes_a_message_does_not_hold_up_the_server() {
+    let server = TestServer::start().await;
+    let mut stream = TcpStream::connect(server.address).await.unwrap();
+    stream.write_all(&upgrade_request(SERIAL)).await.unwrap();
+    let head = read_until(&mut stream, |bytes| bytes.ends_with(b"\r\n\r\n")).await;
+    assert!(head.starts_with(b"HTTP/1.1 101 "), "{}", String::from_utf8_lossy(&head));
+
+    stream.write_all(&[0x01, 1, b'[']).await.unwrap(); // the first piece of a text message
+    let block = [0x00u8, 0].repeat(32 * 1024); // continuation frames with nothing in them
+    let taken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let flood = tokio::spawn({
+        let taken = taken.clone();
+        async move {
+            loop {
+                if stream.write_all(&block).await.is_err() {
+                    return;
+                }
+                taken.fetch_add(block.len(), std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    });
+    let mut slowest = Duration::ZERO;
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let asked = std::time::Instant::now();
+        assert_eq!(server.get("/health", None).await.status, 200);
+        slowest = slowest.max(asked.elapsed());
+    }
+    flood.abort();
+    let taken = taken.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(slowest < Duration::from_millis(250), "/health took {slowest:?} during the flood");
+    assert!(taken < 12 << 20, "the server took {} MB of empty frames in under three seconds", taken >> 20);
 }
 
 /// A charger that ends the connection properly is answered with a close, not cut off.

@@ -175,14 +175,25 @@ impl TestServer {
 
     /// A server over an existing directory (a restart), or with settings a test has adjusted.
     pub async fn with_settings(dir: Arc<TempDir>, settings: Settings) -> TestServer {
-        let app = App::new(settings).unwrap();
-        let server = Server::bind(app.clone()).await.unwrap();
+        TestServer::try_with_settings(dir, settings).await.unwrap()
+    }
+
+    /// [`TestServer::with`] for a test that names a port itself, and so may find it taken.
+    pub async fn try_with(pairs: &[(&str, &str)]) -> Result<TestServer, String> {
+        let dir = Arc::new(tempfile::tempdir().unwrap());
+        let settings = settings(dir.path(), pairs);
+        TestServer::try_with_settings(dir, settings).await
+    }
+
+    async fn try_with_settings(dir: Arc<TempDir>, settings: Settings) -> Result<TestServer, String> {
+        let app = App::new(settings)?;
+        let server = Server::bind(app.clone()).await?;
         let (address, tls_address) = (server.address(), server.tls_address());
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(server.run(async move {
             let _ = stopped.await;
         }));
-        TestServer { app, address, tls_address, dir, stop: Some(stop), task: Some(task) }
+        Ok(TestServer { app, address, tls_address, dir, stop: Some(stop), task: Some(task) })
     }
 
     pub fn controller(&self) -> &Arc<Controller> {

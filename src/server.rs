@@ -37,7 +37,7 @@ use crate::config::{is_charge_point_id, Settings};
 use crate::crypto::base64_decode;
 use crate::logging::printable;
 use crate::net::upstream_host;
-use crate::ocpp::{websocket_config, Connection};
+use crate::ocpp::{websocket_config, Connection, Metered};
 use crate::timeutil::now_iso;
 use crate::value::clip;
 
@@ -213,9 +213,12 @@ async fn websocket_or_page(app: &Arc<App>, http: &mut HttpRequest<Incoming>, req
     tokio::spawn(async move {
         match upgrade.await {
             Ok(upgraded) => {
-                let socket =
-                    WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, Some(websocket_config()))
-                        .await;
+                let socket = WebSocketStream::from_raw_socket(
+                    Metered::new(TokioIo::new(upgraded)),
+                    Role::Server,
+                    Some(websocket_config()),
+                )
+                .await;
                 let handler = |action: &str, payload| controller.handle(&conn.id, action, &payload);
                 conn.run(socket, &handler).await;
             }

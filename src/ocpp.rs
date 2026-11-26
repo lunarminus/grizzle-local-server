@@ -11,14 +11,17 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -69,6 +72,69 @@ pub fn websocket_config() -> WebSocketConfig {
         .max_frame_size(Some(MAX_FRAME_BYTES))
         .max_write_buffer_size(MAX_UNSENT_BYTES)
         .accept_unmasked_frames(true)
+}
+
+/// A charger's socket, read no faster than a charger has any reason to send.
+///
+/// The limit on frames (the token bucket in [`Connection`]) counts whole messages. Bytes that
+/// never add up to one, such as an endless run of empty continuation frames, would otherwise be
+/// read as fast as the peer can send them, and keep the one thread there is busy with nothing.
+/// Past a burst of [`READ_BURST_BYTES`], reading goes at [`READ_BYTES_PER_SECOND`].
+pub struct Metered<S> {
+    inner: S,
+    allowance: f64,
+    at: Instant,
+    wait: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+/// A few of the largest frames at once, then one a second: hundreds of times what a charger sends.
+pub const READ_BURST_BYTES: usize = 4 * MAX_FRAME_BYTES;
+pub const READ_BYTES_PER_SECOND: usize = MAX_FRAME_BYTES;
+
+impl<S> Metered<S> {
+    pub fn new(inner: S) -> Metered<S> {
+        Metered { inner, allowance: READ_BURST_BYTES as f64, at: Instant::now(), wait: None }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Metered<S> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        loop {
+            if let Some(wait) = &mut this.wait {
+                std::task::ready!(wait.as_mut().poll(cx));
+                this.wait = None;
+            }
+            let now = Instant::now();
+            let earned = (now - this.at).as_secs_f64() * READ_BYTES_PER_SECOND as f64;
+            this.allowance = (this.allowance + earned).min(READ_BURST_BYTES as f64);
+            this.at = now;
+            if this.allowance > 0.0 {
+                break;
+            }
+            // Overdrawn by the last read: wait until that is paid back, and a little is in hand.
+            let owed = (MAX_FRAME_BYTES as f64 / 16.0 - this.allowance) / READ_BYTES_PER_SECOND as f64;
+            this.wait = Some(Box::pin(tokio::time::sleep(Duration::from_secs_f64(owed))));
+        }
+        let before = buf.filled().len();
+        let read = Pin::new(&mut this.inner).poll_read(cx, buf);
+        this.allowance -= (buf.filled().len() - before) as f64;
+        read
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Metered<S> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// A frame could not be written: the connection is gone.
@@ -877,6 +943,59 @@ mod tests {
         assert_eq!(start.elapsed(), Duration::ZERO);
         conn.throttle().await;
         assert!(start.elapsed() > Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bytes_are_read_at_a_bounded_rate_after_the_burst() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (near, mut far) = tokio::io::duplex(64 * 1024);
+        let total = READ_BURST_BYTES + 6 * READ_BYTES_PER_SECOND;
+        tokio::spawn(async move { far.write_all(&vec![0u8; total]).await });
+        let mut metered = Metered::new(near);
+        let start = Instant::now();
+        let mut chunk = vec![0u8; 16 * 1024];
+        let mut read = 0;
+        while read < READ_BURST_BYTES {
+            read += metered.read(&mut chunk).await.unwrap();
+        }
+        assert!(start.elapsed() < Duration::from_millis(100), "the burst is free: {:?}", start.elapsed());
+        while read < total {
+            read += metered.read(&mut chunk).await.unwrap();
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        assert!((5.5..=6.5).contains(&elapsed), "six seconds' worth took {elapsed}s");
+    }
+
+    /// A peer that never reads. Whatever is owed to it (an answer to each of its pings, the
+    /// calls the server makes) is kept up to a limit; past it, the peer counts as gone.
+    #[tokio::test]
+    async fn what_waits_to_be_written_is_bounded() {
+        use tokio::io::AsyncWriteExt;
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        let (near, mut far) = tokio::io::duplex(64 * 1024);
+        let socket = WebSocketStream::from_raw_socket(near, Role::Server, Some(websocket_config())).await;
+        // No limit on frames a second here: this is about what is left when that one is not enough.
+        let conn = std::sync::Arc::new(Connection::new("GRD-TEST", 1e12, 1e12, Duration::from_secs(30)));
+        let running = tokio::spawn({
+            let conn = conn.clone();
+            async move {
+                let handler = |_: &str, _: Object| -> HandlerResult { Ok(json!({})) };
+                conn.run(socket, &handler).await;
+            }
+        });
+        let mut ping = vec![0x89, 125]; // unmasked, as full as a ping gets
+        ping.extend_from_slice(&[b'p'; 125]);
+        let block = ping.repeat(1024);
+        for _ in 0..(MAX_UNSENT_BYTES + MAX_UNSENT_BYTES / 2) / block.len() {
+            far.write_all(&block).await.unwrap();
+        }
+        assert!(!conn.is_closed(), "pings alone do not end it: the answers that do not fit are dropped");
+        // The next thing the server has to say does not fit either, and that is the end of it.
+        let call = conn.call("Reset", json!({"type": "Soft"}), None);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), call).await.expect("the call ends");
+        assert_eq!(outcome.unwrap_err().code, "Disconnected");
+        tokio::time::timeout(Duration::from_secs(10), running).await.expect("the connection is given up").unwrap();
+        assert!(conn.is_closed());
     }
 
     #[tokio::test]

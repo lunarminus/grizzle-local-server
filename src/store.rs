@@ -156,8 +156,13 @@ fn repaired(text: &str) -> String {
                     replace(at, at + word.len(), "null");
                     at += word.len();
                 } else if number > 0 {
-                    if is_json_number(&rest[..number]) && serde_json::from_str::<f64>(&rest[..number]).is_err() {
-                        replace(at, at + number, "null");
+                    let token = &rest[..number];
+                    if is_json_number(token) && serde_json::from_str::<f64>(token).is_err() {
+                        // Usually because it is too large. (Right at the largest number there is,
+                        // the parser also refuses some long spellings of numbers that do fit:
+                        // those are written the short way.)
+                        let fits = token.parse::<f64>().ok().and_then(Number::from_f64);
+                        replace(at, at + number, &fits.map_or("null".to_string(), |number| number.to_string()));
                     }
                     at += number;
                 } else {
@@ -750,6 +755,11 @@ mod tests {
         assert_eq!(station["ocppAuthKey"], "kept");
         assert_eq!(station["connectorCount"], Value::Null);
         assert_eq!(station["a"], json!([null, null, null, null]));
+        // The largest number there is, in spellings the parser trips over: still that number.
+        let dir = tempfile::tempdir().unwrap();
+        let largest = r#"{"a": [1.7976931348623158e308, 1797693134862315700e290, 1.797693134862315700000e308, 1e400]}"#;
+        fs::write(dir.path().join("state.json"), largest).unwrap();
+        assert_eq!(Value::Object(open(dir.path()).1), json!({"a": [f64::MAX, f64::MAX, f64::MAX, null]}));
         assert_eq!(station["fine"], json!([1e308, 0.0, 18446744073709551616.0, -0.0, 1500.0]));
         assert_eq!(station["text"], format!("1e400 and {huge}"));
         assert!(!dir.path().join("state.corrupt.json").exists());
